@@ -136,6 +136,18 @@ async function cmdRun(argv: string[]): Promise<void> {
 	try {
 		const root = resolve(procCwd());
 		kit = await openProjectHarness(root, "run");
+		// SIGINT = user abort: clean close (durable state stays; waves resume on the next run).
+		const onInterrupt = () => {
+			void kit!.loop
+				.close()
+				.catch(() => {})
+				.finally(() => {
+					kit!.lock.release();
+					we.error(`\n${c.yellow}interrupted${RESET} — durable state closed cleanly; rerun to resume`);
+					process.exit(130);
+				});
+		};
+		process.on("SIGINT", onInterrupt);
 		const summary = await runWaves(
 			kit,
 			{
@@ -145,6 +157,7 @@ async function cmdRun(argv: string[]): Promise<void> {
 			},
 			printProgress,
 		);
+		process.off("SIGINT", onInterrupt);
 		await kit.loop.close();
 		kit.lock.release();
 		if (summary.exit === "sleeping") {

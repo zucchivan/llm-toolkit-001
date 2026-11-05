@@ -6,7 +6,7 @@
  * human approval stamp; rate-limited runs arm the governor's durable sleep and
  * exit 42 for the next `run` to pick up.
  */
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { readJson } from "../util/fsx.ts";
 import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
@@ -259,14 +259,20 @@ export async function driveTaskWaves(
 			await conv.reset(undefined, BACKGROUND_CONTEXT);
 		}
 
-		const waveInput = assembleWaveInput(current, wave, opts.handoffNote);
+		const promptMd = await readFile(join(paths.root, "PROMPT.md"), "utf8").catch(() => undefined);
+		const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
 		const outcomeWave = await convKit.submitAndAwait(conv, `${task.id}-w${wave}`, waveInput);
 
+		const warnRows: WaveRow[] = [];
+		if (outcomeWave.usage.usd > kit.loop.config.budgets.waveUsdWarn) {
+			warnRows.push({ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "wave-usd-warn", detail: `$${outcomeWave.usage.usd.toFixed(2)} > $${kit.loop.config.budgets.waveUsdWarn}` });
+		}
 		// Budget accumulation per wave.
 		await commitState(kit, {
 			runStatus: (d) => {
 				d.budgetSpentUsd = Math.max(d.budgetSpentUsd, outcomeWave.usage.usd);
 			},
+			rows: warnRows,
 		});
 
 		// Run failure paths (§4.2.5 / §4.5).
@@ -400,7 +406,7 @@ async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, 
  * One wave's user message: PROMPT.md + role brief + spec + criteria + feedback
  * of the previous wave + handoff note.
  */
-export function assembleWaveInput(task: RouterTask, wave: number, handoffNote?: string): string {
+export async function assembleWaveInput(task: RouterTask, wave: number, handoffNote?: string, promptMd?: string): Promise<string> {
 	const spec = [
 		`TASK ${task.id} — WAVE ${wave}: ${task.title}`,
 		`TARGET PATHS: ${task.targetPaths.length ? task.targetPaths.join(", ") : "(whole repo)"}`,
@@ -414,6 +420,7 @@ export function assembleWaveInput(task: RouterTask, wave: number, handoffNote?: 
 		for (const fb of task.feedback) spec.push(`- wave ${fb.wave} [${fb.from}]: ${fb.text}`);
 	}
 	if (handoffNote) spec.push(`USER HANDOFF NOTE: ${handoffNote}`);
+	if (promptMd) spec.push(`PROMPT.MD (the kit's per-wave discipline — follow it): ${promptMd}`);
 	spec.push(`End with a single line: STATUS: COMPLETE or STATUS: BLOCKED <reason>.`);
 	return spec.join("\n\n");
 }
