@@ -1,0 +1,29 @@
+[planner]
+---
+{"tasks": [{"id": "list-parse", "title": "parseList + renderList", "spec": "Add src/list.ts with parseList() and renderList().", "dependsOn": [], "acceptance": ["When parseList is called on '/a/-b', the system shall return ['a','b']."], "taskedPaths": ["src/"], "targetPaths": ["src/"], "priority": 2}, {"id": "list-query", "title": "queryList filter", "spec": "Add queryList(list, q).", "dependsOn": ["list-parse"], "acceptance": ["When queryList runs with 'A', the system shall match case-insensitively."], "targetPaths": ["src/"], "priority": 1}, {"id": "cli-render", "title": "bin/render.js", "spec": "Read argv[2], render output.", "dependsOn": ["list-query"], "acceptance": ["When bin/render.js runs with '/a/-b', the system shall print 'a b'."], "targetPaths": ["bin/"], "priority": 0}]}
+[implementer]
+---
+{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\n"}
+---
+STATUS: COMPLETE
+---
+{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\nexport const BROKEN = 'first wave of task 2 breaks the gate on purpose';\n"}
+---
+STATUS: COMPLETE
+---
+{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\n"}
+---
+{"tool": "write", "path": "src/query.ts", "content": "export function queryList(items: string[], q: string): string[] {\n\tconst needle = q.toLowerCase();\n\treturn items.filter((i) => i.toLowerCase().includes(needle));\n}\n"}
+---
+STATUS: COMPLETE
+---
+{"tool": "write", "path": "bin/render.js", "content": "#!/usr/bin/env node\nimport { parseList, renderList } from '../src/list.ts';\nconsole.log(renderList(parseList(process.argv[2] ?? '-x')));\n"}
+---
+STATUS: COMPLETE
+[verifier]
+---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "diff matches the criterion"}
+---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "fixed on wave 2"}
+---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "present"}

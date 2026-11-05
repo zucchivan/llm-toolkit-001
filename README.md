@@ -40,22 +40,31 @@ llm-toolkit-001 handoff "context for the next wave"
 llm-toolkit-001 verify --task some-task-id  # one-off read-only verification
 ```
 
-### Scripted smoke (no API keys)
+### Scripted smoke, no API keys (proven against examples/demo-prd)
 
 `KIT_FAUX=1` runs every conversation on an in-package faux provider
-(`kit-planner` / `kit-impl` / `kit-verifier` model ids):
+(`kit-planner` / `kit-impl` / `kit-verifier` model ids). `examples/demo-prd`
+ships the replay + gate script for the full plan→wave→gate→verify arc (task 2
+fails its gate on wave 1, the driver resets the conversation, wave 2 fixes it):
 
 ```bash
-KIT_FAUX=1 KIT_FAUX_SCRIPT=.smoke.replay llm-toolkit-001 plan
-KIT_FAUX=1 KIT_FAUX_SCRIPT=.smoke.replay llm-toolkit-001 run --approve
+cp -r examples/demo-prd /tmp/demo && cd /tmp/demo
+npm i <the kit repo>            # or install the kit globally / via npx
+
+llm-toolkit-001 init . --with-demo
+# point [roles.*] at provider "faux" + modelId kit-planner|kit-impl|kit-verifier
+#   (or KIT_FAUX=1 keeps probe-vs-credentials decoupled from real providers)
+# evals/recipes.toml: [broken-gate]\ncmd = "node smoke-gate.cjs"
+
+git init -q && git add -A && git commit -qm base   # the loop needs a repo
+KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 plan
+KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve   # → STATUS: COMPLETE
 ```
 
-The replay file has `[planner]` / `[implementer]` / `[verifier]` sections with
-`---` separated chunks; a chunk may be plain text or a JSON object —
-`{"tool":"write","path":"src/x.ts","content":"…"}` plays a tool call, planner
-chunks are the tasks JSON, verifier chunks are verdict JSON.
-`examples/demo-prd` pairs with this mode for a full plan→wave→gate→verify arc
-(gate fail on wave 1, `conversation.reset()`, approved on wave 2).
+Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
+`---` separated chunks; a chunk is one model request's answer — plain text
+(final assistant turn), the planner's tasks JSON, a verifier verdict JSON, or
+`{"tool":"write","path":"src/x.ts","content":"…"}` for a tool round.
 
 ## Commands
 
