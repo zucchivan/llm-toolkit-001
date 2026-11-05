@@ -253,7 +253,7 @@ export interface LoopAndLock {
 export async function openProjectHarness(
 	root: string,
 	cmdHint: string,
-	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer } = {},
+	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer; retryMax?: number } = {},
 ): Promise<LoopAndLock> {
 	const paths = projectPaths(root);
 	requireConfig(paths.config);
@@ -288,7 +288,7 @@ export async function openProjectHarness(
 			...(opts.now || opts.setTimer ? { now: opts.now, setTimer: opts.setTimer } : {}),
 			env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? root }),
 			settings: {
-				retry: { enabled: true, maxRetries: 3, baseDelayMs: 2_000 },
+				retry: { enabled: true, maxRetries: opts.retryMax ?? 3, baseDelayMs: 2_000 },
 				afterFailedRun: "withdraw",
 				toolExecution: "parallel",
 				progress: { partialIntervalMs: 200, outputIntervalMs: 200, persistWithinMs: 2_000 },

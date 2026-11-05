@@ -248,10 +248,11 @@ export async function driveTaskWaves(
 		let conv = current.convId !== undefined ? await convKit.find(current.convId) : undefined;
 		if (!conv) {
 			conv = await openTaskConversation(kit, convKit, current);
+			current.convId = conv.id as unknown as number;
 			await commitState(kit, {
 				router: (d) => {
 					const t = d.tasks.find((x) => x.id === task.id)!;
-					t.convId = conv!.id;
+					t.convId = conv!.id as unknown as number;
 				},
 			});
 		} else if (wave > 1) {

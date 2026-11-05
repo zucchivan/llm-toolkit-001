@@ -17,6 +17,7 @@ export interface Baked {
 export interface BakeOptions {
 	buildFauxModels: (responses: never[]) => { models: Models; faux: FauxProviderHandle };
 	budgetCeiling?: number;
+	retryMax?: number;
 }
 
 /** Temp project with demo PRD, config, gates, git; returns an open harness. */
@@ -28,7 +29,7 @@ export async function bakeProject(opts: BakeOptions): Promise<Baked> {
 	await initProject(project.root);
 
 	const models = opts.buildFauxModels([] as never[]);
-	const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models });
+	const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models, retryMax: opts.retryMax });
 	return { project, kit, models };
 }
 

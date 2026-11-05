@@ -24,7 +24,7 @@ beforeEach(() => {
 
 describe("beforeTool role boundaries (harness-enforced)", () => {
 	it("implementer writing .orch/** is blocked by the wave (falls to STATUS: BLOCKED and gate scope violation)", async () => {
-		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		const { project, kit, models } = await bakeProject({ buildFauxModels, retryMax: 0 });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "spec", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
 			// the implementer tries to write into .orch — the guard BLOCKS the call
@@ -65,7 +65,7 @@ describe("breakers (§4.5)", () => {
 	});
 
 	it("duplicate gate-failure hash two waves running → immediate quarantine", async () => {
-		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		const { project, kit, models } = await bakeProject({ buildFauxModels, retryMax: 0 });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "make a broken gate hit twice", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
 			// wave 1: write a file BREAKING the gate
@@ -99,6 +99,32 @@ describe("breakers (§4.5)", () => {
 	});
 });
 
+describe("rate-limit durable sleep (exit 42 path)", () => {
+	it("model_error with rate-limit detail arms the durable sleep and the driver exits 'sleeping'", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels, retryMax: 0 });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "s", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
+			// impl request #1 dies with a rate limit
+			fauxAssistantMessage("provider overloaded", { stopReason: "error", errorMessage: "429 rate_limit resets in 90m" }),
+		], models.faux);
+		await accomplish(kit);
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		if (summary.exit !== "sleeping") {
+			const stateDump = await readSessionState(kit.loop.harness);
+			console.error("rows:", stateDump.rows.map((r) => `${r.kind}:${r.task} ${r.verb} ${r.detail ?? ""}`));
+		}
+		const dump = await readSessionState(kit.loop.harness);
+		if (summary.exit !== "sleeping") console.error("sum:", JSON.stringify(summary), "alert:", dump.runStatus.activeAlert, "rows:", dump.rows.map((r) => `${r.kind}:${r.verb}:${String(r.detail ?? "").slice(0, 70)}`));
+		expect(summary.exit).toBe("sleeping");
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.runStatus.sleepTaskId).toBeDefined();
+		expect(state.runStatus.sleepUntil).toBeGreaterThan(Date.now());
+		await kit.loop.close();
+		kit.lock.release();
+		void project;
+	});
+});
+
 describe("verifier verdict parsing", () => {
 	it("strict JSON: approve / reject / needs_human / malformed→needs_human", () => {
 		expect(parseVerdictStrict('{"verdict":"approve","criteria":[{"id":"1","status":"pass"}],"notes":"good"}')).toMatchObject({ verdict: "approve" });
@@ -108,7 +134,7 @@ describe("verifier verdict parsing", () => {
 	});
 
 	it("runVerify produces a wave-log verdict row on needs_human fallback", async () => {
-		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		const { project, kit, models } = await bakeProject({ buildFauxModels, retryMax: 0 });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "s", dependsOn: [], acceptance: ["crit"], targetPaths: [], priority: 1 }] }), { stopReason: "stop" }),
 		], models.faux);
