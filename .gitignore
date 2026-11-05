@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.orch/durable.sqlite*
+.orch/lock
+.orch/status.json
+.orch/pending-handoff.json
+.orch/artifacts/
+.orch/config.toml
