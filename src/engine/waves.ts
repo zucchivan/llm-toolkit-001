@@ -101,8 +101,12 @@ export async function runWaves(
 	}
 
 	// Ingest a queued user handoff note (§3.1) before the next wave starts.
-	const handoff = await readJson<{ note: string; ts: number }>(kit.loop.paths.pendingHandoff);
-	if (handoff) {
+	// The CLI writes {ts, notes: string[]} (multi-note queue); read both shapes.
+	const handoffRaw = await readJson<{ ts: number; notes: string[]; note?: string }>(kit.loop.paths.pendingHandoff);
+	const handoff = handoffRaw
+		? { note: (handoffRaw.notes?.length ? handoffRaw.notes.join("; ") : (handoffRaw.note ?? "")).slice(0, 3000), ts: handoffRaw.ts }
+		: undefined;
+	if (handoff?.note) {
 		await commitState(kit, {
 			rows: [{ ts: Date.now(), kind: "handoff", task: "session", verb: "handoff-ingested", detail: handoff.note }],
 		});
@@ -358,7 +362,7 @@ export async function driveTaskWaves(
 			acceptance: current.acceptance,
 			baselineTreeSha: baseline,
 			targetPaths: current.targetPaths,
-		}, gateSummaryText(gate.results));
+		}, gateSummaryText(gate.results), { skepticSecondPass: kit.loop.config.gates.skepticSecondPass });
 
 		if (verdict.verdict === "approve") {
 			await commitState(kit, {

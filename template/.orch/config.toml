@@ -39,6 +39,7 @@ maxSleepCycles = 3           # rate-limit sleep round-trips per task across rest
 [gates]
 timeoutSec = 120             # per recipe
 enforceTargetPaths = true    # scope check + beforeTool block writes outside targetPaths
+skepticSecondPass = false    # approving verifier must also survive a skeptic round (costs one verify call)
 
 [delivery]
 mode = "none"                # "none" | "commit" | "pr" (pr additionally needs the --deliver flag)

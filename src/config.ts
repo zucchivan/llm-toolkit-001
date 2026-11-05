@@ -29,6 +29,8 @@ export interface Budgets {
 export interface GatesConfig {
 	timeoutSec: number;
 	enforceTargetPaths: boolean;
+	/** When true, an approving verifier must also survive a skeptic second pass. */
+	skepticSecondPass: boolean;
 }
 
 export interface DeliveryConfig {
@@ -65,7 +67,7 @@ export const DEFAULT_CONFIG: KitConfig = {
 		verifier: { provider: "openrouter", modelId: "openai/gpt-5-nano" },
 	},
 	budgets: { sessionUsd: 10.0, waveUsdWarn: 2.0, maxConsecutiveErrors: 3, maxSleepCycles: 3 },
-	gates: { timeoutSec: 120, enforceTargetPaths: true },
+	gates: { timeoutSec: 120, enforceTargetPaths: true, skepticSecondPass: false },
 	delivery: { mode: "none" },
 	paths: { prd: "docs/prd.md", specs: "specs/" },
 };
@@ -138,6 +140,7 @@ export function loadConfig(root: string, file = join(root, ".orch", "config.toml
 		gates: {
 			timeoutSec: orNum(gates["timeoutSec"], DEFAULT_CONFIG.gates.timeoutSec, "timeoutSec", 1),
 			enforceTargetPaths: orBool(gates["enforceTargetPaths"], DEFAULT_CONFIG.gates.enforceTargetPaths, "enforceTargetPaths"),
+			skepticSecondPass: orBool(gates["skepticSecondPass"], DEFAULT_CONFIG.gates.skepticSecondPass, "skepticSecondPass"),
 		},
 		delivery: { mode: readDeliveryMode(delivery["mode"]) },
 		paths: {

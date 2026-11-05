@@ -14,7 +14,7 @@ import { loadPrd, runPlan, parsePlannerJson, normalizeTasks, parseVerdictStrict,
 import { runWaves } from "../src/engine/waves.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
-import { readJson } from "../src/util/fsx.ts";
+import { readJson, atomicWriteJson } from "../src/util/fsx.ts";
 
 const LIST_TS = `export function parseList(input: string): string[] {
 	return input.split("/").flatMap((part) => part.split(",")).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith("-"));
@@ -156,6 +156,40 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 
 		await kit.loop.close();
 		kit.lock.release();
+	});
+
+	it("handoff note queued by another process is ingested at the next wave and the file is removed", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await mkdir(join(project.root, "bin"), { recursive: true });
+		await writeFile(join(project.root, "eval-gate.cjs"), "process.exit(0);\n", "utf8");
+		await writeFile(join(project.root, "evals", "recipes.toml"), "[never-fails]\ncmd = \"node eval-gate.cjs\"\n", "utf8");
+		await initProject(project.root);
+
+		const { models, faux } = buildFauxModels([]);
+		// planner | impl write | impl answer | 1 verifier approve
+		faux.setResponses([
+			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "one", spec: "write src/one.ts", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1;\n" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "" }), { stopReason: "stop" }),
+		]);
+
+		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models });
+		const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
+		await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+
+		// Queue the note exactly like the `handoff` CLI does (atomic side-car).
+		await atomicWriteJson(kit.loop.paths.pendingHandoff, { ts: Date.now(), notes: ["keep tree clean"] });
+
+		await runWaves(kit, { approve: true, tasksFilter: [] });
+		const dumped = await readSessionState(kit.loop.harness);
+		expect(dumped.rows.some((r) => r.kind === "handoff" && r.verb === "handoff-ingested" && (r.detail ?? "").includes("keep tree clean"))).toBe(true);
+		// The handoff file is removed after ingestion (single process lock respected).
+		await kit.loop.close();
+		kit.lock.release();
+		await expect(readFile(join(project.root, ".orch", "pending-handoff.json"), "utf8")).rejects.toThrow();
 	});
 
 	it("lock refusal: a live lock owner blocks a second open (polite error, exit 1)", async () => {

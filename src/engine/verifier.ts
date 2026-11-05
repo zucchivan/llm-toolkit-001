@@ -52,7 +52,7 @@ async function diffVsBaseline(root: string, baseline: string): Promise<{ stat: s
 	return { stat, files: (list.stdout || "").trim().split("\n").filter(Boolean) };
 }
 
-export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, toolBoxOverride?: { read: ToolRegistration }): Promise<VerifyResult> {
+export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: { skepticSecondPass?: boolean } = {}): Promise<VerifyResult> {
 	const diff = await diffVsBaseline(kit.loop.paths.root, task.baselineTreeSha);
 	const criteriaIds = task.acceptance.map((a, i) => `${i + 1}`);
 
@@ -67,10 +67,7 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 		`Reply with the verdict JSON now.`,
 	].join("\n\n");
 
-	const kitConv = new ConversationKit(kit, {
-		...kit.loop.toolBox,
-		read: toolBoxOverride?.read ?? kit.loop.toolBox.read,
-	});
+	const kitConv = new ConversationKit(kit, kit.loop.toolBox);
 	const role = kit.loop.config.roles.verifier;
 	const conv = await kitConv.createUnit({
 		instructions: VERIFY_ROLE_BRIEF,
@@ -80,7 +77,22 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 		maxTurns: kit.loop.config.engine.maxTurns,
 	});
 	const outcome = await kitConv.submitAndAwait(conv, `verify-${task.id}-${Date.now()}`, content);
-	const parsed = parseVerdictStrict(outcome.answer ?? "");
+	let parsed = parseVerdictStrict(outcome.answer ?? "");
+
+	// Optional "skeptic second pass" (off by default): both verifier rounds must
+	// agree on `approve`; any disagreement degrades to needs_human.
+	if (options.skepticSecondPass && parsed.verdict === "approve") {
+		const convTwo = await kitConv.createUnit({
+			instructions: VERIFY_ROLE_BRIEF,
+			guard: { role: "verifier", targetPaths: [] },
+			tools: "read",
+			model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
+			maxTurns: kit.loop.config.engine.maxTurns,
+		});
+		const outcomeTwo = await kitConv.submitAndAwait(convTwo, `verify-${task.id}-skeptic-${Date.now()}`, `${content}\n\nSKEPTIC PASS: assume the diff is subtly wrong and try to refute approval before concluding.`);
+		const parsedTwo = parseVerdictStrict(outcomeTwo.answer ?? "");
+		if (parsedTwo.verdict !== "approve") parsed = { ...parsedTwo, notes: `skeptic pass: ${parsedTwo.notes}`.slice(0, 300) };
+	}
 
 	await commitState(kit, {
 		rows: [
