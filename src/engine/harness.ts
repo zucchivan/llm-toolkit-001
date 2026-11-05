@@ -20,6 +20,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { LockBusyError, acquireLock } from "../util/lockfile.ts";
 import { GovernorSleep } from "./tasks.ts";
+import { maybeFauxModels } from "./faux-replay.ts";
 import type { LockHandle } from "../util/lockfile.ts";
 import { exists as fileExists, atomicWriteJson } from "../util/fsx.ts";
 import { loadConfig, KIT_VERSION } from "../config.ts";
@@ -192,9 +193,10 @@ const builtinProviderFactories: Record<string, () => Provider> = {
  * Credentials resolve from env at request time (§ anti-goal: no secrets in config).
  * Tests register the faux provider via `models.setProvider(faux.provider)` themselves.
  */
-export function buildModels(needed: Iterable<string>): Models {
+export function buildModels(needed: Iterable<string>, flags: { fauxOverlay?: boolean } = {}): Models {
 	const models = createModels();
 	for (const id of needed) {
+		if (id === "faux" && flags.fauxOverlay) continue; // overlay wired via maybeFauxModels()
 		const factory = builtinProviderFactories[id];
 		if (!factory) {
 			throw new Error(
@@ -261,7 +263,11 @@ export async function openProjectHarness(
 		const config = loadConfig(root, paths.config);
 		assertPinnedPiDurable(config.engine.piDurable);
 
-		const models = opts.modelsOverride ?? buildModels(Object.values(config.roles).map((r) => r.provider));
+		const faux = maybeFauxModels();
+		const models =
+			opts.modelsOverride ??
+			faux?.models ??
+			buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined });
 
 		const tools: ToolRegistration[] = [createReadTool(), createWriteTool(), createEditTool(), createBashTool()];
 		const registry = createRegistry();

@@ -291,7 +291,7 @@ export async function driveTaskWaves(
 		// Engine-owned writes (router.md mirror sync, .orch runtime) are not the
 		// wave's output; the zero-progress breaker and scope verdicts use the rest.
 		const filesChanged = filesChangedRaw.filter((f) => !f.startsWith(".orch") && f !== "router.md" && f !== "PROMPT.md");
-		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
+		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedRaw=${JSON.stringify(filesChangedRaw)} engineFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
 		if (filesChanged.length === 0) {
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave produced zero file changes" }],

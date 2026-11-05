@@ -35,6 +35,7 @@ export async function initProject(root: string, options: InitOptions = {}): Prom
 	await mkdir(join(root, "evals"), { recursive: true });
 
 	for (const [relative, target] of templateTargets(projectName)) {
+		if (process.env["KIT_DEBUG"]) console.error("init target:", relative, "template:", join(templateDir, target));
 		const abs = join(root, relative);
 		const source = await readFile(join(templateDir, target), "utf8").catch(() => undefined);
 		if (source === undefined) continue; // engine-owned file without a template
@@ -94,8 +95,9 @@ function templateTargets(projectName: string): Array<[string, string]> {
 }
 
 function templateRoot(): string {
-	// templates ride next to dist/src: <package>/template
-	return join(pd(pd(fileURLToPath(import.meta.url))));
+	// templates ride in <package>/template: fileURLToPath is <pkg>/src/init.ts
+	// (source via tsx) or <pkg>/dist/init.js (built CLI) — parent twice, + /template
+	return join(pd(pd(fileURLToPath(import.meta.url))), "template");
 }
 
 function dirnameOf(abs: string): string {
