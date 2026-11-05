@@ -140,9 +140,10 @@ describe("gates", () => {
 	it("empty recipes still run the scope check and pass with no violation", async () => {
 		const { project, kit } = await bakeProject({ buildFauxModels });
 		const baseline = await (await import("../src/util/git.ts")).captureBaselineTree(project.root);
-		const gate = await runGates(kit, { id: "t", targetPaths: [] }, { "router.md": "irrelevant" });
-		void baseline;
+		const gate = await runGates(kit, { id: "t", targetPaths: [], baselineTreeSha: baseline }, { "router.md": "irrelevant" });
 		expect(gate.allPassed).toBe(true);
+		expect(gate.results[0]?.name).toBe("scope");
+		void project;
 	});
 });
 
