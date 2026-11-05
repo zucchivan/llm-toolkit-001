@@ -156,6 +156,7 @@ export function normalizeTasks(raw: { tasks: unknown[] }): RouterTask[] {
 			priority: typeof t["priority"] === "number" && Number.isFinite(t["priority"]) ? (t["priority"] as number) : 0,
 			status: "todo",
 			waveCount: 0,
+			convId: undefined,
 			baselineTreeSha: undefined,
 			lastGateHash: undefined,
 			feedback: [],

@@ -47,6 +47,8 @@ export type RouterTask = {
 	priority: number;
 	status: TaskStatus;
 	waveCount: number;
+	/** Durable conversation id of this task's implementer conversation. */
+	convId?: number;
 	/** Tree SHA captured before Wave 1 (§4.2.3). */
 	baselineTreeSha?: string;
 	/** SHA of the last failing gate output — duplicate-error breaker. */

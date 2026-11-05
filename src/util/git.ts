@@ -110,6 +110,11 @@ export async function restoreTree(cwd: string, baseTree: string): Promise<void> 
 	await run(["git", "clean", "-fd"], cwd);
 }
 
+/** Create/overwrite a local branch for task delivery (pr mode). */
+export async function recreateBranch(cwd: string, branch: string, fromTree: string): Promise<GitResult> {
+	return run(["git", "branch", "-f", branch, fromTree], cwd);
+}
+
 /** Persist a patch of the wave's changes (quarantine artifact). */
 export async function savePatch(cwd: string, baseTree: string, outFile: string): Promise<boolean> {
 	const r = await run(["git", "diff", "--binary", baseTree], cwd, 60_000);
