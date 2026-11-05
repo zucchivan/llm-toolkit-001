@@ -10,6 +10,12 @@ import type { FauxProviderHandle, FauxResponseStep } from "@earendil-works/pi-ai
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import type { SetTimer } from "./kit-types.ts";
 
+/** Fresh FakeClock per use (setTimer wiring must match one harness at a time). */
+export function fakeClockFor() {
+	return new FakeClock();
+}
+export { FakeClock as FakeClockClass };
+
 export { MemoryStorage };
 export type { FauxProviderHandle, Models, SetTimer };
 export { fauxAssistantMessage, fauxText, fauxToolCall };

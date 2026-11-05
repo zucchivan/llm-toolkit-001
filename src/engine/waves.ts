@@ -138,6 +138,7 @@ export async function runWaves(
 
 		// Budget ceiling first (§4.5): stop the loop before starting another wave.
 		const spent = await recomputeSpent(kit);
+		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] budget spent=$${spent.toFixed(6)} ceiling=$${kit.loop.config.budgets.sessionUsd}`);
 		if (spent > kit.loop.config.budgets.sessionUsd) {
 			summary.exit = "budget";
 			emit({ kind: "budget-stop", message: `budget reached at $${spent.toFixed(2)} of $${kit.loop.config.budgets.sessionUsd} — resume with \`run\`` });
@@ -284,22 +285,27 @@ export async function driveTaskWaves(
 			continue; // retried wave under the retry limit
 		}
 
+		// Zero-progress breaker (§4.5): the wave must move the tree. Fires before
+		// gates so a stalled implementer cannot burn verifier budget either.
+		const filesChangedRaw = await changedFilesVsTree(paths.root, baseline);
+		// Engine-owned writes (router.md mirror sync, .orch runtime) are not the
+		// wave's output; the zero-progress breaker and scope verdicts use the rest.
+		const filesChanged = filesChangedRaw.filter((f) => !f.startsWith(".orch") && f !== "router.md" && f !== "PROMPT.md");
+		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
+		if (filesChanged.length === 0) {
+			await commitState(kit, {
+				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave produced zero file changes" }],
+			});
+			await quarantine(kit, current, wave, "zero progress: no file changes");
+			continue;
+		}
+
 		// Gates (§4.3). Router.md is engine-synced: the expected bytes render from
 		// the doc AS OF NOW (the loop-top read is stale across baseline commits).
 		const stateAtGate = await readSessionState(kit.loop.harness);
 		const mirrorText = renderRouterMd(stateAtGate.router.tasks, stateAtGate.router.phase, stateAtGate.runStatus.prdPath);
 		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths, baselineTreeSha: baseline }, { "router.md": mirrorText });
 
-		// Zero-progress & duplicate-failure breakers (§4.5).
-		const filesChanged = await changedFilesVsTree(paths.root, baseline);
-		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
-		if (filesChanged.length === 0 && !gate.allPassed) {
-			await commitState(kit, {
-				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave changed no files and gates failed" }],
-			});
-			await quarantine(kit, current, wave, "zero progress: no file changes while gates fail");
-			continue;
-		}
 		if (gate.failHash && gate.failHash === current.lastGateHash) {
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gate.failHash.slice(0, 12) }],
