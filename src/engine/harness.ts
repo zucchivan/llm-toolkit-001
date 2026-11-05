@@ -11,18 +11,13 @@
  */
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Context, JsonValue } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT, Harness, NodeExecutionEnv, openNodeSqliteStorage, createReadTool, createWriteTool, createEditTool, createBashTool, createRegistry, defineDoc, defineExtension, hook, ToolTask, defineDoc as realDefineDoc } from "./kit.ts";
+import type { Context, Session, ConversationDocToken, Extension, ToolRegistration } from "./kit.ts";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Models, Provider, Usage } from "@earendil-works/pi-ai";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
-import { Harness, UsageDoc, createRegistry, defineDoc, defineExtension, hook, ToolTask } from "@earendil-works/pi-durable";
-import type { Session, ConversationDocToken, Extension, ToolRegistration } from "@earendil-works/pi-durable";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { LockBusyError, acquireLock } from "../util/lockfile.ts";
 import type { LockHandle } from "../util/lockfile.ts";
 import { exists as fileExists, atomicWriteJson } from "../util/fsx.ts";
@@ -34,7 +29,7 @@ export { LockBusyError, KIT_VERSION };
 
 // ---- type re-exports so engine modules never import pi-durable -------------
 export type { ConversationDocToken, Extension, ToolRegistration, Models, Usage };
-export { LiveDoc, UsageDoc } from "@earendil-works/pi-durable";
+export { LiveDoc, UsageDoc } from "./kit.ts";
 export { BACKGROUND_CONTEXT };
 export type { Context };
 
@@ -233,6 +228,8 @@ export interface LoopHarness {
 	paths: ProjectPaths;
 	harness: Harness;
 	models: Models;
+	/** Handle kit tools; ConversationKit selects these per role. */
+	toolBox: { read: ToolRegistration; write: ToolRegistration; edit: ToolRegistration; bash: ToolRegistration };
 	/** ring buffer of harness reports (task_faulted, task_interrupted, …) since open */
 	reports: ReportRow[];
 	/** Session-wide spend in USD via pi-ai usage (roles' config rates as fallback). */
@@ -300,6 +297,7 @@ export async function openProjectHarness(root: string, cmdHint: string): Promise
 				paths,
 				harness,
 				models,
+				toolBox: { read: tools[0]!, write: tools[1]!, edit: tools[2]!, bash: tools[3]! },
 				reports,
 				sessionUsage: () => computeSessionUsage(harness, config),
 				close: async () => {
@@ -373,7 +371,7 @@ function requireConfig(configPath: string): void {
 // Live status side-car (read by status --view from another process; §3.8)
 // ---------------------------------------------------------------------------
 
-export interface StatusPayload {
+export interface StatusPayloads {
 	kit: string;
 	piDurable: string;
 	ts: number;
@@ -386,10 +384,12 @@ export interface StatusPayload {
 	reports?: ReportRow[];
 	alert?: string;
 	message?: string;
+	/** Session usage estimate at flush time, USD. */
+	usageNote?: number;
 }
 
-export async function flushStatus(paths: ProjectPaths, payload: StatusPayload): Promise<void> {
+export async function flushStated(paths: ProjectPaths, payload: StatusPayloads): Promise<void> {
 	await atomicWriteJson(paths.status, payload);
 }
 
-export type { Session } from "@earendil-works/pi-durable";
+export type { Session };

@@ -14,7 +14,7 @@
  */
 import type { JsonValue } from "@earendil-works/chord";
 import type { SessionDocToken } from "@earendil-works/pi-durable";
-import { defineDoc } from "@earendil-works/pi-durable";
+import { defineDoc } from "./kit.ts";
 import { shasum } from "../util/git.ts";
 import { atomicWrite, atomicWriteJson } from "../util/fsx.ts";
 
