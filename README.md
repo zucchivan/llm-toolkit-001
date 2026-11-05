@@ -108,8 +108,8 @@ Docs: [`docs/concepts.md`](docs/concepts.md) (roles, stages, governor) ·
 | `@earendil-works/pi-ai` | 1.5.0 | provider/model access + faux provider for tests |
 | `@earendil-works/chord` | 1.5.0 | Context/context primitives under pi-durable |
 | `@earendil-works/pi-schema` | 1.5.0 | (transitive) tool argument schemas |
-| `smol-toml` | 1.4.0 | config + recipes parsing |
-| dev: `typescript@5.9.3`, `tsx`, `vitest`, `@types/node`, `smol-toml` | exact | build/dev/tests |
+| `smol-toml` | 1.9.1 | config + recipes parsing |
+| dev: `typescript@5.9.3`, `tsx@4.23.15`, `vitest@5.1.0`, `@types/node@26.6.6` | exact | build/dev/tests |
 
 Upgrading pi-durable: the API changes between releases — read
 [`docs/api-map.md`](docs/api-map.md) first; `PD_VERSION` + config `[engine] piDurable`
