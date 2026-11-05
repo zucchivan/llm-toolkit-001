@@ -16,11 +16,12 @@ const STREAM_CAP = 256 * 1024; // per stream capture guard
  * enforce a timeout. stdin is closed immediately: gate recipes must never
  * block on prompts ("wasteful beats interactive"). Env is inherited.
  */
-export function exec(argv: readonly string[], opts: { cwd: string; timeoutMs: number }): Promise<ExecOutcome> {
+export function exec(argv: readonly string[], inputs: { cwd: string; timeoutMs: number; env?: Record<string, string | undefined> }): Promise<ExecOutcome> {
 	return new Promise((resolve) => {
 		const proc = spawn(argv[0] ?? "", argv.slice(1), {
-			cwd: opts.cwd,
+			cwd: inputs.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
+			env: inputs.env ? { ...process.env, ...inputs.env } : undefined,
 		});
 		let stdout = "";
 		let stderr = "";
@@ -32,7 +33,7 @@ export function exec(argv: readonly string[], opts: { cwd: string; timeoutMs: nu
 			} catch {
 				/* already exited */
 			}
-		}, opts.timeoutMs);
+		}, inputs.timeoutMs);
 
 		proc.stdout!.on("data", (chunk: Buffer) => {
 			stdout += chunk.toString("utf8");

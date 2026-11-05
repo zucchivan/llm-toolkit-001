@@ -87,8 +87,7 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 			d.prdPath = prdPath;
 			d.prdSha = shasum(prdText);
 			d.kitVersion = KIT_VERSION;
-				d.humanApprovedAt = undefined;
-		},
+			},
 		rows: [
 			{
 				ts: Date.now(),
@@ -156,9 +155,6 @@ export function normalizeTasks(raw: { tasks: unknown[] }): RouterTask[] {
 			priority: typeof t["priority"] === "number" && Number.isFinite(t["priority"]) ? (t["priority"] as number) : 0,
 			status: "todo",
 			waveCount: 0,
-			convId: undefined,
-			baselineTreeSha: undefined,
-			lastGateHash: undefined,
 			feedback: [],
 		});
 	});

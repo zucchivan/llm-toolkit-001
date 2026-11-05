@@ -65,10 +65,6 @@ const EMPTY_ROUTER: RouterDocValue = { version: 1, phase: "empty", tasks: [] };
 /** One atomic commit of the three docs; mirrors + status.json follow best-effort. */
 export async function commitState(loopAndLock: LoopAndLock, input: StateInput): Promise<void> {
 	const harness = loopAndLock.loop.harness;
-	let routerAfter: RouterDocValue = EMPTY_ROUTER;
-	let statusAfter: RunStatusDocValue = defaultRunStatus();
-	let rowsAfter: WaveRow[] = [];
-
 	await harness.commit(
 		async (tx) => {
 			if (input.router) {
@@ -83,16 +79,22 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 				const wlDraft = await tx.doc(WaveLogDoc);
 				wlDraft.rows.push(...input.rows);
 			}
-			// Read the resulting values from inside the commit; reads through tx are free.
-			routerAfter = { ...((await tx.doc(RouterDoc)) as unknown as RouterDocValue) };
-			statusAfter = { ...((await tx.doc(RunStatusDoc)) as unknown as RunStatusDocValue) };
-			const wlRead = (await tx.doc(WaveLogDoc)) as unknown as { rows: WaveRow[] };
-			rowsAfter = wlRead.rows.slice();
 		},
 		BACKGROUND_CONTEXT,
 	);
 
-	await postCommit(loopAndLock, { routerAfter, statusAfter, rowsAfter, input });
+	// Drafts are commit-scoped: read the committed values via snapshots after resolution.
+	const [routerAfter, statusAfter] = await Promise.all([
+		harness.snapshot(RouterDoc, BACKGROUND_CONTEXT),
+		harness.snapshot(RunStatusDoc, BACKGROUND_CONTEXT),
+	]);
+	const wlRead = await harness.snapshot(WaveLogDoc, BACKGROUND_CONTEXT);
+	await postCommit(loopAndLock, {
+		routerAfter: { ...(routerAfter ?? { version: 1, phase: "empty", tasks: [] }) },
+		statusAfter: { ...(statusAfter ?? defaultRunStatus()) },
+		rowsAfter: wlRead?.rows ?? [],
+		input,
+	});
 }
 
 /** Apply data or mutator to a doc draft. */

@@ -156,9 +156,9 @@ export async function waitOutSleep(kit: LoopAndLock): Promise<boolean> {
 		// Stale sleep id (task already finished before close): clear and continue.
 		await commitState(kit, {
 			runStatus: (d) => {
-				d.sleepTaskId = undefined;
-				d.sleepUntil = undefined;
-				d.activeAlert = undefined;
+				delete d.sleepTaskId;
+				delete d.sleepUntil;
+				delete d.activeAlert;
 				d.consecutiveErrors = 0;
 			},
 			rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "sleep-clear", detail: "sleep task already terminal" }],
@@ -169,9 +169,9 @@ export async function waitOutSleep(kit: LoopAndLock): Promise<boolean> {
 	await kit.loop.harness.waitForTask(record.id as never, BACKGROUND_CONTEXT);
 	await commitState(kit, {
 		runStatus: (d) => {
-			d.sleepTaskId = undefined;
-			d.sleepUntil = undefined;
-			d.activeAlert = undefined;
+			delete d.sleepTaskId;
+			delete d.sleepUntil;
+			delete d.activeAlert;
 			d.sleepCycleCount = 0;
 		},
 		rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "sleep-woke", detail: "resumed after rate-limit sleep" }],

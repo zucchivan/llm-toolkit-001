@@ -15,6 +15,7 @@ import type { LoopAndLock } from "./harness.ts";
 import { commitState, readSessionState } from "./state.ts";
 import type { RouterTask, RouterDocValue, WaveRow, TaskFeedback } from "./infos.ts";
 import { runGates } from "./gates.ts";
+import { renderRouterMd } from "./infos.ts";
 import type { GateOutcome } from "./gates.ts";
 import { runVerify, gateSummaryText } from "./verifier.ts";
 import type { VerifyResult } from "./verifier.ts";
@@ -82,6 +83,16 @@ export async function runWaves(
 
 	// Human approval gate (§4.1): plan refuses to start waves until approved.
 	if (!state.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
+	if (state.runStatus.humanApprovedAt !== undefined || options.approve) {
+		await commitState(kit, {
+			router: (d) => {
+				if (d.phase === "planned") d.phase = "running";
+			},
+			rows: state.router.phase === "planned" && state.runStatus.humanApprovedAt === undefined
+				? [{ ts: Date.now(), kind: "wave", task: "session", verb: "approved", detail: "--approve stamped the router" }]
+				: [],
+		});
+	}
 	const approvedByStamp = state.runStatus.humanApprovedAt !== undefined;
 	if (!options.approve && !approvedByStamp) {
 		throw new DriverStateError(
@@ -115,6 +126,9 @@ export async function runWaves(
 				summary.exit = "complete";
 				emit({ kind: "complete", message: "STATUS: COMPLETE — the task queue is empty" });
 				await commitState(kit, {
+					router: (d) => {
+						d.phase = "complete";
+					},
 					statusPhase: { phase: "idle", message: "complete" },
 					rows: [{ ts: Date.now(), kind: "wave", task: "session", verb: "complete", detail: "queue empty" }],
 				});
@@ -270,11 +284,15 @@ export async function driveTaskWaves(
 			continue; // retried wave under the retry limit
 		}
 
-		// Gates (§4.3).
-		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths });
+		// Gates (§4.3). Router.md is engine-synced: the expected bytes render from
+		// the doc AS OF NOW (the loop-top read is stale across baseline commits).
+		const stateAtGate = await readSessionState(kit.loop.harness);
+		const mirrorText = renderRouterMd(stateAtGate.router.tasks, stateAtGate.router.phase, stateAtGate.runStatus.prdPath);
+		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths, baselineTreeSha: baseline }, { "router.md": mirrorText });
 
 		// Zero-progress & duplicate-failure breakers (§4.5).
 		const filesChanged = await changedFilesVsTree(paths.root, baseline);
+		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
 		if (filesChanged.length === 0 && !gate.allPassed) {
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave changed no files and gates failed" }],
@@ -304,7 +322,7 @@ export async function driveTaskWaves(
 					}
 				},
 				rows: [
-					{ ts: Date.now(), kind: "gate", task: task.id, wave, verb: gate.allPassed ? "pass" : "fail", detail: gate.results.map((r) => `${r.name}:${r.passed}`).join(","), reason: gate.scopeBody || undefined },
+					gateRowFor(task.id, wave, gate),
 				],
 			});
 			emit({
@@ -429,8 +447,7 @@ async function handleUnanswered(
 				d.activeAlert = `${maxErrors} consecutive run failures — quarantining ${task.id}`;
 			},
 		});
-		await quarantine(kit, task, wave, `consecutive run failures (${nextCount}/${maxErrors}): ${reason}`);
-		return "faulted";
+		return "faulted"; // the driver quarantines once
 	}
 	await commitState(kit, {
 		rows,
@@ -495,6 +512,20 @@ export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: numbe
 
 function artifact(path: string): string {
 	return path.split("/").slice(-2).join("/");
+}
+
+/** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
+function gateRowFor(taskId: string, wave: number, gate: GateOutcome): WaveRow {
+	const base: WaveRow = {
+		ts: Date.now(),
+		kind: "gate",
+		task: taskId,
+		wave,
+		verb: gate.allPassed ? "pass" : "fail",
+		detail: gate.results.map((r) => `${r.name}:${r.passed}`).join(","),
+	};
+	if (gate.scopeBody) base.reason = gate.scopeBody;
+	return base;
 }
 
 void appendFile;

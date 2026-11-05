@@ -1,0 +1,48 @@
+# .orch/config.toml — annotated project config (kit: llm-toolkit-001)
+# All fields have defaults; every field is optional; NO SECRETS live here
+# (providers read credentials from the environment, as pi-ai expects).
+
+[engine]
+# The exact pi-durable release this kit was written against. Mismatched
+# installed versions fail fast at boot with a pointer to docs/api-map.md.
+piDurable = "1.5.0"
+# Max tool rounds for one run (turn cap per conversation).
+maxTurns = 50
+# Wave retries per task: gates/verifier rejections before quarantine (0 allows 1 wave only).
+retryLimit = 3
+
+[roles.planner]      # PRD → task graph (one conversation)
+provider = "anthropic"
+modelId = "claude-sonnet-4-5"
+# thinkingLevel = "high"            # off | low | medium | high
+# costPerMillionInput = 3.0          # USD rate fallback when the provider/catalog cost is missing
+# costPerMillionOutput = 15.0
+
+[roles.implementer]  # one wave per task, coding tools
+provider = "anthropic"
+modelId = "claude-sonnet-4-5"
+# costPerMillionInput = 3.0
+# costPerMillionOutput = 15.0
+
+[roles.verifier]     # read-only verify conversation (cheaper or distinct model recommended)
+provider = "openrouter"
+modelId = "openai/gpt-5-nano"
+# costPerMillionInput = 0.1
+# costPerMillionOutput = 0.4
+
+[budgets]
+sessionUsd = 10.0            # ceiling on cumulative estimated spend; the loop ends gracefully
+waveUsdWarn = 2.0            # warn row when one wave's estimated spend crosses this
+maxConsecutiveErrors = 3     # back-to-back model/transport failures ⇒ quarantine, don't burn budget
+maxSleepCycles = 3           # rate-limit sleep round-trips per task across restarts
+
+[gates]
+timeoutSec = 120             # per recipe
+enforceTargetPaths = true    # scope check + beforeTool block writes outside targetPaths
+
+[delivery]
+mode = "none"                # "none" | "commit" | "pr" (pr additionally needs the --deliver flag)
+
+[paths]
+prd = "docs/prd.md"          # the planning input
+specs = "specs/"             # where optional per-task spec files live

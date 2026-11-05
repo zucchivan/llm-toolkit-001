@@ -40,6 +40,7 @@ import type {
 	Session,
 	ToolRegistration,
 	Task,
+	SetTimer,
 } from "@earendil-works/pi-durable";
 
 export {
@@ -79,6 +80,7 @@ export type {
 	Extension,
 	Session,
 	ToolRegistration,
+	SetTimer,
 };
 export { BACKGROUND_CONTEXT, withAbortSignal };
 

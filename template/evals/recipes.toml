@@ -1,0 +1,17 @@
+# Deterministic gate recipes. Zero exit and every optional `match` regex on stdout ⇒ pass.
+# `on` = path prefixes/globs that skip the recipe when untouched by the wave.
+# Start with NO shell gates (scope check only) and add what your project needs.
+
+# [lint]
+# cmd = "npm run lint"
+# on = ["src/"]
+
+# [typecheck]
+# cmd = "npm run typecheck"
+
+# [build]
+# cmd = "npm run build"
+
+# [unit-test]
+# cmd = "npm test -- --run"
+# on = ["src/", "test/"]

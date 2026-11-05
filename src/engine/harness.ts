@@ -12,7 +12,7 @@
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT, Harness, NodeExecutionEnv, openNodeSqliteStorage, createReadTool, createWriteTool, createEditTool, createBashTool, createRegistry, defineDoc, defineExtension, hook, ToolTask } from "./kit.ts";
-import type { Context, Session, ConversationDocToken, Extension, ToolRegistration } from "./kit.ts";
+import type { Context, Session, ConversationDocToken, Extension, ToolRegistration, SetTimer } from "./kit.ts";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Models, Provider, Usage } from "@earendil-works/pi-ai";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
@@ -248,7 +248,11 @@ export interface LoopAndLock {
  * `.orch/durable.sqlite`. Throws `LockBusyError` when another process owns the
  * storage (polite refusal; caller prints it and exits 1).
  */
-export async function openProjectHarness(root: string, cmdHint: string): Promise<LoopAndLock> {
+export async function openProjectHarness(
+	root: string,
+	cmdHint: string,
+	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer } = {},
+): Promise<LoopAndLock> {
 	const paths = projectPaths(root);
 	requireConfig(paths.config);
 	const lock = await acquireLock(paths.lock, cmdHint);
@@ -257,7 +261,7 @@ export async function openProjectHarness(root: string, cmdHint: string): Promise
 		const config = loadConfig(root, paths.config);
 		assertPinnedPiDurable(config.engine.piDurable);
 
-		const models = buildModels(Object.values(config.roles).map((r) => r.provider));
+		const models = opts.modelsOverride ?? buildModels(Object.values(config.roles).map((r) => r.provider));
 
 		const tools: ToolRegistration[] = [createReadTool(), createWriteTool(), createEditTool(), createBashTool()];
 		const registry = createRegistry();
@@ -275,6 +279,7 @@ export async function openProjectHarness(root: string, cmdHint: string): Promise
 		const harness = await Harness.open(storage, {
 			models,
 			registry,
+			...(opts.now || opts.setTimer ? { now: opts.now, setTimer: opts.setTimer } : {}),
 			env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? root }),
 			settings: {
 				retry: { enabled: true, maxRetries: 3, baseDelayMs: 2_000 },

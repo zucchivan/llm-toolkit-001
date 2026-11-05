@@ -58,8 +58,8 @@ export type RouterTask = {
 
 export type RouterDocValue = {
 	version: 1;
-	/** "empty" | "planned" — plan stops on "planned", waiting for --approve / humanApprovedAt. */
-	phase: "empty" | "planned";
+	/** empty → planned (review point) → running → complete. */
+	phase: "empty" | "planned" | "running" | "complete";
 	tasks: RouterTask[];
 }
 
@@ -145,7 +145,9 @@ export function renderRouterMd(tasks: RouterTask[], phase: RouterDocValue["phase
 		"> Mirror of the RouterDoc kept in durable storage; the engine rewrites this file.",
 		phase === "planned"
 			? "> STATUS: PLANNED — human review pending (`llm-toolkit-001 run --approve` to start)."
-			: "> STATUS: RUNNING/COMPLETE.",
+			: phase === "complete"
+				? "> STATUS: COMPLETE — task queue drained."
+				: "> STATUS: RUNNING/COMPLETE.",
 		"",
 	];
 	if (prd) lines.push(`PRD: ${prd}`, "");

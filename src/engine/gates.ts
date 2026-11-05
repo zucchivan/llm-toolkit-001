@@ -10,7 +10,7 @@ import { join } from "node:path";
 import * as toml from "smol-toml";
 import { exec } from "../util/exec.ts";
 import type { ExecOutcome } from "../util/exec.ts";
-import { workingTreeStatus, isProtectedPath } from "../util/git.ts";
+import { changedFilesVsTree, isScopeViolation } from "../util/git.ts";
 import type { LoopAndLock, ProjectPaths } from "./harness.ts";
 
 export interface Recipe {
@@ -77,7 +77,8 @@ export interface GateResult {
  */
 export async function runGates(
 	kit: LoopAndLock,
-	task: { id: string; targetPaths: string[] },
+	task: { id: string; targetPaths: string[]; baselineTreeSha: string },
+	engineFiles: Record<string, string> = {},
 ): Promise<GateOutcome> {
 	const paths = kit.loop.paths;
 	const now = Date.now();
@@ -85,12 +86,26 @@ export async function runGates(
 
 	// --- Scope check first (§4.3): git facts, no model inference. Empty
 	// targetPaths means no restriction beyond the protected files.
-	const statusFiles = await workingTreeStatus(paths.root);
-	const protectedTouched = statusFiles.filter(isProtectedPath);
+	// Engine-synced files (router.md mirrors the RouterDoc) whose CURRENT bytes
+	// equal the engine's render are not scope violations — the implementer
+	// cannot hand-edit them without breaking the match.
+	const engineSynced = (f: string): boolean => {
+		const expected = engineFiles[f];
+		return expected !== undefined ? readFileSync(join(paths.root, f), "utf8") === expected : false;
+	};
+	// Scope list = diff-vs-baseline + newly-created untracked files (changedFilesVsTree),
+	// not raw status: files unchanged since the baseline capture (incl. intent-to-add
+	// entries) are not the implementer's doing. Engine-managed runtime files drop
+	// out entirely: .orch/** churns every run, PROMPT.md is user-edited, and a
+	// correctly synced router.md equals the mirror bytes.
+	const statusFiles = (await changedFilesVsTree(paths.root, task.baselineTreeSha)).filter(
+		(f) => !f.startsWith(".orch") && f !== "PROMPT.md" && !engineSynced(f),
+	);
+	const protectedTouched = statusFiles.filter(isScopeViolation);
 	const outsideTouched =
 		task.targetPaths.length === 0
 			? []
-			: statusFiles.filter((f) => !isProtectedPath(f) && !targetPathsContain(f, task.targetPaths));
+			: statusFiles.filter((f) => !isScopeViolation(f) && !engineSynced(f) && !targetPathsContain(f, task.targetPaths));
 	const scopeOK = protectedTouched.length === 0 && outsideTouched.length === 0;
 	const scopeBody = [
 		protectedTouched.length ? `protected files modified: ${protectedTouched.join(", ")}` : "",
