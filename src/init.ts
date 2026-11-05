@@ -91,7 +91,6 @@ function templateTargets(projectName: string): Array<[string, string]> {
 		["router.md", "router.md"],
 		[".orch/config.toml", ".orch/config.toml"],
 	];
-	void projectName;
 }
 
 function templateRoot(): string {

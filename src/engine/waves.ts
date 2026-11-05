@@ -6,7 +6,7 @@
  * human approval stamp; rate-limited runs arm the governor's durable sleep and
  * exit 42 for the next `run` to pick up.
  */
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { readJson } from "../util/fsx.ts";
 import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
@@ -546,4 +546,3 @@ function gateRowFor(taskId: string, wave: number, gate: GateOutcome): WaveRow {
 	return base;
 }
 
-void appendFile;

@@ -30,7 +30,6 @@ export function queryList(items: string[], q: string): string[] {
 }
 void $.typeof;
 `;
-void QUERY_TS;
 
 const BIN_JS = `#!/usr/bin/env node
 import { parseList, renderList } from "../src/list.ts";
