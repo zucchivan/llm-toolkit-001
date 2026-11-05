@@ -11,7 +11,7 @@
  */
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT, Harness, NodeExecutionEnv, openNodeSqliteStorage, createReadTool, createWriteTool, createEditTool, createBashTool, createRegistry, defineDoc, defineExtension, hook, ToolTask, defineDoc as realDefineDoc } from "./kit.ts";
+import { BACKGROUND_CONTEXT, Harness, NodeExecutionEnv, openNodeSqliteStorage, createReadTool, createWriteTool, createEditTool, createBashTool, createRegistry, defineDoc, defineExtension, hook, ToolTask } from "./kit.ts";
 import type { Context, Session, ConversationDocToken, Extension, ToolRegistration } from "./kit.ts";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Models, Provider, Usage } from "@earendil-works/pi-ai";
@@ -19,6 +19,7 @@ import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { LockBusyError, acquireLock } from "../util/lockfile.ts";
+import { GovernorSleep } from "./tasks.ts";
 import type { LockHandle } from "../util/lockfile.ts";
 import { exists as fileExists, atomicWriteJson } from "../util/fsx.ts";
 import { loadConfig, KIT_VERSION } from "../config.ts";
@@ -262,6 +263,7 @@ export async function openProjectHarness(root: string, cmdHint: string): Promise
 		const registry = createRegistry();
 		registry.install(defineExtension({ name: "kit-tools", tools }));
 		registry.install(structuredBoundaryExtension());
+		registry.install(defineExtension({ name: "kit-governor", tasks: [GovernorSleep] }));
 
 		const reports: ReportRow[] = [];
 		const push = (row: ReportRow) => {

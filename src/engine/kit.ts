@@ -39,6 +39,7 @@ import type {
 	Extension,
 	Session,
 	ToolRegistration,
+	Task,
 } from "@earendil-works/pi-durable";
 
 export {
@@ -69,6 +70,7 @@ export {
 };
 export { createReadTool, createWriteTool, createEditTool, createBashTool };
 export type {
+	Task,
 	Conversation,
 	ConversationDocToken,
 	EntryId,

@@ -117,7 +117,7 @@ export type RunStatusDocValue = {
 	budgetSpentUsd: number;
 	activeAlert?: string;
 	/** Live sleep task (rate-limit breaker) the next run waits for before resuming. */
-	sleepTaskId?: string;
+	sleepTaskId?: number;
 	sleepUntil?: number;
 	sleepCycleCount: number;
 	consecutiveErrors: number;
