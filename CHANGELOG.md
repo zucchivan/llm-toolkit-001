@@ -27,6 +27,12 @@ Manual semver discipline: keep `package.json` version and the newest section in 
     holder's identity survives into cross-process views)
 - strictly read-only throughout: the inspector writes nothing; its one durable
   read is a writeless commit (`scanConversations`/`scanEntries` table scans)
+- visibility opens (`status`/`export`/`inspect` when the lock is free) wire
+  role providers leniently (`readView`): they never send model requests, so
+  projects configured on unwired providers (e.g. `faux`) stay viewable; plan/
+  run/verify still fail fast on unknown providers at boot
+- the `patches` health check exempts zero-progress quarantines (their reverted
+  diff is empty by definition — no patch file exists legitimately)
 
 ## 0.1.0 — 2026-11-05
 

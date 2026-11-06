@@ -237,7 +237,7 @@ async function cmdStatus(argv: string[]): Promise<void> {
 
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
 	try {
-		kit = await openProjectHarness(root, "status");
+		kit = await openProjectHarness(root, "status", { readView: true });
 		const state = await readSessionState(kit.loop.harness);
 		const usage = await kit.loop.sessionUsage();
 		const view = {
@@ -287,10 +287,11 @@ async function cmdInspect(argv: string[]): Promise<void> {
 	const paths = projectPaths(root);
 
 	// Storage mode when the lock is free; degraded side-car mode when a live run
-	// owns it (never touching storage, per the single-store-owner rule).
+	// owns it (never touching storage, per the single-store-owner rule). readView:
+	// visibility never sends model requests, so unknown role providers stay inert.
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
 	try {
-		kit = await openProjectHarness(root, "inspect");
+		kit = await openProjectHarness(root, "inspect", { readView: true });
 		const read = await readout(paths, { loop: kit });
 		await showReadout(read, { json, healthOnly, sections });
 		await kit.loop.close();
@@ -380,7 +381,7 @@ async function cmdExport(): Promise<void> {
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
 	try {
 		const root = resolve(procCwd());
-		kit = await openProjectHarness(root, "export");
+		kit = await openProjectHarness(root, "export", { readView: true });
 		const read = await readout(kit.loop.paths, { loop: kit });
 		const out = await writeExports(kit.loop.paths, { readout: read });
 		we.log(`exported: ${out.jsonFile}\n          ${out.htmlFile}`);

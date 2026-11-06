@@ -193,12 +193,14 @@ const builtinProviderFactories: Record<string, () => Provider> = {
  * Credentials resolve from env at request time (§ anti-goal: no secrets in config).
  * Tests register the faux provider via `models.setProvider(faux.provider)` themselves.
  */
-export function buildModels(needed: Iterable<string>, flags: { fauxOverlay?: boolean } = {}): Models {
+export function buildModels(needed: Iterable<string>, flags: { fauxOverlay?: boolean; lenient?: boolean } = {}): Models {
 	const models = createModels();
 	for (const id of needed) {
 		if (id === "faux" && flags.fauxOverlay) continue; // overlay wired via maybeFauxModels()
+		if (id === "faux" && flags.lenient) continue; // read-only views never send requests; display-only projects may say "faux"
 		const factory = builtinProviderFactories[id];
 		if (!factory) {
+			if (flags.lenient) continue; // visibility commands wire only what they will never call
 			throw new Error(
 				`roles.*.provider = "${id}" is not wired in this kit (supports: ${Object.keys(builtinProviderFactories).join(", ")}) — ` +
 					`see docs/api-map.md; config.toml holds no secrets, credentials come from env as pi-ai expects`,
@@ -253,7 +255,7 @@ export interface LoopAndLock {
 export async function openProjectHarness(
 	root: string,
 	cmdHint: string,
-	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer; retryMax?: number } = {},
+	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer; retryMax?: number; readView?: boolean } = {},
 ): Promise<LoopAndLock> {
 	const paths = projectPaths(root);
 	requireConfig(paths.config);
@@ -267,7 +269,7 @@ export async function openProjectHarness(
 		const models =
 			opts.modelsOverride ??
 			faux?.models ??
-			buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined });
+			buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined, lenient: opts.readView === true });
 
 		const tools: ToolRegistration[] = [createReadTool(), createWriteTool(), createEditTool(), createBashTool()];
 		const registry = createRegistry();

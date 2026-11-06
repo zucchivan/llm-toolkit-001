@@ -658,18 +658,23 @@ async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<He
 		}
 	}
 
-	// patches — every quarantined task should have a saved patch artifact.
+	// patches — quarantined tasks that MOVED the tree should have a saved patch;
+	// zero-progress quarantines revert an empty diff (legitimately no patch file).
 	const patchNames = input.artifacts.filter((a) => a.kind === "quarantine").map((a) => a.name);
+	const zeroProgress = new Set(
+		(state?.router.tasks ?? []).filter((t) => t.feedback.some((fb) => fb.text.includes("zero progress"))).map((t) => t.id),
+	);
 	const quarantined = (state ? state.router.tasks.filter((t) => t.status === "quarantined") : (payload?.tasks ?? []).filter((t) => t.status === "quarantined")).map((t) => t.id);
 	const missing: string[] = [];
 	for (const taskId of quarantined) {
+		if (zeroProgress.has(taskId)) continue;
 		if (!patchNames.some((name) => name.startsWith(`quarantined-${taskId}-w`))) missing.push(taskId);
 	}
 	checks.push(
 		missing.length
 			? { id: "patches", ok: false, severity: "warn", detail: `quarantined task(s) without a patch artifact: ${missing.join(", ")} — the wave diff may not have been saved` }
 			: quarantined.length > 0
-				? { id: "patches", ok: true, severity: "info", detail: `${quarantined.length} quarantined task(s) with saved patches` }
+				? { id: "patches", ok: true, severity: "info", detail: `${quarantined.length} quarantined task(s) with saved patches (zero-progress quarantines exempt)` }
 				: { id: "patches", ok: true, severity: "info", detail: "nothing quarantined" },
 	);
 
