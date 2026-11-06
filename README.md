@@ -21,7 +21,7 @@ verifier → done/quarantine, with a git-tracked paper trail at every step.
 npx llm-toolkit-001 init . --with-demo     # in the repo root of your project
 
 # 2. declare roles in .orch/config.toml
-#    planner/implementer on your主力 model, verifier on a cheaper one:
+#    planner/implementer on your main model, verifier on a cheaper one:
 #    provider+modelId per role; credentials come from env (ANTHROPIC_API_KEY etc.)
 
 # 3. write the PRD at docs/prd.md, then run one planning conversation
