@@ -381,27 +381,8 @@ async function cmdExport(): Promise<void> {
 	try {
 		const root = resolve(procCwd());
 		kit = await openProjectHarness(root, "export");
-		const state = await readSessionState(kit.loop.harness);
-		const usage = await kit.loop.sessionUsage();
-		const out = await writeExports(kit.loop.paths, {
-			state,
-			statusPayload: {
-				kit: state.runStatus.kitVersion || KIT_VERSION,
-				piDurable: kit.loop.config.engine.piDurable,
-				ts: Date.now(),
-				root,
-				lockedByPid: process.pid,
-				phase: "idle" as const,
-				budget: {
-					spentUsd: usage.totalUsd,
-					sessionCeilingUsd: kit.loop.config.budgets.sessionUsd,
-					waveWarnUsd: kit.loop.config.budgets.waveUsdWarn,
-				},
-				tasks: state.router.tasks.map((t) => ({ id: t.id, status: t.status, waveCount: t.waveCount, title: t.title })),
-				alert: state.runStatus.activeAlert,
-				usageNote: usage.totalUsd,
-			},
-		});
+		const read = await readout(kit.loop.paths, { loop: kit });
+		const out = await writeExports(kit.loop.paths, { readout: read });
 		we.log(`exported: ${out.jsonFile}\n          ${out.htmlFile}`);
 		await kit.loop.close();
 		kit.lock.release();
