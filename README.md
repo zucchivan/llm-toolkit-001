@@ -34,6 +34,7 @@ llm-toolkit-001 status --follow            # live panel (reads .orch/status.json
 # 5. paper trail: router.md (mirror), .orch/wave-log.jsonl (rows),
 #    .orch/artifacts/*.log (gate output), export HTML/JSON anytime:
 llm-toolkit-001 export
+llm-toolkit-001 inspect --health            # full snapshot: tasks, usage, timeline, health
 
 # extras
 llm-toolkit-001 handoff "context for the next wave"
@@ -74,6 +75,7 @@ Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 | `plan [--prd path]` | PRD → RouterDoc + router.md; STOP for human approval |
 | `run [--approve] [--tasks id…] [--deliver]` | the sequential wave cycle (resumable) |
 | `status [--follow]` | task graph + budgets from `.orch/status.json` (when a run is locked) or storage |
+| `inspect [--json] [--health] [section…]` | full visibility snapshot: tasks, usage splits, wave timeline, conversations, artifacts, health; degrades to side-cars while a run holds the lock |
 | `verify --task id` | one-off read-only verification incl. your manual edits |
 | `export` | per-project JSON+HTML report from storage into `.orch/artifacts/` |
 | `handoff "note"` | queue a note the driver ingests at the start of the next wave |

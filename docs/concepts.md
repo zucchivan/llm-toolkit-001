@@ -72,6 +72,44 @@ to `.orch/artifacts/quarantined-<task>-w<N>.patch`, then `git read-tree` +
 the baseline (engine runtime under `.orch/` is preserved). Subsequent
 independent tasks run against a clean tree.
 
+## Visibility
+
+Every view of the kit renders the same snapshot. `readout()` (`src/engine/inspector.ts`)
+assembles ONE `KitReadout` — identity, phase, tasks, wave-log rows, usage splits
+(session / per-model / per-task + spend rate), wave timeline, artifacts,
+conversation summaries, health checks — and every surface consumes it:
+
+| surface | command | mode |
+| --- | --- | --- |
+| live panel | `status [--follow]` | side-car first; storage briefly when the lock is free |
+| full snapshot | `inspect [--json] [--health] [section…]` | storage under the lock; side-cars only while a run owns it |
+| report files | `export` | storage under the lock; report.json = the readout verbatim |
+
+Two readable modes, one rule: pi-durable storage is single-owner, so while a
+run holds `.orch/lock` the inspector never opens it — it degrades to the atomic
+side-cars (`.orch/status.json` + `.orch/wave-log.jsonl`), and its health
+section marks every storage-bound check as skipped. `status` stays deliberately
+cheap (side-cars first, no usage joins); `inspect` is the full lock-holder
+snapshot. The inspector is strictly read-only: it writes nothing, and its one
+storage table read is a writeless commit (`scanConversations`/`scanEntries`).
+
+Health checks (`inspect --health`), id → meaning:
+
+- `pin` — installed pi-durable vs the tested pin (and the `[engine] piDurable` claim)
+- `prd` — PRD exists; sha drift vs `RunStatusDoc.prdSha` (planned digest)
+- `status-sidecar` — .orch/status.json parses; task statuses match the RouterDoc
+- `mirrors` — router.md / wave-log.jsonl byte-parity vs the durable docs render
+- `orphan` — `in_progress` tasks with no live run (resumable)
+- `pending-sleep` — the governor's armed durable sleep task + cycle cap
+- `patches` — quarantined tasks missing their `.orch/artifacts/*.patch` artifact
+- `alert` / `consecutive-errors` — governor alert + error cap surfaced
+- `storage-skip` — degraded-mode marker (why sections are absent)
+
+Conversation summaries (storage mode only): role attribution from each unit's
+`loop.guard` doc (planner / implementer / verifier), per-task `convId` join,
+entry counts by kind, resets, tool rounds, and per-conversation usage from each
+conversation's `pi.usage` doc — that is where per-task USD joins come from.
+
 ## Why side-cars
 
 pi-durable's SQLite is local-only and single-owner (§ one-process rule), so
