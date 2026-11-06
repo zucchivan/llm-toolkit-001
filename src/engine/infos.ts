@@ -175,6 +175,11 @@ function jsonl(rows: readonly WaveRow[]): string {
 	return rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
 }
 
+/** The exact bytes the engine mirrors into .orch/wave-log.jsonl (visibility parity checks). */
+export function renderWaveLogJsonl(rows: readonly WaveRow[]): string {
+	return jsonl(rows);
+}
+
 export interface MirrorTargets {
 	routerMd: string;
 	waveLogJsonl: string;

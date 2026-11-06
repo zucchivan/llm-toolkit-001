@@ -125,6 +125,7 @@ async function postCommit(
 	await flushStated(paths, {
 		kit: calculated.statusAfter.kitVersion,
 		piDurable: loopAndLock.loop.config.engine.piDurable,
+		lockedByPid: process.pid,
 		ts: Date.now(),
 		root: paths.root,
 		phase: calculated.input.statusPhase?.phase ?? "idle",

@@ -41,6 +41,10 @@ import type {
 	ToolRegistration,
 	Task,
 	SetTimer,
+	ConversationRecord,
+	EntryRecord,
+	Cursor,
+	Page,
 } from "@earendil-works/pi-durable";
 
 export {
@@ -81,6 +85,10 @@ export type {
 	Session,
 	ToolRegistration,
 	SetTimer,
+	ConversationRecord,
+	EntryRecord,
+	Cursor,
+	Page,
 };
 export { BACKGROUND_CONTEXT, withAbortSignal };
 

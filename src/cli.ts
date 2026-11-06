@@ -13,11 +13,13 @@ import { createRequire } from "node:module";
 const pjson = createRequire(import.meta.url)("../package.json") as { name?: string; version: string };
 import { initProject } from "./init.ts";
 import { KIT_VERSION, ConfigError } from "./config.ts";
-import { openProjectHarness, projectPaths, flushStated } from "./engine/harness.ts";
+import { openProjectHarness, projectPaths, flushStated, LockBusyError } from "./engine/harness.ts";
+import { readout, INSPECT_SECTIONS } from "./engine/inspector.ts";
 import { readSessionState } from "./engine/state.ts";
 import { loadPrd, runPlan, PlanParseError } from "./engine/planner.ts";
 import { runWaves } from "./engine/waves.ts";
 import type { ProgressEvent } from "./engine/driver-events.ts";
+import { renderInspectPanel } from "./views/inspect.ts";
 import { renderStatusPanel } from "./views/status.ts";
 import { writeExports } from "./views/export.ts";
 import { runVerify } from "./engine/verifier.ts";
@@ -51,6 +53,9 @@ function main(): void {
 			break;
 		case "status":
 			void cmdStatus(rest);
+			break;
+		case "inspect":
+			void cmdInspect(rest);
 			break;
 		case "verify":
 			void cmdVerify(rest);
@@ -261,6 +266,54 @@ async function cmdStatus(argv: string[]): Promise<void> {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// inspect — the full visibility snapshot (storage under the lock, side-cars when busy)
+// ---------------------------------------------------------------------------
+
+const INSPECT_SECTION_NAMES = new Set<string>(INSPECT_SECTIONS);
+
+async function cmdInspect(argv: string[]): Promise<void> {
+	const { values, positionals } = parseArgs({
+		args: argv,
+		options: { json: { type: "boolean", default: false }, health: { type: "boolean", default: false } },
+		strict: false,
+	});
+	const unknown = positionals.filter((s) => !INSPECT_SECTION_NAMES.has(s));
+	for (const name of unknown) we.error(`${c.yellow}unknown section${RESET} ${name} — known: ${[...INSPECT_SECTIONS].join(", ")}`);
+	const sections = positionals.filter((s) => INSPECT_SECTION_NAMES.has(s));
+	const json = values["json"] === true;
+	const healthOnly = values["health"] === true;
+	const root = resolve(procCwd());
+	const paths = projectPaths(root);
+
+	// Storage mode when the lock is free; degraded side-car mode when a live run
+	// owns it (never touching storage, per the single-store-owner rule).
+	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
+	try {
+		kit = await openProjectHarness(root, "inspect");
+		const read = await readout(paths, { loop: kit });
+		await showReadout(read, { json, healthOnly, sections });
+		await kit.loop.close();
+		kit.lock.release();
+	} catch (err) {
+		if (err instanceof LockBusyError) {
+			const read = await readout(paths);
+			await showReadout(read, { json, healthOnly, sections });
+			return;
+		}
+		kit?.lock.release();
+		fail(err, "inspect");
+	}
+}
+
+async function showReadout(read: Awaited<ReturnType<typeof readout>>, opts: { json: boolean; healthOnly: boolean; sections: string[] }): Promise<void> {
+	if (opts.json) {
+		we.log(JSON.stringify(read, null, 2));
+		return;
+	}
+	we.log(renderInspectPanel(read, { sections: opts.sections, healthOnly: opts.healthOnly }));
+}
+
 async function followLoop(paths: { status: string }, render: (payload: unknown) => void): Promise<void> {
 	for (;;) {
 		await new Promise((r) => setTimeout(r, 700));
@@ -398,6 +451,9 @@ function HELP(): string {
   ${CLI_NAME} run [--approve] [--tasks id] [--deliver]
                                           # the cycle; exit 0 done · 42 sleeping · 1 error/busy
   ${CLI_NAME} status [--follow]           # task graph + budgets from side-cars or storage
+  ${CLI_NAME} inspect [--json] [--health] [section…]
+                                          # full visibility: tasks, usage, conversations,
+                                          # timeline, artifacts, health (degrades to side-cars)
   ${CLI_NAME} verify --task id            # one-off read-only verification (works after manual edits)
   ${CLI_NAME} export                      # HTML/JSON report into .orch/artifacts/
   ${CLI_NAME} handoff "note"              # queue a note the next wave ingests

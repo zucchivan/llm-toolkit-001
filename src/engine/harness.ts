@@ -365,7 +365,8 @@ export function estimateUsageUsd(record: unknown, rates: CostRates | undefined):
 	return usageUsd(unwrapUsage(record), rates);
 }
 
-function roleRatesFor(config: KitConfig, modelKey: string): CostRates | undefined {
+/** Config rates (USD per 1M tokens) for one `provider/modelId` usage key; absent when nothing matches. */
+export function roleRatesFor(config: KitConfig, modelKey: string): CostRates | undefined {
 	for (const role of Object.values(config.roles)) {
 		if (`${role.provider}/${role.modelId}` === modelKey) {
 			return { costPerMillionInput: role.costPerMillionInput, costPerMillionOutput: role.costPerMillionOutput };
