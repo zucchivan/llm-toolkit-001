@@ -100,8 +100,9 @@ llm-toolkit-001 ui --no-open
 
 See [`ui/README.md`](ui/README.md) and [`ui/PRD.md`](ui/PRD.md); the only core
 changes are the additive `readout.seam = 1` fields (ui/PRD.md Appendix A).
-CI (`.github/workflows/ui.yml`) runs the engine suite and the ui sub-product's
-suites — including the faux e2e against the real CLI — on every push/PR.
+Verification runs locally (this repo carries no hosted CI): the engine suite
+and the ui sub-product's suites — including the faux e2e against the real
+CLI — before any push.
 
 The seam now (A.2/A.3) also persists a display-oriented per-task patch + stats
 side-car for every done/quarantined task (`.orch/artifacts/task-<id>.patch` +

@@ -9,7 +9,8 @@ verify → export, without touching the terminal. Scope of **M2**: diffs as
 evidence — per-task patches + stats, quarantine patches, and a live in-flight
 preview. Scope of **M3**: operator polish — a health panel,
 keyboard shortcuts, the event-log filter, a budget bar, kind empty/error
-states, an accessibility pass, and a CI pipeline that runs the faux e2e.
+states, an accessibility pass, and a then-CI pipeline that ran the faux e2e
+(removed later at the ship owner's word — see Building/testing).
 Scope of **M4-a**: §7.5 conversation visibility — stage 1 (0.5.0) shipped the
 summary list + read-only summary drawer; stage 2 (0.5.1) added the bounded
 transcript excerpts (Appendix A.5): kind-labeled entry rows, collapsed tool
@@ -296,7 +297,7 @@ Two layers, both in `test/`:
 
 The faux e2e (`test-e2e`) rides the real CLI in a baked demo project and is
 kept out of default `npm test` (it is gated on `KIT_FAUX=1` and runs as
-`test:e2e`; CI runs it in the `ui` job — see `.github/workflows/ui.yml`).
+`test:e2e`).
 
 ## How it reads the loop
 
@@ -345,11 +346,11 @@ ui/
   test/                        # vitest server contract + auth + sse + actions/jobs + components + e2e
 ```
 
-CI (`.github/workflows/ui.yml`, added in M3): one pipeline, two jobs — the
-kit's engine suite (install + test + build at the root) and the ui sub-product
-(install, test, typecheck, svelte-check, build, and the faux e2e, which builds
-the kit first because it spawns the real `dist/cli.js`). Node 22 — both
-packages require ≥ 22.19.
+No hosted CI (the M3 workflow was removed at the ship owner's word): the
+suites run by hand — the kit's engine suite (root `npm test` + `npm run
+build`) and the ui sub-product (`test`, `typecheck`, `svelte-check` via
+`check`, `build`, and the faux e2e, which builds the kit first because it
+spawns the real `dist/cli.js`). Node 22 — both packages require ≥ 22.19.
 
 Node ≥ 22.19 (same as the kit). Everything is local-machine only — loopback,
 one user, no TLS — exactly as scoped in `ui/PRD.md` §12 for v1.
