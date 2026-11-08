@@ -371,6 +371,8 @@ JSON errors: `{ error: string, detail?: string }` with the listed status codes.
 | POST | `/api/actions` | `{ kind, ...params }` → `202 { jobId }` |
 | GET | `/api/tasks/:id/diff` | persisted patch + stats; `404` if none |
 | GET | `/api/tasks/:id/diff/live` | live patch vs baseline; `409` if not running |
+| GET | `/api/conversations/:id/entries` | A.5 bounded transcript excerpt (≤ 2,000 entries; storage-mode lock-per-read; `404` unknown id, `409` while a run owns the lock) |
+| GET | `/api/project/sources` | M5 read-only source viewers' data — M5-a: config + PRD; M5-b: PROMPT.md (fixed root path) + `evals/recipes.toml` (the engine gate loader's verdict; absence = defined empty-gates state). Raw text + verdicts; static files, no lock, ≤ 5 MiB text, `binary` labeled; there is NO mutation route for these files (§5) |
 | GET | `/api/artifacts` | artifact list (same as readout) |
 | GET | `/api/artifacts/:name` | artifact text; allowlisted names, size cap |
 
@@ -630,7 +632,7 @@ together with the milestone that consumes it.
 - LAN/Tailscale access with the same token model.
 - Multi-project switcher.
 - Safe stop for attached (terminal-started) runs, with PID/command verification.
-- Delivery toggle and config/PRD/router editors.
+- Delivery toggle and config/PRD/router EDIT editors — the read half shipped in M5 (decision D5): `/api/project/sources` serves `.orch/config.toml`, the PRD, PROMPT.md and `evals/recipes.toml` raw + read-only; router.md stays plan-review-only; no editing route exists for any of them.
 - Mobile/responsive layouts.
 
 ## 19. Decision log
@@ -722,6 +724,16 @@ semantics, config, docs, or CLI output for users who never open the UI.
 - Missing UI package: print `npm --prefix ui install` (repo) / the package
   install hint and exit 1.
 - No other core CLI changes.
+
+### A.5 Conversation transcript excerpts (additive, inspector-level)
+- The UI may show bounded, read-only transcript excerpts: `inspector.ts` gains `conversationEntries(loop, id, opts)` returning plain JSON-able entry shapes (kind, timestamps, and content fields as strings — no pi-durable types cross the module boundary; the UI server never imports kit.ts).
+- Entry caps mirror the summary scan: at most MAX_ENTRY_PAGES_PER_CONV pages × ENTRIES_PER_PAGE entries per request (≤ 2,000), plus a `truncated` flag; no pagination protocol in v1 — the cap is the contract.
+- Storage-mode only, lock-per-read: the excerpt is read inside the same brief `openProjectHarness` window the readout uses; side-cars mode answers with the established "conversation detail returns when the lock is free — a run is live" empty state. Never hold the lock between requests.
+- Read-only: the callable only scans entries (same BACKGROUND_CONTEXT gated pattern as collectConversations); no writes, no CLI surface change, no behavior change when the UI is absent. Seam version stays `readout.seam = 1` (A.5 is additive surface, not a new seam version — note this choice in the PRD edit).
+
+### A.6 Delivery truth (additive, read-only)
+- `KitReadout` gains an additive `delivery` section: `mode` — the configured `delivery.mode` (§4.6: `none | commit | pr`) — and `rows` — the wave log's kind `"delivery"` rows echoed as plain JSON-able shapes (`ts`, `task`, `verb`, `wave?`, `detail?`). Both modes serve it: storage reads the mode from the open config; side-car mode best-effort re-reads `.orch/config.toml` (a static file, not the owned storage) and omits `mode` when the config itself is unreadable, while the outcome rows still come from the wave log.
+- Read-only, and deliberately WITHOUT a UI mutation: per §5 delivery stays a config + CLI decision. The CLI's only delivery paths are the config's `delivery.mode` and the `--deliver` run qualifier the `pr` mode requires (a per-run override of what a human typed, not a safe toggle) — exposing either as an action would be the §5 non-goal and a §7.2 action-table change. No config write, no new CLI flag/command, no behavior change when the UI is absent. Delivery/config editing stays deferred to M5 (§18). Seam version stays `readout.seam = 1` (A.6 is additive surface, not a new seam version).
 
 ## Appendix B — Detached job runner
 

@@ -9,11 +9,17 @@
  *   - `sleep` — the governor's armed rate-limit sleep (§8.5 sleeping banner +
  *     countdown); A.1 already flushes these, M0 shipped the flush.
  *   - `prdPath` — the configured PRD path (§8.2 plan dialog prefill).
+ *
+ * A.5 adds `readConversationEntries()`: the same lock-per-read window serves
+ * bounded conversation transcript excerpts. A busy lock (after the brief
+ * retry) answers 409 with the established "conversation detail returns when
+ * the lock is free — a run is live" tone; the excerpt is read inside the one
+ * brief harness window and the lock is released immediately after.
  */
 import { openProjectHarness, projectPaths } from "../../src/engine/harness.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
-import { readout } from "../../src/engine/inspector.ts";
-import type { KitReadout } from "../../src/engine/inspector.ts";
+import { conversationEntries, readout } from "../../src/engine/inspector.ts";
+import type { ConvEntriesView, KitReadout } from "../../src/engine/inspector.ts";
 import { LockBusyError } from "../../src/util/lockfile.ts";
 import { dirname, join } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
@@ -69,6 +75,44 @@ export async function readOnce(projectRoot: string): Promise<ReadoutSnapshot> {
 		try {
 			const read = await readout(loop.loop.paths, { loop });
 			return { readout: read, mode: "storage", at: Date.now(), ...await statusExtras(projectRoot) };
+		} finally {
+			// release immediately — the lock is never held between requests
+			await loop.loop.close().catch(() => {});
+			loop.lock.release();
+		}
+	}
+}
+
+/** A.5 excerpt read: ok (storage window) | 404 (unknown conversation) | 409 (lock busy, the established empty state). */
+export type ConversationEntriesRead = { ok: true; view: ConvEntriesView } | { ok: false; status: 404 | 409; error: string };
+
+/**
+ * A.5 conversation transcript excerpts: the same lock-per-read discipline as
+ * readOnce — briefly open the harness, scan the bounded excerpt inside that
+ * window, release. LockBusy after the brief retry → 409 in the established
+ * tone (the client renders the same empty state the panel uses). Never holds
+ * the lock between requests.
+ */
+export async function readConversationEntries(projectRoot: string, conversationId: number): Promise<ConversationEntriesRead> {
+	for (let attempt = 0; ; attempt++) {
+		let loop: Awaited<ReturnType<typeof openProjectHarness>>;
+		try {
+			// readView: visibility never sends model requests (same as readOnce).
+			loop = await openProjectHarness(projectRoot, "ui", { readView: true });
+		} catch (err) {
+			if (err instanceof LockBusyError) {
+				if (attempt < LOCK_RETRIES) {
+					await new Promise((r) => setTimeout(r, LOCK_RETRY_DELAY_MS));
+					continue;
+				}
+				return { ok: false, status: 409, error: "conversation detail returns when the lock is free — a run is live" };
+			}
+			throw err;
+		}
+		try {
+			const view = await conversationEntries(loop, conversationId);
+			if (!view) return { ok: false, status: 404, error: `no conversation #${conversationId} in this project` };
+			return { ok: true, view };
 		} finally {
 			// release immediately — the lock is never held between requests
 			await loop.loop.close().catch(() => {});

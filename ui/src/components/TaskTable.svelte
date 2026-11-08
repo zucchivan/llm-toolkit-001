@@ -1,19 +1,27 @@
 <script lang="ts">
 	import type { KitTaskView } from "../../../src/engine/inspector.ts";
 	import { STATUS_GLYPH } from "../lib/format.ts";
-	import { sortedTasks, type TaskSort } from "../lib/view.ts";
+	import { sortedTasks, filterTasks, TASK_STATUSES, type TaskSort, type TaskStatusFilter } from "../lib/view.ts";
 
-	let { tasks, phase, onOpenDiff }: { tasks: KitTaskView[]; phase: string; onOpenDiff: (task: string) => void } = $props();
+	let { tasks, phase, onOpenDiff, highlight }: { tasks: KitTaskView[]; phase: string; onOpenDiff: (task: string) => void; /** Conversation-drawer link: the task row the open conversation belongs to. */ highlight?: string } = $props();
 
 	// §15.1 task-table sorting: plan order by default (stable rows while the run
-	// progresses), or a failing-first status sort. Filter stays a §13/§16 deferral.
+	// progresses), or a failing-first status sort.
 	let sort = $state<TaskSort>("plan");
-	const shown = $derived(sortedTasks(tasks, sort));
+	// M4-c row filter (the §13/§16 deferral, shipped): a status chip plus a
+	// case-insensitive text match (id/title/deps/targets) — sibling of the event
+	// log's filter; pure filterTasks owns the math. Sort composes on top.
+	let status = $state<TaskStatusFilter>("all");
+	let text = $state("");
+	const active = $derived(status !== "all" || text.trim() !== "");
+	const shown = $derived(sortedTasks(filterTasks(tasks, { status, text }), sort));
+
+	const statusLabel = (s: KitTaskView["status"]): string => STATUS_GLYPH[s]?.label ?? s;
 </script>
 
 <section class="panel">
 	<div class="panel-header">
-		<span>tasks ({tasks.length})</span>
+		<span>tasks ({shown.length}{shown.length !== tasks.length ? ` of ${tasks.length}` : ""})</span>
 		<button
 			class="btn tiny"
 			title={sort === "plan"
@@ -38,6 +46,31 @@
 			{/if}
 		</span>
 	</div>
+	<div style="display:flex; gap:8px; align-items:center; padding:6px 12px; border-bottom:1px solid var(--border)">
+		<input
+			class="input input-sm"
+			type="text"
+			placeholder="filter — id, title, dependency"
+			aria-label="filter tasks by id, title, or dependency"
+			spellcheck="false"
+			bind:value={text}
+		/>
+		<select
+			class="input input-sm"
+			style="min-width:130px"
+			aria-label="filter tasks by status"
+			value={status}
+			onchange={(e) => (status = (e.currentTarget as HTMLSelectElement).value as TaskStatusFilter)}
+		>
+			<option value="all">all statuses</option>
+			{#each TASK_STATUSES as s (s)}
+				<option value={s}>{statusLabel(s)}</option>
+			{/each}
+		</select>
+		{#if active}
+			<button class="btn tiny" onclick={() => { text = ""; status = "all"; }} title="clear the task filter">reset</button>
+		{/if}
+	</div>
 	<table class="grid" aria-label="tasks — status, id, title, waves, dependencies, diff">
 		<thead>
 			<tr>
@@ -51,7 +84,7 @@
 		</thead>
 		<tbody>
 			{#each shown as task (task.id)}
-				<tr class:row-cur={task.status === "in_progress"}>
+				<tr class:row-cur={task.status === "in_progress"} class:row-link={highlight !== undefined && task.id === highlight}>
 					<td class="st-{task.status}">
 						{STATUS_GLYPH[task.status]?.glyph ?? "?"} {STATUS_GLYPH[task.status]?.label ?? task.status}
 					</td>
@@ -74,7 +107,13 @@
 					</td>
 				</tr>
 			{:else}
-				<tr><td colspan="6" class="muted" style="padding:14px">no tasks — write the PRD and run `plan` in the CLI first</td></tr>
+				<tr><td colspan="6" class="muted" style="padding:14px">
+					{#if tasks.length === 0}
+						no tasks — write the PRD and run `plan` in the CLI first
+					{:else}
+						no tasks match{status !== "all" ? ` status “${statusLabel(status)}”` : ""}{text.trim() ? ` “${text.trim()}”` : ""} — clear the filter to see all {tasks.length}
+					{/if}
+				</td></tr>
 			{/each}
 		</tbody>
 	</table>

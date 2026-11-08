@@ -6,7 +6,7 @@
 	 * replaces on each snapshot.
 	 */
 	import { fetchReadout, fetchJobs, postAction, type ReadoutSnapshot, type JobsPayload, type ActionBody } from "./lib/api.ts";
-	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, firstFailureLine, type FailureRow } from "./lib/view.ts";
+	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, hashConversationDrawer, isConversationListHash, conversationById, firstFailureLine, type FailureRow } from "./lib/view.ts";
 	import type { ToastMessage } from "./components/Toasts.svelte";
 	import { actionRequestToBody, describeStopTarget } from "./lib/dialog-requests.ts";
 	import type { ActionRequest } from "./lib/actions-model.ts";
@@ -25,6 +25,9 @@
 	import EventLog from "./components/EventLog.svelte";
 	import Toasts from "./components/Toasts.svelte";
 	import DiffViewer from "./components/DiffViewer.svelte";
+	import ConversationPanel from "./components/ConversationPanel.svelte";
+	import ConversationDrawer from "./components/ConversationDrawer.svelte";
+	import ProjectSources from "./components/ProjectSources.svelte";
 
 	let snapshot = $state<ReadoutSnapshot | undefined>(undefined);
 	let jobs = $state<JobsPayload | undefined>(undefined);
@@ -63,6 +66,75 @@
 		return () => window.removeEventListener("hashchange", onHash);
 	});
 
+	// --- conversations (§7.5, M4-a stage 1): collapsible list panel (#/conversations)
+	// + read-only summary drawer per conversation (#/conversations/<id>).
+	let convPanelOpen = $state(false);
+	let convDrawerId = $state<number | undefined>(undefined);
+
+	function toggleConversations(): void {
+		convPanelOpen = !convPanelOpen;
+		if (convPanelOpen) {
+			history.replaceState(null, "", "#/conversations");
+		} else if (convDrawerId === undefined) {
+			history.replaceState(null, "", location.hash === "#/conversations" ? "#" : location.hash || "#");
+		}
+	}
+
+	function openConversation(id: number): void {
+		convDrawerId = id;
+		convPanelOpen = true;
+		history.replaceState(null, "", `#/conversations/${id}`);
+	}
+
+	function closeConversation(): void {
+		convDrawerId = undefined;
+		if (location.hash.startsWith("#/conversations/")) {
+			history.replaceState(null, "", "#/conversations");
+		}
+	}
+
+	// Deep links: #/conversations opens the list, #/conversations/<id> the
+	// drawer; user-driven hash changes (back/forward) sync both.
+	$effect(() => {
+		const onHash = (): void => {
+			if (isConversationListHash(location.hash)) {
+				convPanelOpen = true;
+				convDrawerId = undefined;
+				return;
+			}
+			const id = hashConversationDrawer(location.hash);
+			if (id !== undefined) {
+				convDrawerId = id;
+				convPanelOpen = true;
+			} else if (convDrawerId !== undefined) {
+				convDrawerId = undefined;
+			}
+		};
+		window.addEventListener("hashchange", onHash);
+		return () => window.removeEventListener("hashchange", onHash);
+	});
+
+	// --- sources (M5-a): read-only config + PRD viewers (#/sources, sibling of #/health)
+	let sourcesOpen = $state(false);
+
+	function toggleSources(): void {
+		sourcesOpen = !sourcesOpen;
+		history.replaceState(null, "", sourcesOpen ? "#/sources" : location.hash === "#/sources" ? "#" : location.hash || "#");
+	}
+
+	$effect(() => {
+		const onHash = (): void => {
+			sourcesOpen = location.hash === "#/sources";
+		};
+		window.addEventListener("hashchange", onHash);
+		return () => window.removeEventListener("hashchange", onHash);
+	});
+
+	// The open drawer's conversation (storage mode only; undefined otherwise).
+	const convDrawer = $derived(conversationById(snapshot?.readout.storage?.conversations, convDrawerId));
+	/** The task row the open conversation belongs to (task-table highlight). */
+	const convHighlightTask = $derived(convDrawer?.task);
+
 	// --- shortcut sheet ("?") + global keys (§10): Esc sheet > dialog > drawer,
 	// "/" focuses the event filter, "?" opens the sheet. No destructive keys.
 	let sheetOpen = $state(false);
@@ -70,12 +142,13 @@
 	$effect(() => {
 		const onKey = (e: KeyboardEvent): void => {
 			if (e.key === "Escape") {
-				const target = escapeTarget({ sheetOpen, dialogOpen: dialog !== undefined, drawerOpen: diffDrawerTask !== undefined || unknownDrawerTask !== undefined });
+				const target = escapeTarget({ sheetOpen, dialogOpen: dialog !== undefined, drawerOpen: diffDrawerTask !== undefined || unknownDrawerTask !== undefined || convDrawerId !== undefined });
 				if (target === "sheet") {
 					sheetOpen = false;
 					e.preventDefault();
 				} else if (target === "drawer") {
-					closeDiff();
+					if (diffDrawerTask !== undefined || unknownDrawerTask !== undefined) closeDiff();
+					else closeConversation();
 					e.preventDefault();
 				}
 				// target === "dialog": ActionDialog closes itself; null: nothing to close.
@@ -339,9 +412,11 @@
 			{/if}
 			<JobList {jobs} {now} onStop={openStopDialog} latestDiffTask={latestDiff} onOpenDiff={openDiff} />
 			<HealthPanel health={snapshot.readout.health} open={healthOpen} onToggleHealth={toggleHealth} />
+			<ConversationPanel conversations={snapshot.readout.storage?.conversations} taskOrder={snapshot.readout.tasks.map((t) => t.id)} hasStorage={snapshot.readout.storage !== undefined} open={convPanelOpen} onToggle={toggleConversations} onOpen={openConversation} />
+			<ProjectSources open={sourcesOpen} configError={snapshot.configError} onToggle={toggleSources} />
 		</div>
 		<div>
-			<TaskTable tasks={snapshot.readout.tasks} phase={snapshot.readout.phase} onOpenDiff={openDiff} />
+			<TaskTable tasks={snapshot.readout.tasks} phase={snapshot.readout.phase} onOpenDiff={openDiff} highlight={convHighlightTask} />
 			<EventLog rows={snapshot.readout.rows} />
 		</div>
 	</div>
@@ -387,6 +462,33 @@
 			the deep link names a task the current plan doesn't have (it may have been
 			re-planned since the link was made). close, or check the task table for the ids that do exist.
 		</div>
+	</div>
+{/if}
+
+{#if convDrawerId !== undefined}
+	<!-- the conversation drawer: same shell as the diff drawer (Esc via the
+	     global chain, close button, hash deep link back to the list) -->
+	<div class="drawer" role="dialog" aria-label={convDrawer ? `conversation ${convDrawer.id} — ${convDrawer.role}` : `conversation drawer — ${convDrawerId}`}>
+		<div class="panel-header">
+			<span>conversation drawer</span>
+			<button class="btn tiny" onclick={closeConversation}>close</button>
+		</div>
+		{#if convDrawer}
+			{#key convDrawer.id}
+				<ConversationDrawer conv={convDrawer} />
+			{/key}
+		{:else if snapshot?.readout.storage === undefined}
+			<div class="banner">
+				<strong>conversation detail returns when the lock is free — a run is live.</strong>
+				this drawer fills itself in on the next storage snapshot; no need to reload or press anything.
+			</div>
+		{:else}
+			<div class="banner">
+				<strong>no conversation <code>#{convDrawerId}</code> in this readout.</strong>
+				the deep link names a conversation the current store doesn't have (older plans retire
+				theirs). close, or pick a live one from the conversations panel.
+			</div>
+		{/if}
 	</div>
 {/if}
 

@@ -1,6 +1,6 @@
 /** Client formatting helpers (pure; runs under node). */
 import { describe, expect, it } from "vitest";
-import { clockTime, healthLevel, msDuration, phaseLabel, relativeAge, STATUS_GLYPH, usd } from "../src/lib/format.ts";
+import { bytesLabel, clockTime, healthLevel, msDuration, phaseLabel, relativeAge, STATUS_GLYPH, usd } from "../src/lib/format.ts";
 
 describe("format helpers", () => {
 	it("usd", () => {
@@ -21,6 +21,13 @@ describe("format helpers", () => {
 	it("clockTime renders HH:MM:SS", () => {
 		expect(clockTime(Date.UTC(2026, 0, 1, 9, 5, 3))).toBe("09:05:03");
 		expect(clockTime(Number.NaN)).toBe("--:--:--");
+	});
+
+	it("bytesLabel", () => {
+		expect(bytesLabel(0)).toBe("0 bytes");
+		expect(bytesLabel(-3)).toBe("0 bytes");
+		expect(bytesLabel(2_048)).toBe("2,048 bytes");
+		expect(bytesLabel(Number.NaN)).toBe("0 bytes");
 	});
 
 	it("relativeAge", () => {

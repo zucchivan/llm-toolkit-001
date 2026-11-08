@@ -522,3 +522,111 @@ input.input:focus-visible {
 .diffline.del { background: color-mix(in srgb, var(--bad) 13%, transparent); color: color-mix(in srgb, var(--bad) 70%, var(--text)); }
 .dcut { padding: 4px 10px; font-size: 11.5px; }
 .live-diff { border-style: dashed; }
+
+/* ---- M4-a: conversation list + drawer (§7.5 summaries) ---- */
+
+.convrow {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	width: 100%;
+	padding: 4px 12px;
+	font-size: 12px;
+	background: none;
+	border: none;
+	border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+	color: var(--text);
+	font: inherit;
+	cursor: pointer;
+	text-align: left;
+	flex-wrap: wrap;
+}
+.convrow:last-child { border-bottom: none; }
+.convrow:hover { background: var(--panel-2); }
+.convrow .chip { min-width: 0; }
+.conv-entries { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.convgroup {
+	padding: 6px 12px 2px;
+	font-size: 10.5px;
+	color: var(--muted);
+	text-transform: uppercase;
+	letter-spacing: 0.4px;
+}
+
+.chip-role-planner { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.chip-role-implementer { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.chip-role-verifier { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.chip-role-none { color: var(--muted); border-style: dashed; }
+
+/* the task row a conversation drawer points at (secondary to row-cur) */
+.row-link { background: color-mix(in srgb, var(--accent) 9%, var(--panel)); }
+
+.convdetail { display: grid; gap: 12px; padding: 12px 14px 40px; align-content: start; }
+
+/* ---- M4-a stage 2: transcript excerpt rows (Appendix A.5) ---- */
+
+.conventries { display: grid; gap: 8px; }
+
+.conventry {
+	display: grid;
+	gap: 4px;
+	padding: 6px 8px;
+	border: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+	border-radius: var(--radius, 4px);
+	font-size: 12px;
+}
+
+.conventry-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 11px;
+	flex-wrap: wrap;
+}
+
+.conv-kind {
+	font-size: 10.5px;
+	padding: 1px 6px;
+	color: var(--muted);
+	border-style: dashed;
+}
+
+.conv-tool { font-size: 11.5px; word-break: break-all; }
+.conv-tool-input { overflow: hidden; text-overflow: ellipsis; }
+
+.convtext {
+	margin: 2px 0 0;
+	padding: 6px 8px;
+	background: color-mix(in srgb, var(--panel-2) 65%, transparent);
+	border-radius: 4px;
+	font-size: 12px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+}
+
+/* M5-a: read-only sources panel (config + PRD viewers) */
+.read-only-note {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px 2px;
+	color: var(--muted);
+	font-size: 10.5px;
+	flex-wrap: wrap;
+}
+.read-only-note .btn { flex: 0 0 auto; margin-left: auto; }
+.srcfile { border-top: 1px solid var(--border); margin-top: 6px; }
+.srcfile:first-child { border-top: none; }
+.srcfile-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 12px 2px;
+	font-size: 11px;
+	flex-wrap: wrap;
+}
+.srcfile-head .muted { font-size: 10.5px; }
+.sources-note-bad { color: var(--bad); }

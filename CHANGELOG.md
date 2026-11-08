@@ -30,6 +30,26 @@ Manual semver discipline: keep `package.json` version and the newest section in 
     skipped the evidence patch; visible only when retryLimit = 0).
 - No behavior change for users without the UI: the whole root suite
   (guards/breakers/e2e.smoke/inspect) passes unchanged.
+- **UI seam A.5 (additive, 2026-11-08; consumed by `ui/` 0.5.1)**:
+  `inspector.ts` gains `conversationEntries()` — bounded, read-only transcript
+  excerpts for the conversation drawer: a ≤ 2,000-entry window (the summary
+  scan's page caps) plus a `truncated` flag, per-entry 4 KiB text bound,
+  plain JSON-able shapes (no pi-durable types cross the module boundary),
+  same BACKGROUND_CONTEXT gated table scan as `collectConversations`.
+  `readout.seam` stays 1 — A.5 is additive surface, not a new seam version;
+  no CLI surface change, no behavior change when the UI is absent (root
+  suite gains the A.5 cases in `test/ui-seam.test.ts`).
+- **UI seam A.6 (additive, 2026-11-08; consumed by `ui/` 0.5.2)**:
+  `readout()` gains an additive read-only `delivery` section — `mode` (the
+  configured `delivery.mode`, echoed from config; never writable from the
+  readout) and `rows` (the wave log's kind `"delivery"` rows as plain JSON
+  shapes). Side-car mode best-effort re-reads the static config file and
+  omits `mode` when the config is unreadable. Deliberately no delivery
+  mutation surface exists in the CLI or the readout: delivery stays a
+  config + CLI decision (the `--deliver` run qualifier the `pr` mode
+  requires is a per-run override, not a toggle). No CLI output change, no
+  behavior change when the UI is absent (root suite gains the A.6 cases in
+  `test/ui-seam.test.ts`).
 
 ## 0.2.1 — 2026-11-06
 

@@ -18,6 +18,10 @@
  * tables only (`scanConversations`/`scanEntries`) — the same established
  * table-read pattern as `ConversationKit.readAnswerText`. pi-durable is
  * reached only through the `kit.ts`/`harness.ts` seam (§3.10).
+ *
+ * A.5 adds `conversationEntries()`: the same gated table-scan pattern serves
+ * bounded, plain-JSON transcript excerpts to the UI. The seam version stays
+ * `readout.seam = 1` — A.5 is additive surface, not a new seam version.
  */
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
@@ -41,10 +45,10 @@ import type {
 } from "./harness.ts";
 import type { SessionState } from "./state.ts";
 import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
-import type { Cursor } from "./kit.ts";
+import type { Cursor, EntryRecord } from "./kit.ts";
 import type { CostRates } from "../util/budget.ts";
 import { usageUsd } from "../util/budget.ts";
-import { KIT_VERSION } from "../config.ts";
+import { KIT_VERSION, loadConfig } from "../config.ts";
 import type { KitConfig } from "../config.ts";
 import { shasum } from "../util/git.ts";
 import { readJson } from "../util/fsx.ts";
@@ -133,6 +137,70 @@ export interface ArtifactFile {
 	kind: "gate" | "quarantine" | "diff" | "other";
 }
 
+// ---------------------------------------------------------------------------
+// A.5: conversation transcript excerpts (bounded, read-only, plain JSON)
+// ---------------------------------------------------------------------------
+
+/** A.5: one tool call requested by an assistant entry, as plain strings. */
+export interface ConvEntryToolCall {
+	name: string;
+	/** The call arguments as compact JSON text (bounded by CONV_ENTRY_TEXT_CAP). */
+	input: string;
+}
+
+/**
+ * A.5: one transcript entry as the UI may render it. Every field is plain
+ * JSON — ids as numbers, timestamps as ms numbers, content as strings. No
+ * pi-durable types cross this boundary.
+ */
+export interface ConvEntryView {
+	/** Durable entry id (the branded EntryId bridged back to a plain number). */
+	id: number;
+	/** Entry kind: pi.user / pi.assistant / pi.tool-result / pi.reset / pi.compaction / … */
+	kind: string;
+	/** ms timestamp from the entry's model message, when the kind carries one. */
+	ts?: number;
+	/** Model-message role when present: "user" | "assistant" | "toolResult" | "system". */
+	role?: string;
+	/** Plain-text content: text blocks joined, thinking omitted, per-entry bounded. */
+	text: string;
+	/** Assistant entries that requested tool calls: names + bounded JSON input. */
+	toolCalls?: ConvEntryToolCall[];
+	/** The assistant stop reason, when the provider recorded one. */
+	stopReason?: string;
+	/** Tool-result entries: the call failed. */
+	isError?: boolean;
+	/** The entry text (or a tool input) hit CONV_ENTRY_TEXT_CAP and was cut. */
+	textCapped?: boolean;
+}
+
+/** A.5: the bounded excerpt payload for one conversation. */
+export interface ConvEntriesView {
+	/** The conversation these entries belong to (plain number). */
+	conversation: number;
+	/**
+	 * The excerpt window in chronological order — at most CONV_ENTRY_SCAN_CAP
+	 * (≤ 2,000) entries per request.
+	 */
+	entries: ConvEntryView[];
+	/**
+	 * True when entries exist beyond the window: the default "newest" order cut
+	 * OLDER entries; "oldest" cut NEWER ones. The cap is the contract; there is
+	 * no pagination protocol in v1.
+	 */
+	truncated: boolean;
+}
+
+export interface ConversationEntriesOptions {
+	/**
+	 * Which end of the transcript the cap keeps. Default "newest": the excerpt
+	 * is the most recent ≤ 2,000 entries (where the outcome lives) and
+	 * `truncated` means older entries were cut. "oldest" mirrors the summary
+	 * scan's counting direction. The cap is the contract either way.
+	 */
+	order?: "newest" | "oldest";
+}
+
 /** A.3: where a task's viewable diff lives (artifact NAMES, not content). */
 export interface DiffArtifactRef {
 	task: string;
@@ -143,6 +211,28 @@ export interface DiffArtifactRef {
 	bytes: number;
 	/** The stored patch was cut at the 5 MiB cap (from the stats side-car). */
 	truncated: boolean;
+}
+
+/** A.6: one delivery outcome, echoed from the wave log's kind:"delivery" rows as plain JSON. */
+export interface DeliveryRow {
+	ts: number;
+	task: string;
+	verb: string;
+	wave?: number;
+	detail?: string;
+}
+
+/**
+ * A.6: delivery truth for connected UIs — the configured mode (§4.6) plus the
+ * delivery outcome rows already in the wave log. Read-only: the mode is
+ * echoed from config (never writable from here), and the CLI keeps every
+ * mutation path (`delivery.mode` in .orch/config.toml, the `--deliver` run
+ * qualifier the `pr` mode requires).
+ */
+export interface DeliveryView {
+	/** Configured `delivery.mode`; absent only when the config itself is unreadable (side-car mode). */
+	mode?: string;
+	rows: DeliveryRow[];
 }
 
 export interface HealthCheck {
@@ -176,9 +266,27 @@ export interface KitReadout {
 	rows: WaveRow[];
 	usage: KitUsage;
 	timeline: WaveSpan[];
+	/** A.6: the configured delivery mode + the outcome rows from the wave log. */
+	delivery: DeliveryView;
 	artifacts: ArtifactFile[];
 	health: HealthCheck[];
 	storage?: StorageReadout;
+}
+
+/**
+ * A.6: delivery — pick the configured mode and echo the wave log's kind:"delivery"
+ * rows (plain JSON shapes; the UI server never parses engine row semantics).
+ * The wave log already carries at most one delivery row per task+wave attempt,
+ * so the echo stays proportional to the rows the caller already holds.
+ */
+function deliveryView(mode: string | undefined, rows: readonly WaveRow[]): DeliveryView {
+	const delivery: DeliveryView = { rows: [] };
+	if (mode !== undefined) delivery.mode = mode;
+	for (const row of rows) {
+		if (row.kind !== "delivery") continue;
+		delivery.rows.push({ ts: row.ts, task: row.task, verb: row.verb, ...(row.wave !== undefined ? { wave: row.wave } : {}), ...(row.detail !== undefined ? { detail: row.detail } : {}) });
+	}
+	return delivery;
 }
 
 /** A.1: the live view is derived from the status side-car's wave-running flush. */
@@ -202,6 +310,12 @@ export type InspectSectionName = (typeof INSPECT_SECTIONS)[number];
 const MAX_SCAN_PAGES = 8;
 const ENTRIES_PER_PAGE = 500;
 const MAX_ENTRY_PAGES_PER_CONV = 4;
+
+/** A.5: the excerpt window is the same cap the summary scan uses (≤ 2,000 entries). */
+export const CONV_ENTRY_SCAN_CAP = MAX_ENTRY_PAGES_PER_CONV * ENTRIES_PER_PAGE;
+
+/** A.5: per-entry text/tool-input bound, so one pathological tool result cannot own the wire. */
+export const CONV_ENTRY_TEXT_CAP = 4_096;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -275,6 +389,7 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 			source: "storage",
 		},
 		timeline,
+		delivery: deliveryView(config.delivery.mode, state.rows),
 		artifacts,
 		health: [],
 		storage: { router: state.router, runStatus: state.runStatus, conversations, reports: loop.loop.reports.slice(-20) },
@@ -295,6 +410,20 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 // ---------------------------------------------------------------------------
 // Side-car mode (lock held elsewhere; never opens storage)
 // ---------------------------------------------------------------------------
+
+/**
+ * A.6 in side-car mode: the config file is a static read (not the owned
+ * storage), so the configured mode is still available while a run holds the
+ * lock — unless the config itself is unreadable, in which case mode is
+ * omitted and the reader says so rather than guessing.
+ */
+function sidecarDeliveryMode(root: string): string | undefined {
+	try {
+		return loadConfig(root).delivery.mode;
+	} catch {
+		return undefined;
+	}
+}
 
 async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
 	const at = Date.now();
@@ -365,6 +494,7 @@ async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
 			source: "sidecars",
 		},
 		timeline,
+		delivery: deliveryView(sidecarDeliveryMode(paths.root), rows),
 		artifacts,
 		health: [],
 	};
@@ -449,6 +579,97 @@ async function collectConversations(harness: HarnessType, tasks: RouterTask[], r
 		});
 	}
 	return summaries;
+}
+
+// ---------------------------------------------------------------------------
+// A.5: transcript excerpts (storage mode; same gated scan as the summaries)
+// ---------------------------------------------------------------------------
+
+/**
+ * A.5: bounded, read-only transcript excerpt for one conversation. Same gated
+ * table-scan pattern as `collectConversations` — a single commit that only
+ * reads (`scanEntries`), BACKGROUND_CONTEXT, never writes. The returned
+ * shapes are plain JSON: ids/timestamps as numbers, content as strings; no
+ * pi-durable types cross the module boundary (the UI server never imports
+ * kit.ts). Returns undefined for a conversation id that does not exist.
+ */
+export async function conversationEntries(loop: LoopAndLock, conversationId: number, opts: ConversationEntriesOptions = {}): Promise<ConvEntriesView | undefined> {
+	const harness = loop.loop.harness;
+	const existing = await harness.conversation(convId(conversationId), BACKGROUND_CONTEXT).catch(() => undefined);
+	if (!existing) return undefined;
+	const order = opts.order ?? "newest";
+	const scan = await harness.commit(async (tx) => {
+		const records: EntryRecord[] = [];
+		let truncated = false;
+		let cursor: Cursor | undefined;
+		for (let page = 0; page < MAX_ENTRY_PAGES_PER_CONV; page++) {
+			const found = await tx.scanEntries({ conversationId: convId(conversationId), order: order === "oldest" ? "ascending" : "descending" }, ENTRIES_PER_PAGE, cursor);
+			records.push(...found.items);
+			if (!found.next) break;
+			if (page === MAX_ENTRY_PAGES_PER_CONV - 1) truncated = true;
+			cursor = found.next;
+		}
+		return { records, truncated };
+	}, BACKGROUND_CONTEXT);
+	const entries = scan.records.map(convEntryView);
+	if (order === "newest") entries.reverse(); // chronological inside the window
+	return { conversation: conversationId, entries, truncated: scan.truncated };
+}
+
+/** A.5 shaping: one EntryRecord → a plain view. Content blocks become strings. */
+function convEntryView(record: EntryRecord): ConvEntryView {
+	const view: ConvEntryView = { id: record.id as unknown as number, kind: record.kind, text: "" };
+	const message = record.model?.[0] as
+		| { role?: string; timestamp?: number; content?: unknown; stopReason?: string; isError?: boolean }
+		| undefined;
+	// Display/bookkeeping entries without model context (plain resets, system
+	// markers): the kind is the whole story.
+	if (!message) return view;
+	if (typeof message.timestamp === "number") view.ts = message.timestamp;
+	if (typeof message.role === "string") view.role = message.role;
+	const text = capEntryText(entryText(message.content));
+	view.text = text.value;
+	let capped = text.capped;
+	if (message.role === "assistant") {
+		const calls = entryToolCalls(message.content);
+		if (calls.list.length > 0) view.toolCalls = calls.list;
+		capped = capped || calls.capped;
+		if (typeof message.stopReason === "string") view.stopReason = message.stopReason;
+	}
+	if (message.role === "toolResult" && message.isError === true) view.isError = true;
+	if (capped) view.textCapped = true;
+	return view;
+}
+
+/** Join a message's text blocks into one string; thinking is model-internal and stays out. */
+function entryText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content as { type?: string; text?: string }[]) {
+		if (block !== null && typeof block === "object" && block.type === "text" && typeof block.text === "string") parts.push(block.text);
+	}
+	return parts.join("\n");
+}
+
+/** Extract assistant tool calls as plain { name, input } pairs (input JSON-bounded). */
+function entryToolCalls(content: unknown): { list: ConvEntryToolCall[]; capped: boolean } {
+	if (!Array.isArray(content)) return { list: [], capped: false };
+	const list: ConvEntryToolCall[] = [];
+	let capped = false;
+	for (const block of content as { type?: string; name?: string; arguments?: unknown }[]) {
+		if (block === null || typeof block !== "object" || block.type !== "toolCall") continue;
+		const input = capEntryText(JSON.stringify(block.arguments ?? {}));
+		if (input.capped) capped = true;
+		list.push({ name: typeof block.name === "string" ? block.name : "?", input: input.value });
+	}
+	return { list, capped };
+}
+
+/** A.5 per-entry bound; the " …" marker makes the cut visible in the UI. */
+function capEntryText(text: string): { value: string; capped: boolean } {
+	if (text.length <= CONV_ENTRY_TEXT_CAP) return { value: text, capped: false };
+	return { value: `${text.slice(0, CONV_ENTRY_TEXT_CAP)} …`, capped: true };
 }
 
 function buildRateMap(config: KitConfig): Record<string, CostRates> {

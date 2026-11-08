@@ -27,6 +27,12 @@ export function relativeAge(ms: number): string {
 	return ms < 1_000 ? "just now" : `${msDuration(ms)} ago`;
 }
 
+/** Serving-display byte count (M5-a source viewer + diff metadata style): 1,234 bytes. */
+export function bytesLabel(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes <= 0) return "0 bytes";
+	return `${bytes.toLocaleString("en-US")} bytes`;
+}
+
 export type TaskStatus = "todo" | "in_progress" | "done" | "quarantined";
 
 export const STATUS_GLYPH: Record<string, { glyph: string; label: string }> = {

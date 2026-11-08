@@ -5,7 +5,7 @@
  */
 import type { ReadoutSnapshot, JobsPayload, RoleModelInfo } from "./api.ts";
 import type { JobRecord } from "../../server/jobs.ts";
-import type { KitTaskView, KitUsage, HealthCheck } from "../../../src/engine/inspector.ts";
+import type { KitTaskView, KitUsage, HealthCheck, ConvSummary, ConvEntryView, DeliveryRow, DeliveryView } from "../../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../../src/engine/infos.ts";
 import type { RoleName } from "../../../src/config.ts";
 
@@ -289,6 +289,133 @@ export function latestDiffTask(artifacts: Array<{ name: string; kind: string; mt
 }
 
 // ---------------------------------------------------------------------------
+// M4-a: conversation visibility (§7.5, stage 1 — summaries only; transcript
+// content is stage 2 and needs the Appendix A.5 seam, still pending)
+// ---------------------------------------------------------------------------
+
+export interface ConversationGroup {
+	/** Group key: "planner", a task id, "verifier", or "other" (role-less). */
+	key: string;
+	rows: ConvSummary[];
+}
+
+/**
+ * §7.5 conversation list, grouped sensibly: the planner's conversation first,
+ * then one group per task that has implementer conversations (several can map
+ * to one task — ordered by the task table's order, unknown tasks last), then
+ * verifier conversations, then anything role-less. Rows sort by conversation
+ * id inside a group.
+ */
+export function conversationGroups(conversations: ConvSummary[] | undefined, taskOrder: string[]): ConversationGroup[] {
+	if (!conversations || conversations.length === 0) return [];
+	const byId = [...conversations].sort((a, b) => a.id - b.id);
+	const planner: ConvSummary[] = [];
+	const verifier: ConvSummary[] = [];
+	const other: ConvSummary[] = [];
+	const byTask = new Map<string, ConvSummary[]>();
+	for (const conv of byId) {
+		if (conv.role === "implementer" && conv.task) {
+			const list = byTask.get(conv.task);
+			if (list) list.push(conv);
+			else byTask.set(conv.task, [conv]);
+		} else if (conv.role === "planner") planner.push(conv);
+		else if (conv.role === "verifier") verifier.push(conv);
+		else other.push(conv);
+	}
+	const rank = (task: string): number => {
+		const i = taskOrder.indexOf(task);
+		return i === -1 ? Number.MAX_SAFE_INTEGER : i;
+	};
+	const groups: ConversationGroup[] = [];
+	if (planner.length > 0) groups.push({ key: "planner", rows: planner });
+	for (const key of [...byTask.keys()].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))) {
+		groups.push({ key, rows: byTask.get(key)! });
+	}
+	if (verifier.length > 0) groups.push({ key: "verifier", rows: verifier });
+	if (other.length > 0) groups.push({ key: "other", rows: other });
+	return groups;
+}
+
+/** One conversation by id (the drawer's data); undefined for unknown ids or no storage. */
+export function conversationById(conversations: ConvSummary[] | undefined, id: number | undefined): ConvSummary | undefined {
+	if (id === undefined || !conversations) return undefined;
+	return conversations.find((c) => c.id === id);
+}
+
+/** The conversation id a `#/conversations/<id>` deep link names; undefined for any other hash (strict shape, like hashDiffTask). */
+export function hashConversationDrawer(hash: string): number | undefined {
+	const match = /^#\/conversations\/(\d+)$/.exec(hash);
+	if (!match) return undefined;
+	const id = Number(match[1]);
+	return Number.isSafeInteger(id) ? id : undefined;
+}
+
+/** Whether the hash is exactly `#/conversations` — the list deep link (sibling of `#/health`). */
+export function isConversationListHash(hash: string): boolean {
+	return hash === "#/conversations";
+}
+
+// ---------------------------------------------------------------------------
+// M4-a stage 2: transcript excerpts (§18 fast-follow, Appendix A.5) — the
+// drawer's excerpt state + kind labels. The fetch itself lives in api.ts.
+// ---------------------------------------------------------------------------
+
+/** The excerpt's client state: loading → ready | lock-busy (the established empty state) | error. */
+export type ExcerptState =
+	| { kind: "loading" }
+	| { kind: "ready"; entries: ConvEntryView[]; truncated: boolean }
+	| { kind: "lock-busy" }
+	| { kind: "error"; message: string };
+
+/**
+ * Classify a failed excerpt fetch (pure, so the 409 wording stays in one
+ * place): the server's lock-busy answer speaks the established sentence —
+ * anything else is a plain error the banner quotes.
+ */
+export function excerptErrorState(message: string): Extract<ExcerptState, { kind: "lock-busy" } | { kind: "error" }> {
+	if (/lock is free — a run is live/.test(message)) return { kind: "lock-busy" };
+	return { kind: "error", message };
+}
+
+/** Kind label for one excerpt row: the "pi." prefix trimmed; tool calls and failures named. */
+export function entryKindLabel(entry: Pick<ConvEntryView, "kind" | "toolCalls" | "isError">): string {
+	const kind = entry.kind.replace(/^pi\./, "") || "entry";
+	if (entry.toolCalls && entry.toolCalls.length > 0) {
+		return `${kind} · ${entry.toolCalls.map((c) => c.name).join(", ")}`;
+	}
+	if (entry.kind === "pi.tool-result" && entry.isError) return `${kind} · failed`;
+	return kind;
+}
+
+// ---------------------------------------------------------------------------
+// M4-b: delivery truth (§8.6 "delivery mode/outcome rows", Appendix A.6) — a
+// READ-ONLY report section. The mode/outcome surface just says what ran; there
+// is deliberately no toggle action: delivery is a config + CLI decision (§5),
+// the CLI's only delivery paths are .orch/config.toml's delivery.mode and the
+// --deliver run qualifier the pr mode requires (a per-run override, not a
+// safe toggle), and config editors stay deferred to M5 (§18).
+// ---------------------------------------------------------------------------
+
+/** The readout's delivery truth reworded for the completion report. */
+export interface DeliveryReportView {
+	/** The configured mode from .orch/config.toml; undefined = side-car mode with an unreadable config. */
+	mode?: string;
+	/** The stat cell text: mode + row count, or "unknown" when the readout carries neither. */
+	stat: string;
+	/** The outcome rows, engine verbs verbatim ("delivered", "commit-failed", "pr-skip", …). */
+	rows: DeliveryRow[];
+}
+
+export function deliveryReport(delivery: DeliveryView | undefined): DeliveryReportView {
+	const rows = delivery?.rows ?? [];
+	const mode = delivery?.mode;
+	if (mode === undefined) {
+		return { stat: rows.length > 0 ? `${rows.length} delivery row(s) — mode unknown` : "unknown", rows };
+	}
+	return { mode, stat: rows.length > 0 ? `${mode} · ${rows.length} row(s)` : mode, rows };
+}
+
+// ---------------------------------------------------------------------------
 // M3: health panel (§7.1) — errors + warnings first, skipped checks labeled
 // ---------------------------------------------------------------------------
 
@@ -343,6 +470,55 @@ export function budgetBarData(usage: Pick<KitUsage, "sessionUsd" | "ceilingUsd" 
 		.sort((a, b) => b.usd - a.usd);
 	const total = models.reduce((n, m) => n + m.usd, 0);
 	return { spentPct, over: usage.ceilingUsd > 0 && usage.sessionUsd >= usage.ceilingUsd, models: total > 0 ? models.map((m) => ({ ...m, share: m.usd / total })) : models.map((m) => ({ ...m, share: 0 })) };
+}
+
+// ---------------------------------------------------------------------------
+// M4-c: event-log window raise (§13) — the DOM window the M3 record deferred
+// (300) is raised to §13's 2,000-row windowed tail, with an explicit
+// "truncated — showing newest N of M" notice. The server readout carries the
+// FULL wave-log tail (no server-side cap — readout build stays the engine's
+// job and CompletionReport's wall clock reads rows[0]); the notice names both
+// numbers so what is cut is never hidden.
+// ---------------------------------------------------------------------------
+
+/** §13's event-log DOM window: the newest N rows rendered, older ones cut. */
+export const EVENT_LOG_DOM_WINDOW = 2_000;
+
+/** The windowed tail: the newest `max` rows plus how many were cut (the notice numbers). */
+export function windowedTail<T>(rows: readonly T[], max: number = EVENT_LOG_DOM_WINDOW): { shown: T[]; hidden: number; truncated: boolean } {
+	if (rows.length <= max) return { shown: [...rows], hidden: 0, truncated: false };
+	return { shown: rows.slice(rows.length - max), hidden: rows.length - max, truncated: true };
+}
+
+// ---------------------------------------------------------------------------
+// M4-c: task-table row filter (§7.1's dense table) — the §13/§16 deferral the
+// M3 record documented ("row filtering stays a §13/§16 deferral") ships as a
+// small status chip + text match (id/title/deps), sibling of the event log's
+// filter. Sorting (sortedTasks) composes on top.
+// ---------------------------------------------------------------------------
+
+/** The status chip: one concrete status, or "all" (no status constraint). */
+export type TaskStatusFilter = "all" | KitTaskView["status"];
+
+/** The task-table filter: a status chip plus a case-insensitive text match. */
+export interface TaskTableFilter {
+	status: TaskStatusFilter;
+	/** Case-insensitive substring over id, title, dependsOn, target paths; blank → all. */
+	text: string;
+}
+
+/** The concrete statuses the filter chip offers (TaskTable order, not rank). */
+export const TASK_STATUSES: readonly KitTaskView["status"][] = ["todo", "in_progress", "done", "quarantined"];
+
+/** Row filter: status chip AND text match; blank chip + blank text → everything. */
+export function filterTasks(tasks: readonly KitTaskView[], filter: TaskTableFilter): KitTaskView[] {
+	const q = filter.text.trim().toLowerCase();
+	return tasks.filter((t) => {
+		if (filter.status !== "all" && t.status !== filter.status) return false;
+		if (!q) return true;
+		const hay = `${t.id} ${t.title} ${t.dependsOn.join(" ")} ${t.targetPaths.join(" ")}`;
+		return hay.toLowerCase().includes(q);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -407,4 +583,66 @@ export function failureRows(rows: { ts: number; kind: string; task: string; wave
 		}
 	}
 	return out;
+}
+
+// ---------------------------------------------------------------------------
+// M5-a/M5-b: read-only project sources (config + PRD + PROMPT.md + gate
+// recipes viewers, §5/§18) — per-file chip labels. One glyph+label per file;
+// the worst fact wins so the header never lies about a file it merely carried
+// raw.
+// ---------------------------------------------------------------------------
+
+export type SourceChip = { kind: "ok"; label: "ok" | "ok · absent" } | { kind: "missing"; label: "missing" | "absent" } | { kind: "parse-error"; label: "parse error" } | { kind: "capped"; label: "ok · capped" } | { kind: "binary"; label: "binary" } | { kind: "unloaded"; label: "…" };
+
+/** Chip for one source file; the worst fact wins (parse error → capped → binary → missing → ok). */
+export function sourceChip(file: { exists: boolean; truncated?: boolean; binary?: boolean }, parseError?: string): SourceChip {
+	if (parseError) return { kind: "parse-error", label: "parse error" };
+	if (!file.exists) return { kind: "missing", label: "missing" };
+	if (file.truncated) return { kind: "capped", label: "ok · capped" };
+	if (file.binary) return { kind: "binary", label: "binary" };
+	return { kind: "ok", label: "ok" };
+}
+
+/**
+ * M5-b: PROMPT.md chip. Nothing parses it (raw markdown — no verdict beyond
+ * the §11.4 facts), and its ABSENCE is a warn, not an error: the engine
+ * reads it best-effort each wave (waves.ts), so a missing file means every
+ * wave input assembles without the per-wave discipline doc — amber
+ * "absent", with the panel's note telling you how to fix it.
+ */
+export function promptChip(file: { exists: boolean; truncated?: boolean; binary?: boolean }): SourceChip {
+	if (!file.exists) return { kind: "missing", label: "absent" };
+	return sourceChip(file);
+}
+
+/**
+ * M5-b: evals/recipes.toml chip; the verdict is the engine gate loader's.
+ * An ABSENT file is a DEFINED state (empty gates = scope check only,
+ * gates.ts) — green "ok · absent", surfaced only inside the panel; a broken
+ * file is the plain-words error the next wave's gate step throws — parse
+ * error wins over every §11.4 fact.
+ */
+export function recipesChip(file: { exists: boolean; truncated?: boolean; binary?: boolean }, parseError?: string): SourceChip {
+	const chip = sourceChip(file, parseError);
+	if (chip.kind === "missing") return { kind: "ok", label: "ok · absent" };
+	return chip;
+}
+
+/**
+ * M5-b header summary: the worst chip across the four sources — severity
+ * first (parse error > missing > binary > capped > ok), not merely position,
+ * so a red recipes verdict outranks an amber PROMPT.md absence.
+ */
+export function worstSourceChip(chips: SourceChip[]): SourceChip | undefined {
+	const rank: Record<SourceChip["kind"], number> = { "parse-error": 5, missing: 4, binary: 3, capped: 2, ok: 1, unloaded: 0 };
+	let worst: SourceChip | undefined;
+	let worstRank = -1;
+	for (const chip of chips) {
+		const r = rank[chip.kind] ?? 0;
+		if (r > worstRank) {
+			worst = chip;
+			worstRank = r;
+		}
+	}
+	return worst;
 }

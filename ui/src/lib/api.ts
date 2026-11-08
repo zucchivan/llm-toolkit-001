@@ -1,5 +1,6 @@
 /** Client API access + the wire types the ui server speaks (§11.2). */
-import type { KitReadout } from "../../../src/engine/inspector.ts";
+import type { ConvEntryView, KitReadout } from "../../../src/engine/inspector.ts";
+import type { ProjectSourcesPayload } from "../../server/sources.ts";
 import type { JobRecord, JobView, AttachedRun } from "../../server/jobs.ts";
 import type { RoleModelInfo } from "../../server/readout.ts";
 import type { DiffStats, DisplayDiffStats } from "../../../src/util/git.ts";
@@ -103,6 +104,16 @@ export async function fetchReadout(): Promise<ReadoutSnapshot> {
 	return (await res.json()) as ReadoutSnapshot;
 }
 
+/** Server <-> client shared shape for one read-only project source (ui/server/sources.ts). */
+export type { SourceFileView, ProjectSourcesPayload } from "../../server/sources.ts";
+
+/** M5-a: GET /api/project/sources — raw config + PRD text + verdicts (read-only, both modes). */
+export async function fetchProjectSources(): Promise<ProjectSourcesPayload> {
+	const res = await fetch("/api/project/sources");
+	if (!res.ok) throw new Error(await errorMessage(res) || `HTTP ${res.status}`);
+	return (await res.json()) as ProjectSourcesPayload;
+}
+
 /** GET /api/tasks/:id/diff (§11.2): the persisted diff; 404 surfaces as a thrown Error. */
 export async function fetchTaskDiff(task: string): Promise<TaskDiffPayload> {
 	const res = await fetch(`/api/tasks/${encodeURIComponent(task)}/diff`);
@@ -120,6 +131,25 @@ export async function fetchLiveDiff(task: string): Promise<LiveDiffPayload> {
 /** The raw patch as a browser download (attachment; the cookie authenticates). */
 export function diffDownloadUrl(task: string): string {
 	return `/api/tasks/${encodeURIComponent(task)}/diff?download=1`;
+}
+
+/** A.5: GET /api/conversations/:id/entries wire shape (bounded transcript excerpt). */
+export interface ConversationEntriesPayload {
+	at: number;
+	conversation: number;
+	entries: ConvEntryView[];
+	truncated: boolean;
+}
+
+/**
+ * A.5: the bounded transcript excerpt for one conversation. 404 (unknown id)
+ * and 409 (a run owns the lock — the established empty state) surface as
+ * thrown Errors whose message the drawer classifies (excerptErrorState).
+ */
+export async function fetchConversationEntries(conversation: number): Promise<ConversationEntriesPayload> {
+	const res = await fetch(`/api/conversations/${conversation}/entries`);
+	if (!res.ok) throw new Error(await errorMessage(res) || `HTTP ${res.status}`);
+	return (await res.json()) as ConversationEntriesPayload;
 }
 
 export async function fetchJobs(): Promise<JobsPayload> {

@@ -9,6 +9,12 @@
  *   GET  /api/jobs/:id/log  tail of a job log (?n=200, max 5000)
  *   GET  /api/tasks/:id/diff       persisted patch + stats (§11.2; 404 if none)
  *   GET  /api/tasks/:id/diff/live  live patch vs the task baseline (409 if not in-flight)
+ *   GET  /api/conversations/:id/entries  A.5 bounded transcript excerpt
+ *                                  (404 unknown conversation; 409 while a
+ *                                  run owns the lock — the established tone)
+ *   GET  /api/project/sources      M5-a read-only config + PRD viewers' data
+ *                                  (raw text + verdicts; static files, no
+ *                                  lock, never written — §5 non-goal intact)
  *   GET  /api/artifacts            artifact list (§11.4)
  *   GET  /api/artifacts/:name      artifact text ≤5 MiB (larger → metadata + download link)
  *   POST /api/actions       { kind, …params } → 202 { jobId } — cookie AND
@@ -22,7 +28,8 @@ import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { checkMutationAuth, csrfCookie, hasValidCookie, isLoopbackPeer, MutationAuthError, sessionCookie, tokenEquals } from "./auth.ts";
-import { readOnce } from "./readout.ts";
+import { readConversationEntries, readOnce } from "./readout.ts";
+import { readProjectSources } from "./sources.ts";
 import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName } from "./diff.ts";
 import { startAction, stopAction, validateAction } from "./actions.ts";
 import { serveStatic } from "./static.ts";
@@ -152,6 +159,13 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 			res.end(JSON.stringify(snapshot));
 			return;
 		}
+		if (pathname === "/api/project/sources") {
+			if (req.method !== "GET") return void jsonError(res, 405, `method ${req.method ?? "?"} not allowed`);
+			const sources = await readProjectSources(opts.root);
+			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+			res.end(JSON.stringify(sources));
+			return;
+		}
 		if (pathname === "/api/events") {
 			if (req.method !== "GET") return void jsonError(res, 405, `method ${req.method ?? "?"} not allowed`);
 			serveEvents(req, res, opts, hub);
@@ -163,6 +177,12 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
 			res.end(JSON.stringify(payload));
 			return;
+		}
+		// A.5: conversation transcript excerpts (bounded; lock-per-read inside).
+		const convEntriesMatch = /^\/api\/conversations\/(\d+)\/entries$/.exec(pathname);
+		if (convEntriesMatch) {
+			if (req.method !== "GET") return void jsonError(res, 405, `method ${req.method ?? "?"} not allowed`);
+			return await serveConversationEntriesRoute(res, opts.root, Number(convEntriesMatch[1]));
 		}
 		const jobMatch = /^\/api\/jobs\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})(\/log)?$/.exec(pathname);
 		if (jobMatch) {
@@ -323,6 +343,16 @@ async function serveArtifactRoute(req: IncomingMessage, res: ServerResponse, roo
 	}
 	res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
 	res.end(read.text);
+}
+
+async function serveConversationEntriesRoute(res: ServerResponse, root: string, conversationId: number): Promise<void> {
+	const read = await readConversationEntries(root, conversationId);
+	if (!read.ok) {
+		jsonError(res, read.status, read.error);
+		return;
+	}
+	res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+	res.end(JSON.stringify({ at: Date.now(), ...read.view }));
 }
 
 async function serveJobRoute(

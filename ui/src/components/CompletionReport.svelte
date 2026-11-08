@@ -1,10 +1,13 @@
 <script lang="ts">
 	/**
 	 * Completion report (§8.6): summary — tasks done/quarantined, waves, total
-	 * spend vs ceiling, wall-clock span, delivery rows; Run again only when todo
-	 * tasks remain. Per-task diff access lands with M2 (diff refs).
+	 * spend vs ceiling, wall-clock span, delivery mode/outcome rows (M4-b,
+	 * Appendix A.6 — read-only; there is deliberately no delivery toggle:
+	 * per §5 delivery stays a config + CLI decision, and config editors stay
+	 * deferred to M5). Run again only when todo tasks remain.
 	 */
 	import type { ReadoutSnapshot, JobsPayload } from "../lib/api.ts";
+	import { deliveryReport } from "../lib/view.ts";
 	import { usd, msDuration, relativeAge } from "../lib/format.ts";
 	import type { JobRecord } from "../../server/jobs.ts";
 
@@ -26,7 +29,10 @@
 	const firstTs = $derived(readout.rows[0]?.ts);
 	const lastTs = $derived(readout.rows.at(-1)?.ts);
 	const span = $derived(firstTs !== undefined && lastTs !== undefined ? msDuration(Math.max(0, lastTs - firstTs)) : "—");
-	const deliveryRows = $derived(readout.rows.filter((r) => r.kind === "delivery").slice(-4));
+	// M4-b (A.6): the readout's delivery section — mode + outcome rows; the
+	// report shows the last few joined with the wave they came from.
+	const delivery = $derived(deliveryReport(readout.delivery));
+	const deliveryTail = $derived(delivery.rows.slice(-4));
 	const endedRun = $derived(
 		jobs.jobs
 			.filter((j) => j.kind === "run" && j.status !== "running")
@@ -52,11 +58,19 @@
 		<div class="stat"><div class="muted">waves</div><div class="big mono">{waves}</div></div>
 		<div class="stat"><div class="muted">spend</div><div class="big mono">{usd(readout.usage.sessionUsd)} <span class="muted" style="font-size:12px">/ {usd(readout.usage.ceilingUsd)}</span></div></div>
 		<div class="stat"><div class="muted">wall clock</div><div class="big mono">{span}</div></div>
-		<div class="stat"><div class="muted">delivery</div><div class="big mono" style="font-size:15px">{deliveryRows.length ? `${deliveryRows.length} row(s)` : "none"}</div></div>
+		<div class="stat">
+			<div class="muted">delivery</div>
+			<div class="big mono" style="font-size:15px" title="delivery is a config + CLI decision (§5): the mode lives in .orch/config.toml and the CLI keeps every delivery path (--deliver on run, for the pr mode). Read-only here — delivery/config editors are deferred to M5.">{delivery.stat}</div>
+		</div>
 	</div>
 
-	{#if deliveryRows.length}
-		<pre class="joblog mono" style="max-height:120px">{deliveryRows.map((r) => `${r.verb} — ${r.detail ?? ""}`).join("\n")}</pre>
+	{#if delivery.rows.length}
+		<pre class="joblog mono" style="max-height:120px">{deliveryTail.map((r) => `${r.verb} — ${r.detail ?? ""}`).join("\n")}</pre>
+	{:else if delivery.mode && delivery.mode !== "none"}
+		<details class="muted" style="font-size:11.5px; padding:0 16px">
+			<summary>no delivery rows yet</summary>
+			config mode is {delivery.mode} — rows land in the wave log as waves deliver; delivery stays a config + CLI decision (§5), read-only here.
+		</details>
 	{/if}
 
 	<!-- §8.6 per-task diff access: terminal rows carry their diffs; todo rows stay silent -->

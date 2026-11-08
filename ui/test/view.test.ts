@@ -3,15 +3,15 @@
  * topological order + selection defaults, failure-row toasts.
  */
 import { describe, expect, it } from "vitest";
-import { decideView, topoOrder, jobOutcome, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded } from "../src/lib/view.ts";
+import { decideView, topoOrder, jobOutcome, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded, conversationGroups, conversationById, hashConversationDrawer, isConversationListHash, excerptErrorState, entryKindLabel, deliveryReport, windowedTail, EVENT_LOG_DOM_WINDOW, filterTasks, TASK_STATUSES } from "../src/lib/view.ts";
 import type { RoleModelInfo } from "../src/lib/api.ts";
 import type { HealthCheck } from "../../src/engine/inspector.ts";
 import type { ReadoutSnapshot } from "../src/lib/api.ts";
 import type { JobRecord } from "../server/jobs.ts";
-import type { KitReadout } from "../../src/engine/inspector.ts";
+import type { KitReadout, KitTaskView, ConvSummary, ConvEntryView, DeliveryRow } from "../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../src/engine/infos.ts";
 
-function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "storage" | "sidecars"; storageTasks?: RouterTask[]; sleep?: ReadoutSnapshot["sleep"] }> = {}): ReadoutSnapshot {
+function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "storage" | "sidecars"; storageTasks?: RouterTask[]; storageConversations?: ConvSummary[]; sleep?: ReadoutSnapshot["sleep"] }> = {}): ReadoutSnapshot {
 	return {
 		readout: {
 			at: 1,
@@ -23,9 +23,12 @@ function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "
 			rows: [],
 			usage: { sessionUsd: 0, tokens: 0, ceilingUsd: 0, warnUsdPerWave: 0, wavesExecuted: 0, spendRateUsdPerWave: 0, byModel: {}, byTask: {}, source: "storage" },
 			timeline: [],
+			delivery: { rows: [] },
 			artifacts: [],
 			health: [],
-			...(over.storageTasks ? { storage: { router: { version: 1, phase: "planned", tasks: over.storageTasks }, runStatus: { version: 1, budgetSpentUsd: 0, sleepCycleCount: 0, consecutiveErrors: 0, kitVersion: "k" }, conversations: [], reports: [] } } : {}),
+			...(over.storageTasks || over.storageConversations
+			? { storage: { router: { version: 1, phase: "planned", tasks: over.storageTasks ?? [] }, runStatus: { version: 1, budgetSpentUsd: 0, sleepCycleCount: 0, consecutiveErrors: 0, kitVersion: "k" }, conversations: over.storageConversations ?? [], reports: [] } }
+			: {}),
 		},
 		mode: over.mode ?? "storage",
 		at: 1,
@@ -209,6 +212,118 @@ describe("diffOpenable + latestDiffTask", () => {
 });
 
 // ---------------------------------------------------------------------------
+// M4-a: conversation visibility (§7.5 stage 1) — grouping, drawer lookup, hashes
+// ---------------------------------------------------------------------------
+
+function conv(over: Partial<ConvSummary> & Pick<ConvSummary, "id" | "role">): ConvSummary {
+	return { entries: 0, resets: 0, compactions: 0, toolRounds: 0, byKind: {}, entriesTruncated: false, usage: { usd: 0, totalTokens: 0 }, ...over };
+}
+
+describe("conversationGroups (§7.5 list grouping)", () => {
+	const convs: ConvSummary[] = [
+		conv({ id: 7, role: "implementer", task: "list-parse", targetPaths: ["src/list.ts"], entries: 9 }),
+		conv({ id: 2, role: "implementer", task: "list-parse", entries: 4 }),
+		conv({ id: 1, role: "planner", entries: 30 }),
+		conv({ id: 5, role: "verifier", entries: 6 }),
+		conv({ id: 9, role: "implementer", task: "render-rows", entries: 12 }),
+		conv({ id: 3, role: "none", entries: 1 }),
+		// a task the router no longer has (stale mapping) still renders, last
+		conv({ id: 4, role: "implementer", task: "ghost-task", entries: 2 }),
+	];
+	const taskOrder = ["render-rows", "list-parse"];
+
+	it("groups planner → per-task (task-table order, unknown last) → verifier → other; rows by id inside a group", () => {
+		const groups = conversationGroups(convs, taskOrder);
+		expect(groups.map((g) => g.key)).toEqual(["planner", "render-rows", "list-parse", "ghost-task", "verifier", "other"]);
+		expect(groups.map((g) => g.rows.map((r) => r.id))).toEqual([[1], [9], [2, 7], [4], [5], [3]]);
+	});
+
+	it("several implementer conversations mapping to one task share a group", () => {
+		const groups = conversationGroups(convs, taskOrder);
+		const listGroup = groups.find((g) => g.key === "list-parse")!;
+		expect(listGroup.rows.map((r) => r.id)).toEqual([2, 7]);
+		expect(listGroup.rows.every((r) => r.task === "list-parse")).toBe(true);
+	});
+
+	it("unknown task order falls back to id order; empty input → no groups; undefined never throws", () => {
+		expect(conversationGroups(convs, []).map((g) => g.key)).toEqual(["planner", "ghost-task", "list-parse", "render-rows", "verifier", "other"]);
+		expect(conversationGroups([], taskOrder)).toEqual([]);
+		expect(conversationGroups(undefined, taskOrder)).toEqual([]);
+	});
+
+	it("an implementer conversation without a task lands in other, not a task group", () => {
+		const groups = conversationGroups([conv({ id: 1, role: "implementer" }), conv({ id: 2, role: "planner" })], []);
+		expect(groups.map((g) => g.key)).toEqual(["planner", "other"]);
+	});
+});
+
+describe("conversationById (drawer lookup)", () => {
+	const convs = [conv({ id: 1, role: "planner" }), conv({ id: 2, role: "implementer", task: "t" })];
+
+	it("finds by numeric id; unknown id / undefined list / undefined id → undefined", () => {
+		expect(conversationById(convs, 2)?.task).toBe("t");
+		expect(conversationById(convs, 99)).toBeUndefined();
+		expect(conversationById(undefined, 1)).toBeUndefined();
+		expect(conversationById(convs, undefined)).toBeUndefined();
+	});
+});
+
+describe("excerptErrorState (A.5 fetch classification)", () => {
+	const LOCK_BUSY = "conversation detail returns when the lock is free — a run is live";
+
+	it("the server's lock-busy sentence classifies to the established empty state", () => {
+		expect(excerptErrorState(LOCK_BUSY)).toEqual({ kind: "lock-busy" });
+		expect(excerptErrorState(`409: ${LOCK_BUSY}`)).toEqual({ kind: "lock-busy" });
+	});
+
+	it("anything else stays a plain error the banner quotes", () => {
+		expect(excerptErrorState("no conversation #42 in this project")).toEqual({ kind: "error", message: "no conversation #42 in this project" });
+		expect(excerptErrorState("HTTP 500")).toEqual({ kind: "error", message: "HTTP 500" });
+	});
+});
+
+describe("entryKindLabel (A.5 row labels)", () => {
+	function entry(over: Partial<ConvEntryView>): ConvEntryView {
+		return { id: 1, kind: "pi.user", text: "", ...over };
+	}
+
+	it("trims the pi. prefix; unknown/empty kinds do not blank the row", () => {
+		expect(entryKindLabel(entry({ kind: "pi.user" }))).toBe("user");
+		expect(entryKindLabel(entry({ kind: "pi.assistant" }))).toBe("assistant");
+		expect(entryKindLabel(entry({ kind: "seed.entry" }))).toBe("seed.entry"); // non-pi kinds stay verbatim
+		expect(entryKindLabel(entry({ kind: "" }))).toBe("entry");
+	});
+
+	it("assistant entries name their tool calls; failed tool results say so", () => {
+		expect(entryKindLabel(entry({ kind: "pi.assistant", toolCalls: [{ name: "write", input: "{}" }] }))).toBe("assistant · write");
+		expect(entryKindLabel(entry({ kind: "pi.assistant", toolCalls: [{ name: "bash", input: "{}" }, { name: "write", input: "{}" }] }))).toBe("assistant · bash, write");
+		expect(entryKindLabel(entry({ kind: "pi.tool-result", isError: true }))).toBe("tool-result · failed");
+		expect(entryKindLabel(entry({ kind: "pi.tool-result" }))).toBe("tool-result");
+	});
+});
+
+describe("conversation hash parsing (deep links)", () => {
+	it("#/conversations/<id> parses strictly to a safe integer id", () => {
+		expect(hashConversationDrawer("#/conversations/12")).toBe(12);
+		expect(hashConversationDrawer("#/conversations/007")).toBe(7);
+		expect(hashConversationDrawer("#/conversations/")).toBeUndefined();
+		expect(hashConversationDrawer("#/conversations")).toBeUndefined(); // the list link, not a drawer
+		expect(hashConversationDrawer("#/conversations/abc")).toBeUndefined();
+		expect(hashConversationDrawer("#/conversations/1/extra")).toBeUndefined();
+		expect(hashConversationDrawer("#/conversations/9007199254740993")).toBeUndefined(); // unsafe integer
+		expect(hashConversationDrawer("#/diff/x")).toBeUndefined();
+		expect(hashConversationDrawer("#bad")).toBeUndefined();
+	});
+
+	it("isConversationListHash matches exactly #/conversations and nothing else", () => {
+		expect(isConversationListHash("#/conversations")).toBe(true);
+		expect(isConversationListHash("#/conversations/3")).toBe(false);
+		expect(isConversationListHash("#/health")).toBe(false);
+		expect(isConversationListHash("")).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // M3: health panel order (§7.1) — errors → warnings → pass → skipped-labeled
 // ---------------------------------------------------------------------------
 
@@ -321,6 +436,66 @@ describe("filterWaveRows (event log)", () => {
 	});
 });
 
+// M4-c: event-log window raise (§13) + task-table row filter
+describe("windowedTail (§13 event-log DOM window)", () => {
+	it("under the window: everything shows, no truncation", () => {
+		const rows = Array.from({ length: 10 }, (_, i) => i);
+		expect(windowedTail(rows, 2_000)).toEqual({ shown: rows, hidden: 0, truncated: false });
+	});
+
+	it("over the window: the NEWEST rows survive, the cut is counted", () => {
+		const rows = Array.from({ length: 10 }, (_, i) => i);
+		expect(windowedTail(rows, 4)).toEqual({ shown: [6, 7, 8, 9], hidden: 6, truncated: true });
+	});
+
+	it("exactly at the window is not truncation (nothing is hidden)", () => {
+		const rows = Array.from({ length: 4 }, (_, i) => i);
+		expect(windowedTail(rows, 4)).toEqual({ shown: rows, hidden: 0, truncated: false });
+	});
+
+	it("empty input stays empty; one over the §13 default window truncates to 2,000", () => {
+		expect(windowedTail([], 4)).toEqual({ shown: [], hidden: 0, truncated: false });
+		expect(EVENT_LOG_DOM_WINDOW).toBe(2_000);
+		const over = windowedTail(Array.from({ length: 2_001 }, (_, i) => i));
+		expect(over.shown).toHaveLength(2_000);
+		expect(over.shown[0]).toBe(1);
+		expect(over.hidden).toBe(1);
+		expect(over.truncated).toBe(true);
+	});
+});
+
+describe("filterTasks (task-table row filter)", () => {
+	const tasks: KitTaskView[] = [
+		{ id: "list-parse", title: "Parse the list module", status: "done", waveCount: 1, dependsOn: [], targetPaths: ["src/list.ts"], priority: 1, feedback: 0 },
+		{ id: "list-query", title: "Query wiring", status: "in_progress", waveCount: 2, dependsOn: ["list-parse"], targetPaths: ["src/query.ts"], priority: 1, feedback: 1 },
+		{ id: "cli-render", title: "Render the CLI", status: "todo", waveCount: 0, dependsOn: ["list-query"], targetPaths: ["src/cli.ts"], priority: 2, feedback: 0 },
+		{ id: "docs-sweep", title: "Sweep docs", status: "quarantined", waveCount: 3, dependsOn: [], targetPaths: ["docs/"], priority: 3, feedback: 2 },
+	];
+
+	it("blank filter (all statuses + no text) returns everything", () => {
+		expect(filterTasks(tasks, { status: "all", text: "" })).toHaveLength(4);
+		expect(filterTasks(tasks, { status: "all", text: "   " })).toHaveLength(4);
+	});
+
+	it("status chip narrows to exactly that status", () => {
+		expect(filterTasks(tasks, { status: "done", text: "" }).map((t) => t.id)).toEqual(["list-parse"]);
+		expect(filterTasks(tasks, { status: "todo", text: "" }).map((t) => t.id)).toEqual(["cli-render"]);
+		expect(TASK_STATUSES).toEqual(["todo", "in_progress", "done", "quarantined"]);
+	});
+
+	it("text matches id, title, dependency, and target path — case-insensitive substring", () => {
+		expect(filterTasks(tasks, { status: "all", text: "LIST-P" }).map((t) => t.id)).toEqual(["list-parse", "list-query"]); // own id + the dependency join
+		expect(filterTasks(tasks, { status: "all", text: "query wiring" }).map((t) => t.id)).toEqual(["list-query"]); // title
+		expect(filterTasks(tasks, { status: "all", text: "list-query" }).map((t) => t.id)).toEqual(["list-query", "cli-render"]); // dependency join only
+		expect(filterTasks(tasks, { status: "all", text: "docs/" }).map((t) => t.id)).toEqual(["docs-sweep"]); // target path
+	});
+
+	it("status chip AND text combine; no match → empty (the table's kind empty state)", () => {
+		expect(filterTasks(tasks, { status: "in_progress", text: "query" }).map((t) => t.id)).toEqual(["list-query"]);
+		expect(filterTasks(tasks, { status: "done", text: "query" })).toEqual([]);
+	});
+});
+
 describe("keyboard binding derivations (§10)", () => {
 	const clean = { ctrlKey: false, altKey: false, metaKey: false };
 
@@ -422,5 +597,38 @@ describe("firstFailureLine (failed-job toast reason)", () => {
 		expect(firstFailureLine(undefined)).toBeUndefined();
 		expect(firstFailureLine([""])).toBeUndefined();
 		expect(firstFailureLine(["", "  plan failed: roles.planner needs provider and modelId", "hint: run init"])).toBe("plan failed: roles.planner needs provider and modelId");
+	});
+});
+
+describe("deliveryReport (§8.6 delivery mode/outcome rows, Appendix A.6 — read-only)", () => {
+	const rows = [
+		{ ts: 1, task: "t1", verb: "commit-failed", detail: "git commit failed (nothing to commit?)" },
+		{ ts: 2, task: "t1", wave: 1, verb: "delivered", detail: "committed: demo: t1 (wave 1)" },
+	] as DeliveryRow[];
+
+	it("mode + row count; rows pass through as engine verbs", () => {
+		const view = deliveryReport({ mode: "commit", rows });
+		expect(view.mode).toBe("commit");
+		expect(view.stat).toBe("commit · 2 row(s)");
+		expect(view.rows).toEqual(rows);
+		expect(view.rows[1]?.verb).toBe("delivered");
+	});
+
+	it("mode none with no rows is 'none' (delivery off is the truth, not an error)", () => {
+		expect(deliveryReport({ mode: "none", rows: [] })).toEqual({ mode: "none", stat: "none", rows: [] });
+	});
+
+	it("mode none keeps any outcome rows visible (e.g. a project that ran with commit mode, then switched config)", () => {
+		const view = deliveryReport({ mode: "none", rows });
+		expect(view.stat).toBe("none · 2 row(s)");
+		expect(view.rows).toHaveLength(2);
+	});
+
+	it("a side-car snapshot with an unreadable config: rows stay, the stat says the mode is unknown", () => {
+		const view = deliveryReport({ rows });
+		expect(view.mode).toBeUndefined();
+		expect(view.stat).toBe("2 delivery row(s) — mode unknown");
+		// nothing at all (no delivery in the readout — old snapshot shape)
+		expect(deliveryReport(undefined)).toEqual({ stat: "unknown", rows: [] });
 	});
 });

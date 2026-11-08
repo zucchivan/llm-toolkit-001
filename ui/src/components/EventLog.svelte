@@ -2,17 +2,19 @@
 	/**
 	 * EventLog (§7.1): wave-log tail — newest last, filter by task/kind/text,
 	 * pause (freezes the visible tail; held-back rows counted), autoscroll.
-	 * The filter input registers itself so the global "/" shortcut can focus it
-	 * (lib/shortcuts.ts).
+	 * The §13 DOM window (M4-c): the newest 2,000 rows render; older rows are
+	 * cut with an explicit "truncated — showing newest N of M" notice (the
+	 * readout itself carries the full wave-log tail — no server-side cap — and
+	 * the notice says so rather than hiding the cut). The filter input
+	 * registers itself so the global "/" shortcut can focus it (lib/shortcuts.ts).
 	 */
 	import type { WaveRow } from "../../../src/engine/infos.ts";
 	import { clockTime } from "../lib/format.ts";
-	import { filterWaveRows } from "../lib/view.ts";
+	import { filterWaveRows, windowedTail } from "../lib/view.ts";
 	import { registerEventFilter } from "../lib/shortcuts.ts";
 
 	let { rows }: { rows: WaveRow[] } = $props();
 
-	const MAX_VISIBLE = 300;
 	let paused = $state(false);
 	let frozen = $state<WaveRow[]>([]);
 	let query = $state("");
@@ -26,7 +28,10 @@
 
 	const filtered = $derived(filterWaveRows(paused ? frozen : rows, query));
 	const heldBack = $derived(paused ? Math.max(0, rows.length - frozen.length) : 0);
-	const visible = $derived.by(() => (filtered.length > MAX_VISIBLE ? filtered.slice(-MAX_VISIBLE) : filtered));
+	// §13 window (M4-c): the DOM keeps the newest EVENT_LOG_DOM_WINDOW rows; the
+	// cut is announced, never hidden (windowedTail owns the numbers).
+	const tail = $derived(windowedTail(filtered));
+	const visible = $derived(tail.shown);
 
 	// Event log tail: newest last, auto-scrolled on update (§11.3 style).
 	let container: HTMLDivElement | undefined = $state(undefined);
@@ -65,7 +70,7 @@
 <section class="panel eventlog">
 	<div class="panel-header">
 		<span>event log · wave-log.jsonl tail</span>
-		<span class="muted">{filtered.length} row(s){filtered.length > MAX_VISIBLE ? ` · last ${MAX_VISIBLE} shown` : ""}{paused ? ` · paused${heldBack > 0 ? ` (+${heldBack} held back)` : ""}` : ""}</span>
+		<span class="muted">{filtered.length} row(s){tail.truncated ? ` · truncated — showing newest ${tail.shown.length.toLocaleString()} of ${filtered.length.toLocaleString()}` : ""}{paused ? ` · paused${heldBack > 0 ? ` (+${heldBack} held back)` : ""}` : ""}</span>
 	</div>
 	<div style="display:flex; gap:8px; align-items:center; padding:6px 12px; border-bottom:1px solid var(--border)">
 		<input
@@ -89,6 +94,15 @@
 	<div bind:this={container} onscroll={onScroll} role="log" aria-label="wave log tail" aria-live={paused ? "off" : "polite"}
 		style="overflow:auto; max-height:480px; padding:4px 0;"
 	>
+		{#if tail.truncated}
+			<!-- the explicit cut notice: the readout carries the full wave-log tail (no server-side cap);
+			     only this DOM window is windowed (§13) -->
+			<div class="status-mono truncated-notice" role="note" style="padding:4px 12px; border-bottom:1px solid var(--border);">
+				↑ truncated — showing newest {tail.shown.length.toLocaleString()} of {filtered.length.toLocaleString()} row(s) ·
+				{tail.hidden.toLocaleString()} earlier row(s) sit above this window (the readout carries the full wave-log tail; no server-side cap) ·
+				narrow the filter, or read <span class="mono">.orch/wave-log.jsonl</span> for the complete paper trail
+			</div>
+		{/if}
 		{#each visible as row, i (i)}
 			<div class="status-mono" style="display:flex; gap:10px; padding:2px 12px;">
 				<span class="mono muted" style="flex:0 0 66px">{clockTime(row.ts)}</span>

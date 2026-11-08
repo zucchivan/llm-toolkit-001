@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 /**
- * EventLog component tests (M3): the filter narrows the tail, pause freezes it
- * (held-back rows counted), "/" registration focuses the filter input.
+ * EventLog component tests (M3 + M4-c): the filter narrows the tail, pause
+ * freezes it (held-back rows counted), "/" registration focuses the filter
+ * input; over §13's 2,000-row DOM window the cut is explicit (the notice
+ * names newest-N-of-M and that the readout carries the full tail).
  */
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/svelte";
@@ -24,7 +26,8 @@ const rows: WaveRow[] = [
 	row({ task: "t2", kind: "verdict", wave: 2, verb: "reject:1", detail: "missing criterion" }),
 ];
 
-const visibleRows = (root: HTMLElement): HTMLElement[] => Array.from(root.querySelectorAll(".eventlog [role=log] .status-mono"));
+const visibleRows = (root: HTMLElement): HTMLElement[] => Array.from(root.querySelectorAll(".eventlog [role=log] .status-mono:not(.truncated-notice)"));
+const notice = (root: HTMLElement): HTMLElement | null => root.querySelector(".eventlog [role=log] .truncated-notice");
 
 describe("EventLog filter + pause", () => {
 	it("renders all rows; the filter narrows to matching ones with an empty-state when nothing matches", async () => {
@@ -63,6 +66,25 @@ describe("EventLog filter + pause", () => {
 		await fireEvent.click(screen.getByRole("button", { name: "reset" }));
 		expect(visibleRows(container)).toHaveLength(4);
 		expect(screen.getByRole("button", { name: "pause" }).getAttribute("aria-pressed")).toBe("false");
+	});
+
+	it("over §13's window: the DOM keeps the newest 2,000 rows and the cut is announced explicitly", () => {
+		const many = Array.from({ length: 2_005 }, (_, i) => row({ task: `t${i}`, kind: "wave", verb: "start", ts: i }));
+		const { container } = render(EventLog, { props: { rows: many } });
+		const domRows = visibleRows(container);
+		expect(domRows).toHaveLength(2_000);
+		// the window keeps the NEWEST rows: the first visible row is t5 (t0–t4 cut)
+		expect(domRows[0]!.textContent).toContain("t5");
+		expect(domRows.at(-1)!.textContent).toContain("t2004");
+		// the explicit notice: newest-N-of-M, the hidden count, and the honest
+		// server-side truth (the readout carries the full tail — no server cap)
+		expect(container.textContent).toContain("truncated — showing newest 2,000 of 2,005");
+		expect(notice(container)?.textContent).toContain("5 earlier row(s) sit above this window");
+		expect(notice(container)?.textContent).toContain("no server-side cap");
+		// at/under the window there is no notice at all (2,000 exactly = not truncated)
+		const small = render(EventLog, { props: { rows: many.slice(-2_000) } });
+		expect(notice(small.container)).toBeNull();
+		expect(small.container.textContent).not.toContain("truncated");
 	});
 
 	it("registers its filter input so the global '/' shortcut can focus it; unregistering on unmount", async () => {

@@ -4,6 +4,287 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.6.1 — M5-b: PROMPT.md + gate recipes join the read-only sources panel (§5/§18)
+
+The second M5 slice completes the read half of the §18 deferral across the
+loop's INPUT documents: 0.6.0 shipped `.orch/config.toml` + the PRD; this one
+adds `PROMPT.md` and `evals/recipes.toml` to the SAME panel, SAME endpoint,
+SAME no-write promise (D5 stands — viewing ships, editors stay deferred;
+router.md stays plan-review-only; D3's no-delivery-toggle is untouched). No
+core seam change (still kit 0.2.2, A.1–A.3 + A.5 + A.6; `readout.seam` stays
+1), no new deps, no CLI surface change.
+
+- **One endpoint, four files** — `GET /api/project/sources` now serves
+  `prompt` (`.orch`-sibling fixed root path `PROMPT.md`, the per-wave
+  discipline doc every wave input embeds — same fixed path the engine reads)
+  and `recipes` (`evals/recipes.toml` with a `parseError` verdict from the
+  ENGINE's own `loadRecipes`, so the shown message is exactly what the next
+  wave's gate step would throw). Still static-file reads with NO lock and NO
+  harness window in both snapshot modes: a live run reads — never rewrites —
+  either file (the harness blocks agents from writing `.orch/**`, `evals/**`,
+  `router.md` or `PROMPT.md` anyway — engine-owned paths). §11.4 discipline
+  carries over verbatim: 5 MiB text cap with
+  a stated `truncated` flag (never silent), NUL-byte content labeled
+  `binary`, byte counts always the file's real size. Still no POST: read-only
+  in the protocol itself.
+- **Honest verdict semantics per file** — the two new files have DIFFERENT
+  absence meanings and the panel honors both: `PROMPT.md` missing is a WARN
+  (amber `absent`) — waves still run, but every wave input assembles without
+  the per-wave discipline doc; the banner names the fix (write it at the
+  root, or `llm-toolkit-001 init`). `evals/recipes.toml` missing is a
+  DEFINED state (green `ok · absent`) — zero recipes means gates run the
+  scope check only, exactly what `loadRecipes` returns for `ENOENT`; the
+  banner says so rather than crying red. A recipes TOML that parses but lacks
+  `cmd` (or fails to parse) keeps the raw text visible under the red
+  `parse error` chip — showing the text is how you fix the edit.
+- **Panel + header** — the sources panel renders all four files through one
+  generalized per-file row (chip, path, bytes, banners, raw text) driven by
+  the pure chips in `view.ts`: `promptChip` / `recipesChip` (new) join
+  `sourceChip`, and a new `worstSourceChip` makes the closed-panel header
+  note severity-ordered (parse error > missing > binary > capped > ok) so a
+  red recipes verdict outranks an amber prompt absence regardless of
+  position. Header label is now `sources · config + prd + prompt + recipes`
+  and never lies about a file it merely carried raw. Fetch-on-open +
+  `refetch` only (no polling — §13); closed = zero requests. router.md
+  deliberately stays unlisted: its content already lives in the plan-review
+  cards.
+- **Non-goals unchanged** — no write path for ANY of the four files (§5;
+  D3/D5 hold), no delivery toggle, no per-wave isolated diffs, no
+  mobile/LAN/light theme, no new UI deps.
+- **Testing** — `test/project-sources-server.test.ts` gains the four-file
+  happy path (prompt text = the init scaffold, recipes = the commented
+  starter with no parseError), prompt-absent (warn, others stay clean),
+  recipes unparseable (raw text + the loader's unreadable/invalid verdict),
+  recipes missing `cmd` (the loader's needs-cmd message verbatim), and
+  recipes-absent (defined state, no parseError); `test/components-sources.test.ts`
+  covers the two new files' render (`text`/`missing`/`parse-error` states,
+  the config's parse banner unchanged) plus new pure cases for
+  `promptChip`/`recipesChip` and the severity-ordered header
+  (`worstSourceChip`). All suites green: ui `npm test`, `typecheck`,
+  `check`, `build`, `test:e2e` (3/3), root `npm test` and `npm run build`.
+
+## 0.6.0 — M5-a: read-only project sources (config + PRD viewers, §5/§18)
+
+The first M5 slice is deliberately the HALF of the §18 deferral ("config/PRD
+editors") that §5 permits: viewing, not editing (decision recorded 2026-11-08,
+D5 — a UI editor that writes `.orch/config.toml` or the PRD would be a §5
+non-goal AND a §7.2 action-table change; the honest M5-a ships the read side
+and keeps the edit side deferred, as M4-b did for delivery). No core seam
+change (still kit 0.2.2, A.1–A.3 + A.5 + A.6; `readout.seam` stays 1), no new
+deps, no CLI surface change. Delivery reading shipped in M4-b (A.6) — M5-a
+adds the two remaining input documents: the config and the PRD.
+
+- **`GET /api/project/sources` (§11.2 shape)** — one read-only endpoint
+  serving both static sources: `config` (`.orch/config.toml` raw text + a
+  best-effort parse verdict in the CLI's own plain words) and `prd` (the
+  resolved path: status.json's A.1 `prdPath` flush first, then the config's
+  `[paths] prd`, then the engine default `docs/prd.md`). Both modes serve it
+  with NO lock and NO harness window — these are static files (the A.6
+  precedent for reading the config path without the lock), and a live run
+  rewrites neither. Text is capped at 5 MiB (§11.4 discipline) with a
+  `truncated` flag; NUL-byte content is labeled `binary` and not shown; byte
+  counts are always the file's real size. There is no POST for this route:
+  read-only in the protocol itself, never a UI write path (the CLI stays the
+  only mutation path).
+- **Sources panel** — a collapsible left-column panel (deep link `#/sources`,
+  sibling of `#/health` and `#/conversations`) rendering both files raw in
+  scrollable pre blocks: per-file chip (ok / parse error / missing /
+  `ok · capped` / binary), path, real byte count, and stated bounds. The
+  header shows the worst fact (`parse error`, `unreadable`, a non-ok chip
+  label) — and the snapshot's existing `configError` colors it even before a
+  fetch, consistent with the dialogs' 422 preflight. Fetches on open + an
+  explicit `refetch` button only (§13: no polling loops); closed = zero
+  requests. Parse errors keep the raw text visible — showing the text is how
+  you fix the edit. A missing PRD gets the established kind sentence (write
+  it, or pass `--prd`; the plan dialog prefills the same path).
+- **The promise is on the panel** — `read-only — the ui never writes these
+  files; edit in your editor, the cli stays the only mutation path` — so the
+  §5 guardrail is stated where the files are shown, not only in the PRD.
+- **Non-goals unchanged** — no config/PRD/router editing (the §18 deferral
+  stays deferred; so do PROMPT.md, evals/recipes.toml and router.md viewing —
+  router content already lives in the plan review cards), no delivery toggle
+  (D3), no per-wave isolated diffs, no mobile/LAN, no new UI deps.
+- **Testing** — new `test/project-sources-server.test.ts` (shape happy path,
+  missing PRD, broken TOML with status.json prd fallback, config-less root,
+  the >5 MiB cap with the real byte count preserved, binary labeling, 401/405);
+  new `test/components-sources.test.ts` (closed = zero fetches, ready render
+  + read-only note, missing/parse-error/capped/error states, refetch retry,
+  header pre-coloring from the snapshot's configError) + `sourceChip` cases;
+  `format.test.ts` grows `bytesLabel`. All suites green: root `npm test`
+  (46), ui `npm test`, `typecheck`, `check`, `build`, `test:e2e` (3/3).
+
+## 0.5.3 — M4-c: event-log window raise (§13) + task-table row filter (§7.1)
+
+The last M4 polish slice before M5. Two operator-console gaps closed, both
+UI-only: no core seam change (still kit 0.2.2, A.1–A.3 + A.5 + A.6;
+`readout.seam` stays 1 — nothing here needed even an additive Appendix
+subsection), no new deps, no CLI surface change.
+
+- **Event-log window raise (§13)** — the M3 record deferred §13's 2,000-row
+  DOM window together with virtualization ("300 keeps sub-second SSE updates
+  snappy"). M4-c ships the windowed half without virtualization, which §13
+  explicitly accepts ("virtualized or windowed"): the DOM now keeps the
+  **newest 2,000 rows** (was 300), and when the window bites the cut is
+  announced, never hidden — the header says
+  `truncated — showing newest 2,000 of M` and an in-log notice names the
+  hidden count and the honest server-side truth: **the readout carries the
+  full wave-log tail (no server-side cap)**, narrow the filter or read
+  `.orch/wave-log.jsonl` for the complete paper trail. Pure `windowedTail` in
+  `lib/view.ts` owns the numbers (`EVENT_LOG_DOM_WINDOW = 2_000`).
+- **Decision (recorded 2026-11-08, D4)** — no server-side row cap ships in
+  this slice. The readout path is the engine's (`inspector.ts` reads the whole
+  `wave-log.jsonl`), and capping rows in the UI server would silently skew the
+  completion report's wall-clock span (it reads `rows[0].ts`/`rows.at(-1).ts`)
+  the moment a log outgrows the cap. Loopback transfer of the full tail stays
+  "typical" per §13 at demo/realistic run sizes; a server-side tail cap (with
+  a preserved run-start timestamp) stays unscoped until a real log outgrows
+  it. The notice naming "no server-side cap" is the honest half of the deal.
+- **Task-table row filter (§7.1)** — the §13/§16 deferral the M3 record
+  documented ("row filtering stays a documented deferral") ships as a small,
+  dense toolbar sibling of the event log's: a case-insensitive text match
+  (id, title, dependsOn, target paths) + a status chip (`all statuses`,
+  `todo`, `in progress`, `done`, `quarantined`), with a counted header
+  (`tasks (2 of 12)`), a `reset` button while active, and a kind no-match
+  state naming both active constraints. Pure `filterTasks` in `lib/view.ts`
+  owns the math; it composes with the existing sort toggle (filter, then
+  plan/failing-first order). Keyboard/a11y patterns unchanged: the inputs are
+  plain Tab-reachable controls, typing in them already suppresses the global
+  `/`/`?` shortcuts (the `typing` guard), the Esc chain is untouched, no new
+  global keys exist.
+- **Testing** — `view.test.ts` grows `windowedTail` (under/at/over the window,
+  empty, the §13 default contract) + `filterTasks` (blank → all, status chip,
+  id/title/dependency/target matches, AND composition) cases;
+  `components-eventlog.test.ts` renders 2,005 rows and asserts exactly 2,000
+  in the DOM, the explicit notice text, and its absence under the window;
+  `components-tasktable.test.ts` covers text/status/combined filtering, the
+  counted header, reset, the no-match kind state, and filter∘sort
+  composition. All suites green: root `npm test`, ui `npm test`, `typecheck`,
+  `check`, `build`, `test:e2e` (3/3).
+- **Non-goals unchanged** — no M5 (config/PRD/router/delivery editors), no
+  conversation search/paging, no per-wave isolated diffs, no mobile/LAN, no
+  server-side row cap (D4), no new UI deps, no CLI behavior change.
+
+## 0.5.2 — M4-b: delivery truth (§7.2 deferral, §8.6 rows, Appendix A.6)
+
+The §7.2 "Delivery override" deferral is resolved the honest way — by NOT
+inventing a mutation. Consumed kit seam: **A.6 (additive read-only readout
+section; `readout.seam` stays 1 — A.6 is additive surface, not a new seam
+version; the kit itself stays 0.2.2)**. No new deps, no CLI surface change.
+
+- **Decision (recorded 2026-11-08, D3)** — there is no safe delivery toggle
+  for the UI to own. Per §5, delivery stays a config + CLI decision; the
+  CLI's only delivery paths are `.orch/config.toml`'s `delivery.mode`
+  (config editing → M5) and the `--deliver` run qualifier the `pr` mode
+  requires (delivery.ts: a per-run override of what a human typed — a UI
+  that passes it silently changes run semantics vs the same command in a
+  terminal, which is exactly the §5 non-goal and would also be a §7.2
+  action-table change). So M4-b ships the READ-ONLY truth instead of a
+  mutation, and the deferral is documented here, in the PRD's Appendix A.6,
+  and in the report itself (stat title + kind empty note).
+- **Core seam A.6** — `KitReadout` gains an additive `delivery` section:
+  `mode` (the configured `none | commit | pr` from config; storage reads it
+  from the open config, side-car mode best-effort re-reads the static config
+  file and omits `mode` when it is unreadable) and `rows` (the wave log's
+  kind `"delivery"` rows echoed as plain JSON shapes — ts, task, verb, wave?,
+  detail). Root tests: 3 new A.6 cases in `test/ui-seam.test.ts` (a full
+  commit-mode faux run echoing a real `delivered` row, side-car echo + mode
+  from config, broken-config side-car keeping rows and omitting mode).
+- **Completion report (§8.6)** — the delivery stat now says the MODE, not
+  just a row count: `commit · 2 row(s)` / `none` / `1 delivery row(s) — mode
+  unknown`; the outcome `pre` lists engine verbs verbatim (`delivered`,
+  `commit-failed`, `pr-skip`) joined with their detail. A read-only, kind
+  explanation rides the stat's title, and a `no delivery rows yet` details
+  note appears only when the configured mode is `commit`/`pr` but no row has
+  landed yet. There is deliberately NO delivery button in the ActionBar.
+- **Notes** — delivery already surfaced as generic wave-log rows in the
+  event log; it still does. The §8.6 "delivery mode/outcome rows" item is
+  now fully true in one place (the readout's delivery section + the
+  report's delivery stat/tail). Non-goals unchanged: no config/PRD/router
+  editors (M5), no M4-c, no new UI deps.
+- **Testing** — pure `deliveryReport` derivations in `lib/view.ts` (4 cases
+  in `view.test.ts`); new `components-report.test.ts` mounts
+  `CompletionReport` and covers mode·rows, the none/unknown/empty states,
+  and the absence of any delivery mutation control. All suites green:
+  root `npm test`, ui `npm test` (faux e2e 3/3 included).
+
+## 0.5.1 — M4-a stage 2: transcript excerpts (§18 fast-follow, Appendix A.5)
+
+Second half of the §18 fast-follow — the conversation drawer now shows bounded
+transcript content, not just counters. Consumed kit seam: **A.5 (additive;
+`readout.seam` stays 1 — A.5 is additive surface, not a new seam version; the
+kit itself stays 0.2.2)**. Still no new deps, no CLI surface change.
+
+- **Core seam A.5** (`src/engine/inspector.ts`, root tests in
+  `test/ui-seam.test.ts`): `conversationEntries(loop, id, opts)` — a bounded,
+  read-only transcript excerpt. Same BACKGROUND_CONTEXT gated table scan as
+  `collectConversations` (never writes); plain JSON-able shapes only (entry ids
+  as numbers, model-message timestamps as ms numbers, content/tool input as
+  strings — no pi-durable types cross the module boundary, and the UI server
+  still never imports kit.ts). The window is the summary scan's cap — at most
+  4 pages × 500 = **≤ 2,000 entries** per request with a `truncated` flag; no
+  pagination protocol in v1, the cap is the contract. Default order keeps the
+  **newest** 2,000 (where the outcome lives); per-entry text/tool input is cut
+  at 4 KiB with a visible marker. Thinking blocks stay model-internal and
+  never render.
+- **Endpoint** `GET /api/conversations/:id/entries` (§11.2 shape,
+  `{ at, conversation, entries, truncated }`): storage-mode only, the same
+  lock-per-read window as `/api/readout` — the harness opens, the excerpt
+  scans inside it, the lock releases before the response completes; never held
+  between requests. Unknown id → `404`; a live run owning the lock → `409` in
+  the established tone ("conversation detail returns when the lock is free —
+  a run is live"); same cookie auth as every other GET.
+- **Drawer excerpt** — the stage-1 "transcripts stay deferred" banner is gone,
+  replaced by the real thing: kind-labeled rows (`user`, `assistant · write`,
+  `tool-result · failed`), wall-clock timestamps, assistant stop reasons, tool
+  calls with their JSON input, **tool results collapsed** behind a
+  show/hide button, and honest notices when a bound bites (the 2,000-entry
+  window cut, per-entry 4 KiB cut). A mid-view lock loss swaps the excerpt for
+  the established empty state and it fills back in on the next free read.
+  Everything from stage 1 stays: summary fields, truncation-floor note,
+  by-kind table, target paths, task-row highlight, `Esc` chain, both hash deep
+  links.
+- **Testing** — engine: 3 new A.5 cases in `test/ui-seam.test.ts` (shape after
+  a completed run incl. tool calls + stability/read-only re-read, the
+  >2,000-entry truncation both directions, at-cap-isn't-truncated + thinking
+  omission). Server: new `test/conversation-entries-server.test.ts`
+  (200/404/409/405/401, plain-JSON shapes, lock-per-read recovery). Client:
+  `view.test.ts` gains `excerptErrorState` + `entryKindLabel`;
+  `components-conversations.test.ts` mounts the drawer on a stubbed fetch and
+  covers ready/truncated/empty/lock-busy/error states + the collapsed tool
+  result. The faux e2e (3 cuts) is unchanged and stays green.
+
+## 0.5.0 — M4-a stage 1: conversation visibility (§7.5 summaries)
+
+First §18 fast-follow, stage 1 of 2 — summaries only, no core change (still
+kit 0.2.2, A.1–A.3; no PRD edit, no new deps):
+
+- **Conversation list** (§7.5) — a collapsible panel renders
+  `readout.storage.conversations`: role chip, entry counts with a compact
+  by-kind breakdown (`msg×8 tool×3 …`), resets/compactions, tool rounds, a
+  `truncated` chip when the entry scan hit its page cap (counts are a floor,
+  not exact), and per-conversation USD + tokens. Grouped sensibly: planner →
+  one group per task with implementer conversations (several can map to one
+  task; groups follow the task table's order) → verifier → other. Deep link
+  `#/conversations` (sibling of `#/health`).
+- **Summary drawer** — clicking a conversation opens the read-only drawer in
+  the diff drawer's shell (same `Esc` chain, close button, hash deep link
+  `#/conversations/<id>`): role, id, linked task, the counters, the by-kind
+  table, target paths, spend + tokens — and an honest note that transcript
+  CONTENT stays deferred (§18). The linked task row highlights in the task
+  table (`row-link`, secondary to the live `row-cur`).
+- **Storage-mode only, kind about it** — without `storage` (a run owns the
+  lock) the panel and drawer show the established tone: "conversation detail
+  returns when the lock is free — a run is live" — no spinner, no extra
+  requests; the SSE re-snapshot fills it in.
+- **Stage 2 is transcript content**, pending the Appendix A.5 seam session
+  (bounded read-only entry excerpts; the A.5 proposal is drafted in this
+  slice's handoff). The drawer labels the deferral instead of faking content.
+- **Testing** — pure derivations in `lib/view.ts` (`conversationGroups`,
+  `conversationById`, `hashConversationDrawer`, `isConversationListHash`,
+  all strict/edge-proof like `hashDiffTask`) plus a component suite
+  (`components-conversations.test.ts`): panel grouping/empty states/row→
+  drawer callback, drawer fields + truncation note, task-table highlight.
+
 ## 0.4.1 — M3+ verification feedback (model readiness + failed-job reasons)
 
 Found during the M4-entry approval walk: clicking **Plan** on a project whose

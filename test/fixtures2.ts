@@ -18,12 +18,14 @@ export interface BakeOptions {
 	buildFauxModels: (responses: never[]) => { models: Models; faux: FauxProviderHandle };
 	budgetCeiling?: number;
 	retryMax?: number;
+	/** Override the demo config TOML wholesale (e.g. delivery mode commit for A.6 tests). */
+	configToml?: string;
 }
 
 /** Temp project with demo PRD, config, gates, git; returns an open harness. */
 export async function bakeProject(opts: BakeOptions): Promise<Baked> {
 	const project = await prepareDemoProject();
-	await writeConfig(project.root, opts.budgetCeiling ? demoBudgetToml2(opts.budgetCeiling) : demoConfigToml());
+	await writeConfig(project.root, opts.configToml ?? (opts.budgetCeiling ? demoBudgetToml2(opts.budgetCeiling) : demoConfigToml()));
 	await gitInit(project.root);
 	await mkdir(join(project.root, "bin"), { recursive: true });
 	await initProject(project.root);
