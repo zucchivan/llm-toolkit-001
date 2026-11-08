@@ -74,12 +74,19 @@
 				</div>
 			{/if}
 			{#if jobs.attached}
+				{@const stopCheck = jobs.attached.stop}
 				<div class="jobrow">
-					<span class="badge attached" title={`a run holds .orch/lock (pid ${jobs.attached.pid}) but this UI did not launch it — Stop is disabled for it`}>attached · not launched here</span>
+					<span class="badge attached" title={`a run holds .orch/lock (pid ${jobs.attached.pid}) but this UI did not launch it${stopCheck?.ok ? " — its identity verifies (§7.2.1); Stop sends one Ctrl-C (SIGINT), exit 130, resumable" : " — its identity must verify (§7.2.1) before Stop is offered"}`}>attached · not launched here</span>
 				<span class="mono">{verbLabel["run"] ?? ""} (terminal)</span>
 				<span class="mono muted">pid {jobs.attached.pid}</span>
 				<span class="muted">{jobs.attached.phase}</span>
-				<span class="muted" style="margin-left:auto" title="stop from its terminal — the UI cannot verify what it would signal">⨯ stop disabled (from terminal)</span>
+				{#if stopCheck?.ok}
+					<span style="margin-left:auto; display:flex; gap:6px">
+						<button class="btn tiny stop" onclick={onStop} title={`verified — sends Ctrl-C (SIGINT) once: ${stopCheck.command}; the run stays resumable (exit 130)`}>stop (verified)</button>
+					</span>
+				{:else}
+					<span class="muted" style="margin-left:auto" title={stopCheck?.reason ?? "its identity is not verified yet (the check is read-only) — stop it from its terminal"}>⨯ stop unavailable{stopCheck?.ok === false ? " (not verified)" : " (checking identity)"}</span>
+				{/if}
 			</div>
 		{/if}
 		{#each records as job (job.id)}

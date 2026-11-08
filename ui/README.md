@@ -41,7 +41,16 @@ what the next wave's gate step would throw; an absent file is the runner's
 defined "empty gates = scope check only" state, shown green). Same
 read-only promise, same static-file/no-lock discipline (a live run reads —
 never rewrites — either file), same 5 MiB cap and binary labeling, no new
-deps, no core seam change.
+deps, no core seam change. Scope of **M5-slice-3** (0.7.0, this release):
+safe stop for TERMINAL-started runs — the attached Stop affordance ships,
+gated behind a full process-identity verification (PRD §7.2.1): live pid,
+real working directory, and a command line that names this project's
+installed CLI entry followed by a lock-holding subcommand; then EXACTLY ONE
+re-verified `SIGINT` — the kit's clean-close path, exit 130, resumable.
+Any failed check is a stated plain-words reason and NO signal; SIGTERM and
+SIGKILL never happen; Linux-only v1 (the machine needs `/proc`; macOS
+variant B stays deferred in §18). No core seam change (`lockedByPid` was
+already there; `readout.seam` stays 1), no new deps.
 
 What M1 adds on top of the M0 read (see the M0 list in the 0.1.0 CHANGELOG
 entry for the status strip / task table / event log / degradation basics):
@@ -53,9 +62,10 @@ entry for the status strip / task table / event log / degradation basics):
   detached job (Appendix B): the run survives browser AND UI-server death.
 - **Jobs list** — one row per record in `.orch/ui/jobs/` (kind, status chip,
   pid, age, log tail, stop). Terminal-started runs show as `attached · not
-  launched here` with Stop disabled (the UI cannot verify what it would
-  signal). Dead-pid records go `stale` on server start; history keeps the
-  newest 50 records / 14 days.
+  launched here`; their row gains `stop (verified)` when the §7.2.1 identity
+  check passes, else a stated `⨯ stop unavailable (not verified)` with the
+  plain-words reason in the tooltip. Dead-pid records go `stale` on server
+  start; history keeps the newest 50 records / 14 days.
 - **Plan review** — topological task cards with spec, acceptance, target
   paths, deps, priority; selectable when dependencies are done/empty;
   Approve & run waves all todo tasks, Run selected waves the checked subset.
@@ -208,8 +218,9 @@ What M3 adds around that core (§16 M3 polish):
   so it stays unscoped until one does).
 - Task-table row **filtering** shipped in 0.5.3 (a dense toolbar: text match
   over id/title/deps/target paths + a status chip, a counted header, a kind
-  no-match state, composing with the sort toggle). Per-wave isolated diffs
-  and safe stop for attached runs stay in the PRD's §18 deferred list.
+  no-match state, composing with the sort toggle). Safe stop for attached
+  runs shipped in 0.7.0 (§7.2.1, decision D6); per-wave isolated diffs stay
+  in the PRD's §18 deferred list.
   Conversation **summaries** shipped in 0.5.0 and transcript **excerpts** in
   0.5.1 (list + drawer above) — the §18 "read-only conversation transcript
   drawer" fast-follow is now fully landed via the Appendix A.5 seam (bounded
@@ -300,7 +311,10 @@ kept out of default `npm test` (it is gated on `KIT_FAUX=1` and runs as
   CLI job (`.orch/ui/jobs/<id>.json` + `.log`). plan/run/verify/export need a
   free lock (the server probes it with the same brief retry, then answers 409
   with the holder pid/phase); handoff rides the atomic side-car and is safe
-  during a run; stop signals a UI job's CLI pid only. On server start, dead-pid
+  during a run; stop signals a UI job's CLI pid — or, `target: "attached"`,
+  a terminal-started run after the §7.2.1 identity verification (one
+  re-verified SIGINT; every failed check is a reason, never a signal). On
+  server start, dead-pid
   records are marked stale (history: newest 50 / 14 days). Job env is inherited
   from the server (KIT_FAUX*, provider keys) and no secrets land in records.
 - The SSE hub watches `.orch/status.json`, `.orch/wave-log.jsonl` and

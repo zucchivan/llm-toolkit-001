@@ -12,4 +12,7 @@ export interface ActionRequest {
 	prd?: string;
 	/** handoff note (typed in the dialog). */
 	note?: string;
+	/** stop target "attached" (M5-slice-3, §7.2.1): the verified pid the POST confirms. */
+	target?: "job" | "attached";
+	pid?: number;
 }

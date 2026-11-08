@@ -1,9 +1,9 @@
 {
   "name": "llm-toolkit-001-ui",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
-  "description": "Local web control surface for one llm-toolkit-001 loop — plan/approve/run/stop control + detached jobs + diffs + health/keyboard/a11y polish + conversation summaries + bounded transcript excerpts (M4-a) + delivery truth (M4-b) + event-log window raise & task-table filter (M4-c) + read-only source viewers: config/PRD (M5-a) + PROMPT.md/gate recipes (M5-b)",
+  "description": "Local web control surface for one llm-toolkit-001 loop — plan/approve/run/stop control + detached jobs + diffs + health/keyboard/a11y polish + conversation summaries + bounded transcript excerpts (M4-a) + delivery truth (M4-b) + event-log window raise & task-table filter (M4-c) + read-only source viewers: config/PRD (M5-a) + PROMPT.md/gate recipes (M5-b) + verified attached stop: one re-verified Ctrl-C (SIGINT) to terminal-started runs (M5-slice-3)",
   "engines": {
     "node": ">=22.19.0"
   },

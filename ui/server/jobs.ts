@@ -95,9 +95,19 @@ export async function jobsViewList(root: string): Promise<JobView[]> {
 	);
 }
 
+/**
+ * The verified-stop affordance attached to the attached-run view (§7.2.1):
+ * `ok: true` (command line the dialog shows) is what enables the UI's Stop
+ * for a terminal-started run; `ok: false` carries the plain-words reason and
+ * never signals anything (the check is read-only).
+ */
+export type AttachedStopView = { ok: true; pid: number; command: string } | { ok: false; pid: number; reason: string };
+
 /** Attached-run discovery result: a terminal-started live run (never a record). */
 export interface AttachedRun {
 	pid: number;
+	/** The §7.2.1 verification result. Computed per payload (read-only, no signal; see ui/server/attached-stop.ts). */
+	stop?: AttachedStopView;
 	/** `status.json` phase at the last flush (planning / wave-running / idle …). */
 	phase: string;
 	task?: string;
@@ -314,7 +324,9 @@ export async function tailJobLog(logPath: string, maxLines: number): Promise<str
 /**
  * Attached-run discovery (Appendix B): a live `.orch/status.json.lockedByPid`
  * that NO UI running job holds is a terminal-started run. Best-effort liveness;
- * they are not job records and the UI cannot stop them.
+ * they are not job records — stop follows §7.2.1's verification
+ * (ui/server/attached-stop.ts), which names the process before anything is
+ * signalled.
  */
 export async function attachedRun(projectRoot: string, jobs: JobRecord[]): Promise<AttachedRun | undefined> {
 	let payload: StatusPayloads | undefined;

@@ -5,7 +5,10 @@
  * only, never a shell. The allowlist is hard-coded; validation is explicit per
  * kind (unknown kinds/fields → 400). `plan`/`run`/`verify`/`export` need the
  * free lock (else 409 with the holder pid/phase); `handoff` is safe during a
- * run (atomic side-car write); `stop` acts only on jobs this UI launched.
+ * run (atomic side-car write); `stop` acts on jobs this UI launched, or —
+ * `target: "attached"` — on a terminal-started run whose §7.2.1 identity
+ * verification passes (ui/server/attached-stop.ts; a failed check signals
+ * nothing).
  */
 import { existsSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
@@ -34,7 +37,7 @@ export type ActionKind = (typeof ACTION_KINDS)[number];
 const ACTION_FIELDS: Record<ActionKind, readonly string[]> = {
 	plan: ["kind", "prd"],
 	run: ["kind", "approve", "resume", "tasks"],
-	stop: ["kind"],
+	stop: ["kind", "target", "pid"],
 	handoff: ["kind", "note"],
 	verify: ["kind", "task"],
 	export: ["kind"],
@@ -54,6 +57,10 @@ export interface ActionBody {
 	note?: string;
 	/** verify --task <id>. */
 	task?: string;
+	/** stop: "job" (default — this server's own jobs) or "attached" (§7.2.1-verified terminal run). */
+	target?: "job" | "attached";
+	/** stop + target "attached": the pid the dialog confirmed (the server still re-derives and re-checks the holder). */
+	pid?: number;
 }
 
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
@@ -142,8 +149,25 @@ export function validateAction(raw: unknown): Validation {
 			out.task = task;
 			break;
 		}
+		case "stop": {
+			const target = body["target"];
+			if (target !== undefined && target !== "job" && target !== "attached") {
+				return { ok: false, status: 400, error: `stop target must be "job" (this server's own jobs) or "attached" (a verified terminal-started run), not ${JSON.stringify(target)}` };
+			}
+			if (target === "attached") {
+				const pid = body["pid"];
+				if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
+					return { ok: false, status: 400, error: 'stop target "attached" needs pid: a positive integer — the attached holder the jobs payload showed' };
+				}
+				out.target = "attached";
+				out.pid = pid;
+			} else if (body["pid"] !== undefined) {
+				return { ok: false, status: 400, error: 'stop target "job" takes no pid — the newest running UI job is the target' };
+			}
+			break;
+		}
 		default:
-			break; // stop / export take no params
+			break; // export takes no params
 	}
 	return { ok: true, body: out };
 }
@@ -439,9 +463,10 @@ async function waitForProcTarget(projectRoot: string, record: JobRecord): Promis
 }
 
 /**
- * Stop: SIGINT to the newest running non-handoff job's CLI pid. Only UI jobs
- * are stoppable; a terminal-started run answers 409 with the terminal hint
- * (safe attached-stop is deferred — no verifiable command identity yet).
+ * Stop (target "job", the default): SIGINT to the newest running non-handoff
+ * job's CLI pid. A terminal-started run answers 409 with the terminal hint —
+ * its stop lives behind the §7.2.1 verification (ui/server/attached-stop.ts,
+ * target "attached"), never in this path.
  */
 export async function stopAction(projectRoot: string): Promise<{ ok: true; jobId: string; pid: number } | { ok: false; fail: StartError }> {
 	const running = (await activeJobs(projectRoot, (kind) => kind === "handoff")).sort((a, b) => b.startedAt - a.startedAt);
@@ -454,7 +479,7 @@ export async function stopAction(projectRoot: string): Promise<{ ok: true; jobId
 				ok: false,
 				fail: {
 					status: 409,
-					error: `this run holds .orch/lock (pid ${busy.holderPid}) but was not launched by the UI — stop it from its terminal; the UI cannot verify what it would signal`,
+					error: `this run holds .orch/lock (pid ${busy.holderPid}) but was not launched by the UI — stop it from its terminal, or use the attached run's verified stop (target: "attached"; its identity must pass §7.2.1 first)`,
 					holderPid: busy.holderPid,
 					phase: busy.phase,
 				},

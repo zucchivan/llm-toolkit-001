@@ -9,11 +9,13 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { startServer, type RunningUiServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { readOnce } from "../server/readout.ts";
 import { jobsList, type JobRecord } from "../server/jobs.ts";
+import { resolveCli } from "../server/actions.ts";
 import { postAction, actionHeaders, waitFor, spawnSleeper } from "./actions-helper.ts";
 import { bakeConfiguredDemo } from "./helpers.ts";
 
@@ -222,20 +224,123 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect((await stat(join(root, ".orch", "artifacts", "task-list-parse.patch"))).size).toBeGreaterThan(0);
 	});
 
-	it("stop: a terminal-started attach cannot be stopped via the UI (409 + terminal hint)", async () => {
-		// fake a foreign live run: a real sleeper pid owning .orch/lock
-		const holder = spawnSleeper(5);
+	it("attached stop refused: an unverifiable holder is answered with the reason and signal NOTHING (§7.2.1)", async () => {
+		// fake a foreign live run: a real sleeper pid owning .orch/lock from the
+		// PROJECT cwd (so the check reaches the command line) — its cmd is not
+		// this project's installed CLI entry, so the identity check fails
+		// BEFORE anything is signalled.
+		const foreign = spawn(process.execPath, ["-e", "const t = Date.now() + 30000; while (Date.now() < t) {}"], { cwd: root, stdio: "ignore" });
+		const holder = { child: foreign, pid: foreign.pid! };
 		try {
 			await writeFile(join(root, ".orch", "lock"), `${holder.pid}\n${new Date().toISOString()}\n`, "utf8");
 			await writeFile(join(root, ".orch", "status.json"), JSON.stringify({ lockedByPid: holder.pid, phase: "wave-running", ts: Date.now() }), "utf8");
-			const stop = await postAction(base, cookie, { kind: "stop" }, actionHeaders(csrf, base));
-			expect(stop.status).toBe(409);
-			expect(((await stop.json()) as { error: string }).error).toMatch(/from its terminal/);
+
+			// the plain default stop keeps the UI-job contract (terminal hint)
+			const plain = await postAction(base, cookie, { kind: "stop" }, actionHeaders(csrf, base));
+			expect(plain.status).toBe(409);
+			expect(((await plain.json()) as { error: string }).error).toMatch(/from its terminal/);
+
+			// the attached target: verification fails on identity — 409, no signal
+			const attached = await postAction(base, cookie, { kind: "stop", target: "attached", pid: holder.pid }, actionHeaders(csrf, base));
+			expect(attached.status).toBe(409);
+			const body = (await attached.json()) as { error: string };
+			expect(body.error).toMatch(/command line/);
+			expect(body.error).toMatch(/installed CLI entry/);
+
+			const payload = (await (await fetch(`${base}/api/jobs`, { headers: { cookie } })).json()) as { attached?: { pid: number; stop?: { ok: boolean; reason?: string } } };
+			expect(payload.attached?.pid).toBe(holder.pid);
+			expect(payload.attached?.stop?.ok).toBe(false);
+			expect(payload.attached?.stop?.reason).toMatch(/command line/);
+
+			// the holder got NO signal: it is still alive when the test looks again
+			await new Promise((r) => setTimeout(r, 300));
+			process.kill(holder.pid, 0); // throws ESRCH only if it is gone
 		} finally {
 			holder.child.kill("SIGKILL");
 		}
 	});
+
+	it("attached stop verified: the UI SIGINTs the TERMINAL-spawned faux runner once — exit 130, resumable", { timeout: 300_000 }, async () => {
+		// a project with a slow gate: wave 1 of list-parse stalls 3s INSIDE the
+		// gate — the stop window. Plan through the UI first (approve stamp), then
+		// spawn the runner like a terminal would: the SAME entry resolveCli()
+		// picks for spawning jobs, cwd = the project root, detached from jobs.
+		root = await bakeConfiguredDemo();
+		await mkdir(join(root, "evals"), { recursive: true });
+		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
+		await writeFile(join(root, "evals", "recipes.toml"), '[broken-gate]\ncmd = "node smoke-gate.cjs"\n[slow-gate]\ncmd = "node slow-gate.cjs"\n', "utf8");
+
+		const token = newToken();
+		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-stop-dist-"));
+		await writeFile(join(dist, "index.html"), "<!doctype html><title>ok</title>", "utf8");
+		running = await startServer({ root, token, port: 0, distDir: dist });
+		base = `http://127.0.0.1:${running.port}`;
+		cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
+		csrf = token;
+		const headers = actionHeaders(csrf, base);
+
+		const plan = await postAction(base, cookie, { kind: "plan", prd: "docs/prd.md" }, headers);
+		expect(plan.status).toBe(202);
+		const { jobId } = (await plan.json()) as { jobId: string };
+		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
+
+		// terminal-spawned run (NOT a UI job record): same argv shape the human
+		// types, cwd on the project, the UI server's job layer left out entirely.
+		const child = spawn(resolveCli(root).argv[0]!, [...resolveCli(root).argv.slice(1), "run", "--approve"], {
+			cwd: root,
+			stdio: "ignore",
+			env: { ...process.env }, // KIT_FAUX=1 + KIT_FAUX_SCRIPT ride the test env
+		});
+		try {
+			// attach: the CLI owns the lock and flushes wave-running promptly
+			await waitFor(
+				async () => {
+					try {
+						const payload = JSON.parse(await readFile(join(root, ".orch", "status.json"), "utf8")) as { lockedByPid?: number; phase?: string; task?: { id?: string } };
+						return payload.lockedByPid === child.pid && payload.phase === "wave-running" && payload.task?.id === "list-parse";
+					} catch {
+						return false;
+					}
+				},
+				(ok) => ok,
+				120_000,
+			);
+
+			// the affordance flips to verified on the jobs payload
+			const payload = (await waitFor(async () => {
+				const jobs = (await (await fetch(`${base}/api/jobs`, { headers: { cookie } })).json()) as { attached?: { pid: number; stop?: { ok: boolean; command?: string } } };
+				const attached = jobs.attached;
+				if (!attached || attached.pid !== child.pid) return undefined;
+				return attached.stop?.ok ? jobs : undefined;
+			}, (p) => p !== undefined, 15_000))! as { attached: { pid: number; stop?: { ok: boolean; command?: string } } };
+			expect(payload.attached.stop?.command).toContain("run");
+
+			// the confirm dialog's POST — exactly one re-verified SIGINT
+			const stop = await postAction(base, cookie, { kind: "stop", target: "attached", pid: child.pid! }, actionHeaders(csrf, base));
+			expect(stop.status).toBe(202);
+			expect((await stop.json()) as { kind: string; target: string; pid: number }).toMatchObject({ kind: "stop", target: "attached", pid: child.pid });
+
+			const code = await new Promise<number>((done) => {
+				const timer = setTimeout(() => done(-1), 60_000);
+				child.once("exit", (c) => {
+					clearTimeout(timer);
+					done(c ?? -1);
+				});
+			});
+			expect(code).toBe(130); // interrupted — durable state stays resumable
+
+			// and the sheet stays honest afterwards: the attachment is gone once the
+			// stale flush is superseded (the record-less run left no job record)
+			await waitFor(async () => {
+				const jobs = (await (await fetch(`${base}/api/jobs`, { headers: { cookie } })).json()) as { attached?: { pid: number } };
+				return jobs.attached === undefined;
+			}, (gone) => gone, 15_000);
+		} finally {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		}
+	});
 });
+
 
 async function recordOf(projectRoot: string, id: string): Promise<JobRecord | undefined> {
 	return (await jobsList(projectRoot)).find((j) => j.id === id);

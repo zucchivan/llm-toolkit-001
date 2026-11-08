@@ -4,6 +4,70 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.7.0 — M5-slice-3: verified attached stop — Ctrl-C (SIGINT) to terminal-started runs (§7.2.1, decision D6)
+
+The third M5 slice lifts the §18 deferral "safe stop for attached
+(terminal-started) runs, with PID/command verification" — the last
+control-shaped gap between a UI-launched run and an attached one. Variant A
+(§7.2.1): NO core seam change (kit stays 0.2.2; A.1–A.3 + A.5 + A.6 are
+untouched — `lockedByPid` was already in the side-car; `readout.seam` stays
+1), no new deps, no CLI surface change, and the CLI is still the only thing
+that writes loop state. What changes: the UI server can now, after proving
+the identity of the process that owns the lock, send it exactly one Ctrl-C.
+
+- **The verification (all of it server-side, off `/proc`)** — every stop
+  attempt first proves the runner, and every failed check is a stated
+  plain-words reason with NO signal: (1) a FRESH `.orch/status.json` read
+  names a live `lockedByPid` that is neither this server's own readout
+  window nor a pid a running UI job record claims; (2) Linux only (v1):
+  `/proc` present — macOS variant B (the runner writing `{pid, argv,
+  startedAt}` into status.json) stays deferred, and machines without `/proc`
+  refuse with a 501; (3) `/proc/<pid>/cwd` realpaths to the project root
+  ("pid N is alive but its working directory is X, not this project");
+  (4) `/proc/<pid>/cmdline` carries EXACTLY ONE token (after `argv[0]`)
+  whose realpath equals the CLI entry this UI resolves for its own jobs
+  (override → project `.bin` → kit dist → PATH → tsx — the same chain the
+  job spawner uses; relative tokens resolve against the verified cwd)
+  followed by a lock-holding subcommand (`plan`/`run`) — flags, task lists
+  and the interpreter are NOT required tokens, the entry + subcommand are;
+  (5) the whole check re-runs immediately before signalling, then EXACTLY
+  ONE SIGINT goes out — the kit's SIGINT clean-close path, exit 130,
+  durable state left resumable. SIGTERM/SIGKILL never happen; stale, missing
+  or changed holders never auto-kill anything (§17).
+- **Enablement is earned, then re-verified** — the jobs payload (`/api/jobs`
+  + SSE `job` events) carries `attached.stop`: `ok` with the verified pid +
+  command (what the dialog shows) or the plain-words reason why not. The
+  ActionBar's Stop and the jobs list's `stop (verified)` button are enabled
+  only when that verification is ok (`⨯ stop unavailable (not verified)`
+  with the reason in the tooltip otherwise); the confirm dialog states the
+  full identity — "verifies: pid N runs this project's installed CLI … sends
+  Ctrl-C (SIGINT) once; the run stays resumable (exit 130)" — and the POST
+  (`{ kind: "stop", target: "attached", pid: N }`) re-verifies server-side
+  as the authoritative gate, answering 202 `{ kind, target, pid }` or 409
+  with the reason. A holder that changed between confirm and POST is told
+  plainly ("it is pid X now, not the pid N you confirmed"). The ordinary
+  `{ kind: "stop" }` (UI jobs) path is byte-for-byte unchanged.
+- **Non-goals untouched** — no per-wave isolated diffs (still §18; the NEXT
+  slice's Appendix A.7 proposal is NOT started here), no editors of any
+  project file (D5; sources stay GET-only), no delivery toggle (D3), no new
+  UI deps, no router/hash changes, Linux-only v1 documented in §7.2.1.
+- **Testing** — new `test/attached-stop.test.ts` (identity of a real spawned
+  child verifies and one re-verified SIGINT lands exactly once — a fixture
+  counts received SIGINTs and exits 130; wrong cwd, foreign command, wrong
+  subcommand, mismatched/changed holder pid, dead holder, the server's own
+  readout window, and a UI-job-held pid all refuse with their reasons and
+  signal nothing; route-level 400 shapes, 409 without a signal, and the 202
+  happy path) and `test/dialog-requests.test.ts` (the request-builder shapes:
+  job / verified-attached pid+command+Ctrl-C+exit-130 / unverified reason /
+  nothing-running; body mapping; accepted lines). `e2e-real-cli.test.ts`
+  gained the end-to-end scene: the real faux runner is spawned TERMINALLY
+  (outside the job runner), its identity verifies on the jobs payload, the
+  POST sends one SIGINT, and the process exits 130 — while the
+  unverifiable-holder scene now proves the refusal never signals (the
+  foreign sleeper survives). All suites green: root `npm test` (46/46) +
+  `npm run build`; ui `npm test` (217 passed/4 skipped), `typecheck`,
+  `check` (0/0), `build`, `test:e2e` (4/4).
+
 ## 0.6.1 — M5-b: PROMPT.md + gate recipes join the read-only sources panel (§5/§18)
 
 The second M5 slice completes the read half of the §18 deferral across the

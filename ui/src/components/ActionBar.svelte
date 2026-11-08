@@ -7,6 +7,7 @@
 	import type { ReadoutSnapshot, JobsPayload } from "../lib/api.ts";
 	import { postAction, type ActionBody } from "../lib/api.ts";
 	import type { ActionRequest } from "../lib/actions-model.ts";
+	import { describeStopTarget, stopAcceptedLine } from "../lib/dialog-requests.ts";
 	import type { RouterTask } from "../../../src/engine/infos.ts";
 
 	let { snapshot, jobs, selection = [], planTasks = undefined, request = () => {}, done = () => {}, error = () => {} }: {
@@ -31,9 +32,14 @@
 		snapshot.mode === "sidecars" && (snapshot.readout.identity.lockedByPid ?? 0) > 0 && jobs.attached !== undefined,
 	);
 
+	// M5-slice-3 (§7.2.1): the attached terminal-started run is stoppable when
+	// its identity verification came back ok on the last jobs payload — the
+	// POST re-verifies server-side and is the authoritative gate.
+	const attachedStoppable = $derived(jobs.attached?.stop?.ok === true);
+
 	const canPlan = $derived(planJob === undefined && runJob === undefined);
 	const canRun = $derived(runJob === undefined && planJob === undefined && todoCount > 0 && !lockedBusy);
-	const canStop = $derived(runJob !== undefined || planJob !== undefined);
+	const canStop = $derived(runJob !== undefined || planJob !== undefined || attachedStoppable);
 	const resumeReady = $derived(sleepBanner && !lockedBusy);
 	const selectedCount = $derived(selection.length);
 	const canRunSelected = $derived(canRun && selectedCount > 0 && selectedCount <= todoCount && selectedCount < todoCount);
@@ -68,15 +74,7 @@
 	}
 
 	function clickStop(): void {
-		const target = running[0];
-		request({
-			kind: "stop",
-			title: "Stop",
-			body: target
-				? `sends SIGINT to job ${target.id} (${target.kind}, pid ${target.pid ?? "?"}) — it closes durable state cleanly, so a later run resumes.`
-				: "there is no UI job running right now.",
-			confirmLabel: "Stop job",
-		});
+		request(describeStopTarget(jobs));
 	}
 
 	function clickResume(): void {
@@ -116,7 +114,7 @@
 	async function tryAction(body: ActionBody): Promise<void> {
 		try {
 			const accepted = await postAction(body);
-			done(`${accepted.kind} accepted — job ${accepted.jobId}`);
+			done(stopAcceptedLine(accepted));
 		} catch (err) {
 			error((err as Error).message);
 		}
@@ -137,12 +135,16 @@
 		onclick={clickStop}
 		disabled={!canStop}
 		title={canStop
-			? "SIGINT to the running UI job"
-			: snapshot.sleep
-				? "a run held the lock recently — nothing to stop right now"
-				: snapshot.mode === "sidecars"
-					? "a run holds the lock but was not launched by this UI — stop it from its terminal"
-					: "nothing running"}
+			? attachedStoppable && runJob === undefined && planJob === undefined
+				? `SIGINT (Ctrl-C) once to the verified terminal run (pid ${jobs.attached?.pid}) — exit 130, resumable`
+				: "SIGINT to the running UI job"
+			: jobs.attached !== undefined && jobs.attached.stop !== undefined
+				? `cannot verify pid ${jobs.attached.pid} as this project's run loop — nothing will be signalled`
+				: snapshot.sleep
+					? "a run held the lock recently — nothing to stop right now"
+					: snapshot.mode === "sidecars"
+						? "a run holds the lock but was not launched by this UI — stop it from its terminal"
+						: "nothing running"}
 	>
 		Stop
 	</button>

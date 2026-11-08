@@ -146,7 +146,7 @@ The UI exposes exactly these mutations. Every one maps to a CLI invocation
 | Plan | `plan [--prd path]` | no run active; router empty, or explicit replace confirmation | phase `planning` while it runs |
 | Approve & run | `run --approve` | router planned/running; no other run active | the human approval stamp |
 | Run selected | `run --approve --tasks <ids…>` | plan reviewed; selection non-empty | subset of `todo` tasks |
-| Stop | SIGINT to the active job | only for jobs launched by this UI (v1) | graceful; state stays resumable |
+| Stop | SIGINT to the active job | a running UI job, or a terminal-started run whose §7.2.1 identity verification passes | graceful; state stays resumable (exit 130); exactly one re-verified signal |
 | Handoff | `handoff "<note>"` | always (atomic side-car, safe during a run) | queued for the next wave |
 | Verify | `verify --task <id>` | no run active; task has a baseline | one-off read-only check |
 | Export | `export` | no run active | writes `.orch/artifacts/report.{json,html}` |
@@ -156,11 +156,53 @@ Guardrails:
 - No config, router, PRD, or delivery editing.
 - `run` always passes `--approve` from the Approve & run / Run selected
   buttons; there is no silent run.
-- Stop for a terminal-started run is **not** in v1; the drawer shows the PID and
-  "stop from its terminal". Adding safe attached-stop is deferred until there
-  is a verifiable PID/command check.
+- Stop for a terminal-started run is offered only through the §7.2.1
+  verification; an unverifiable holder is never signalled — the UI states the
+  plain-words reason, and "stop it from its terminal" stands.
 - Destructive-looking actions (Plan replace, Approve & run with quarantined
   tasks in the graph) require a confirmation dialog that states the effect.
+
+### 7.2.1 Verified attached stop (M5-slice-3; Linux-only v1)
+
+A terminal-started run may be stopped from the UI only when its process
+identity verifies. The check runs server-side, straight off the operating
+system, with NO seam change: `.orch/status.json` already carries
+`lockedByPid`, and `/proc` carries the rest. ALL of the following must pass;
+every failure answers with its plain-words reason and sends NO signal:
+
+1. **Holder truth** — a FRESH `.orch/status.json` read names `lockedByPid`
+   pid N, and N is alive (`kill(pid, 0)`, the signal-0 probe; a
+   `/proc/<pid>` existence probe where `/proc` exists). N is neither this UI
+   server's own pid (a brief readout window can flash there) nor a pid a
+   running UI job record claims (that is the ordinary Stop).
+2. **Platform** — `/proc` exists (Linux). macOS variant B — the runner
+   recording `{pid, argv, startedAt}` into `status.json` — is deferred
+   (§18); without `/proc` the deeper checks refuse (501) and the UI says so.
+3. **Working directory** — `/proc/<pid>/cwd` realpath equals the project
+   root. Failure text: "pid N is alive but its working directory is X, not
+   this project".
+4. **Command identity** — `/proc/<pid>/cmdline` argv contains exactly ONE
+   token after `argv[0]` whose realpath equals the CLI entry this UI resolves
+   for spawning its own jobs (the same chain: explicit bin override → the
+   project's `.bin` → the kit's `dist/cli.js` → PATH → tsx; relative tokens
+   resolve against the verified cwd), and the token immediately following it
+   is a lock-holding subcommand (`plan` or `run`). Required tokens: the entry
+   token and that subcommand token. NOT required: any other token — flags,
+   task lists, the node interpreter, `argv[0]` form. Anything else visible in
+   the argv is ignored.
+5. **One re-verified signal** — immediately before signalling, the full check
+   re-runs (the run may have exited, or the holder may have changed between
+   the browser's confirmation and now); then exactly one `SIGINT` is sent —
+   the kit's SIGINT clean-close path (exit 130, resumable). SIGTERM and
+   SIGKILL are never sent. A check that fails on the second round answers
+   "… nothing was signalled".
+
+Lock-busy/staleness never auto-kills anything (§17): a stale or missing
+holder, a changed pid, or a dead process stops every attempt at the check
+that failed. The UI enables the attached Stop affordance only when the
+latest `/api/jobs` payload reports the verification ok (that payload carries
+the pid + command the confirm dialog shows); the POST re-verifies and is the
+authoritative gate.
 
 ### 7.3 Run lifecycle
 
@@ -168,7 +210,7 @@ Guardrails:
   browser or UI server closes.
 - **Attach:** discover a live run from `.orch/status.json` (`lockedByPid`) and
   the wave log; display it identically to a UI-launched run, except for the
-  "attached" badge and the Stop limitation.
+  "attached" badge; Stop follows the §7.2.1 verification.
 - **Reattach:** on UI server start, scan job records; a job whose PID is alive
   is `running`, otherwise `stale` with its last exit code if recorded.
 - **Sleep:** exit code 42 is surfaced as a distinct `sleeping` state with
@@ -381,7 +423,8 @@ Action body shapes:
 ```ts
 { kind: "plan", prd?: string }
 { kind: "run", approve: true, tasks?: string[] }
-{ kind: "stop" }
+{ kind: "stop", target?: "job" }
+{ kind: "stop", target: "attached", pid: number }   // §7.2.1; one re-verified SIGINT
 { kind: "handoff", note: string }
 { kind: "verify", task: string }
 { kind: "export" }
@@ -392,8 +435,10 @@ Rules:
 - One mutating job at a time. `plan`/`run`/`verify`/`export` need the lock; if
   the lock is held or a job is active, `409` with the holder PID/phase.
 - `handoff` is allowed during a run; it writes only the atomic side-car.
-- `stop` acts only on a job launched by this server; otherwise `409` with the
-  "stop from its terminal" hint.
+- `stop` acts on a job launched by this server (`target: "job"`, the
+  default), or — with `target: "attached"` — on the terminal-started run
+  whose §7.2.1 verification passes. Anything unverifiable stays unsignalled:
+  409 with the plain-words reason of the check that failed.
 - Validation is explicit per kind; unknown kinds/fields → `400`. Never pass
   user input to a shell; argv arrays only.
 - Job records and logs live under `.orch/ui/` (git-ignored with `.orch`).
@@ -518,7 +563,9 @@ with a visible warning. Node >= 22.19, same as the kit.
   change when the UI is absent.
 - **Server tests:** token exchange + cookie, bad/missing token (401), cross-
   origin mutation (403), action allowlist, argv construction (no shell),
-  lock-busy 409, job spawn/exit/reattach/stale, artifact path traversal,
+  lock-busy 409, job spawn/exit/reattach/stale, verified attached stop
+  (§7.2.1: identity match signals once; every failed check signals nothing),
+  artifact path traversal,
   SSE snapshot delivery and heartbeat.
 - **UI tests:** task table sorting/filtering, plan selection, diff parser
   (hunks, binary, truncation), status strip states, phase switching,
@@ -553,7 +600,9 @@ Pass criteria:
 6. Closing the browser does not kill the run; reopening the UI reattaches and
    shows the correct final state.
 7. Starting `run --approve` in a terminal while the UI is open shows the same
-   live state with an "attached" badge; Stop is disabled for that run.
+   live state with an "attached" badge; Stop is disabled until the §7.2.1
+   identity check passes, then sends one verified SIGINT (exit 130,
+   resumable).
 8. Export produces the same `.orch/artifacts/report.{json,html}` as the CLI.
 
 ### 15.3 Manual checks
@@ -631,7 +680,9 @@ together with the milestone that consumes it.
 - Browser notifications (opt-in Notification API).
 - LAN/Tailscale access with the same token model.
 - Multi-project switcher.
-- Safe stop for attached (terminal-started) runs, with PID/command verification.
+- macOS variant B for attached stop — the runner recording `{pid, argv,
+  startedAt}` into `status.json` (the Linux `/proc` path ships in
+  M5-slice-3, §7.2.1).
 - Delivery toggle and config/PRD/router EDIT editors — the read half shipped in M5 (decision D5): `/api/project/sources` serves `.orch/config.toml`, the PRD, PROMPT.md and `evals/recipes.toml` raw + read-only; router.md stays plan-review-only; no editing route exists for any of them.
 - Mobile/responsive layouts.
 
@@ -655,6 +706,7 @@ together with the milestone that consumes it.
 | visual | dense dark operational dashboard |
 | alerts | in-page + tab-title badge |
 | execution | vertical slices, walking skeleton first |
+| attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
 
 ## Appendix A — Core seam (required, additive)
 

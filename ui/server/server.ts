@@ -18,7 +18,10 @@
  *   GET  /api/artifacts            artifact list (§11.4)
  *   GET  /api/artifacts/:name      artifact text ≤5 MiB (larger → metadata + download link)
  *   POST /api/actions       { kind, …params } → 202 { jobId } — cookie AND
- *                           X-Kit-Token header AND same-origin (Appendix C step 5)
+ *                           X-Kit-Token header AND same-origin (Appendix C step 5);
+ *                           stop gains target "attached" (§7.2.1: the run's
+ *                           process identity must verify — one SIGINT, else
+ *                           409 with the plain reason and NO signal)
  *
  * Loopback bind only; the lock is never held between requests; the server never
  * writes loop state — actions run as detached CLI jobs (Appendix B).
@@ -32,6 +35,7 @@ import { readConversationEntries, readOnce } from "./readout.ts";
 import { readProjectSources } from "./sources.ts";
 import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName } from "./diff.ts";
 import { startAction, stopAction, validateAction } from "./actions.ts";
+import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
 import { currentJobsEvent, startSnapshotHub, type SnapshotHub } from "./sse.ts";
 import { jobsViewList, markStaleRecords, pruneJobs, readJobRecord, tailJobLog } from "./jobs.ts";
@@ -416,8 +420,24 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 	}
 	const body = validation.body;
 
-	// `stop` acts on the new-est running UI job; everything else spawns one.
+	// `stop` acts on the newest running UI job (target "job", the default) or,
+	// with target "attached", on a terminal-started run after the §7.2.1
+	// verification (exactly one re-verified SIGINT; a failed check answers 409
+	// and signals nothing). Everything else spawns a job.
 	if (body.kind === "stop") {
+		if (body.target === "attached") {
+			const attached = await attachedStopAction(opts.root, { expectedPid: body.pid });
+			if (!attached.ok) {
+				jsonError(res, attached.fail.status, attached.fail.error, {
+					...(attached.fail.pid !== undefined ? { holderPid: attached.fail.pid } : {}),
+				});
+				return;
+			}
+			hub.pulseJobs();
+			res.writeHead(202, { "Content-Type": "application/json; charset=utf-8" });
+			res.end(JSON.stringify({ kind: "stop", target: "attached", pid: attached.pid }));
+			return;
+		}
 		const result = await stopAction(opts.root);
 		if (!result.ok) {
 			jsonError(res, result.fail.status, result.fail.error, {

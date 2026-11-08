@@ -168,20 +168,28 @@ export type ActionBody =
 	| { kind: "plan"; prd?: string }
 	| { kind: "run"; approve: true; tasks?: string[] }
 	| { kind: "run"; resume: true }
-	| { kind: "stop" }
+	| { kind: "stop"; target?: "job" }
+	| { kind: "stop"; target: "attached"; pid: number }
 	| { kind: "handoff"; note: string }
 	| { kind: "verify"; task: string }
 	| { kind: "export" };
 
 export interface ActionAccepted {
-	jobId: string;
 	kind: string;
+	/** The spawned job record — absent on an attached stop (there is no record; the pid is the answer). */
+	jobId?: string;
+	/** stop: the signalled pid (either path). */
+	pid?: number;
+	/** stop target "attached" echoes back. */
+	target?: "attached";
 }
 
 /**
  * POST /api/actions (Appendix C step 5): same-origin by construction (the page
  * itself), the session's CSRF cookie echoed in the X-Kit-Token header.
  * 202 { jobId } on accept; other statuses surface the server's plain error.
+ * An attached stop (§7.2.1) answers { kind, target: "attached", pid } — the
+ * server verified the runner's identity and sent exactly one SIGINT.
  */
 export async function postAction(body: ActionBody): Promise<ActionAccepted> {
 	const res = await fetch("/api/actions", {

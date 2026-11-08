@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { readOnce, type ReadoutSnapshot } from "./readout.ts";
 import { attachedRun, jobsDir, jobsList, jobsViewList, type AttachedRun } from "./jobs.ts";
 import type { JobRecord, JobView } from "./jobs.ts";
+import { attachedStopView } from "./attached-stop.ts";
 
 export interface HubOptions {
 	pollMs?: number;
@@ -38,7 +39,16 @@ export interface JobsEventPayload {
 
 export async function currentJobsEvent(projectRoot: string): Promise<JobsEventPayload> {
 	const jobs = await jobsViewList(projectRoot);
-	return { at: Date.now(), jobs, attached: await attachedRun(projectRoot, jobs) };
+	const attached = await attachedRun(projectRoot, jobs);
+	if (attached) {
+		// §7.2.1: the attached run's stop affordance, verified read-only per
+		// payload (a failed check never signals; the POST re-verifies anyway).
+		const uiJobPids = jobs
+			.filter((j) => j.status === "running" && j.kind !== "handoff" && j.pid !== undefined)
+			.map((j) => j.pid!);
+		attached.stop = await attachedStopView(projectRoot, attached.pid, uiJobPids);
+	}
+	return { at: Date.now(), jobs, attached };
 }
 
 export interface SnapshotHub {

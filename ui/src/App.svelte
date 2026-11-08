@@ -8,7 +8,7 @@
 	import { fetchReadout, fetchJobs, postAction, type ReadoutSnapshot, type JobsPayload, type ActionBody } from "./lib/api.ts";
 	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, hashConversationDrawer, isConversationListHash, conversationById, firstFailureLine, type FailureRow } from "./lib/view.ts";
 	import type { ToastMessage } from "./components/Toasts.svelte";
-	import { actionRequestToBody, describeStopTarget } from "./lib/dialog-requests.ts";
+	import { actionRequestToBody, describeStopTarget, stopAcceptedLine } from "./lib/dialog-requests.ts";
 	import type { ActionRequest } from "./lib/actions-model.ts";
 	import { focusEventFilter } from "./lib/shortcuts.ts";
 	import { msDuration } from "./lib/format.ts";
@@ -44,8 +44,8 @@
 	let dialog = $state<ActionRequest | undefined>(undefined);
 
 	function openStopDialog(): void {
-		if (!snapshot || !jobs) return;
-		dialog = describeStopTarget(snapshot, jobs);
+		if (!jobs) return;
+		dialog = describeStopTarget(jobs);
 	}
 
 	// --- health panel (§7.1): collapsible, header-dot toggle, #/health deep link
@@ -363,7 +363,7 @@
 	async function runAction(body: ActionBody): Promise<void> {
 		try {
 			const accepted = await postAction(body);
-			doneToast(`${accepted.kind} accepted — job ${accepted.jobId}`);
+			doneToast(stopAcceptedLine(accepted));
 		} catch (err) {
 			pushToast("error", (err as Error).message);
 		}
