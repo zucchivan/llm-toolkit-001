@@ -238,7 +238,7 @@ authoritative gate.
 - **Semantics:** because retries do not reset the tree, the per-task patch is
   cumulative since the task baseline (all attempts), not "only the last wave".
   The UI labels it "task diff" and shows the wave count. Per-wave isolated
-  diffs are deferred.
+  diffs are deferred (proposal drafted: Appendix A.7 — not implemented).
 
 ### 7.5 Conversation visibility
 
@@ -675,7 +675,7 @@ together with the milestone that consumes it.
 ## 18. Deferred (explicitly not v1)
 
 - Read-only conversation transcript drawer (first fast-follow).
-- Per-wave isolated diffs (wave-start snapshots).
+- Per-wave isolated diffs (wave-start snapshots) — proposed, not implemented (Appendix A.7).
 - Light theme.
 - Browser notifications (opt-in Notification API).
 - LAN/Tailscale access with the same token model.
@@ -707,6 +707,7 @@ together with the milestone that consumes it.
 | alerts | in-page + tab-title badge |
 | execution | vertical slices, walking skeleton first |
 | attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
+| per-wave isolated diffs | proposed, not implemented (Appendix A.7, drafted alongside 0.7.1): wave start/end rows gain an optional additive `treeSha` (throwaway-index capture inside the engine's existing windows), a tree-to-tree display wrapper with the A.2 exclusions/caps, and `GET /api/tasks/:id/diff?wave=N` labeled per-wave; a failed wave capture degrades to an unlabeled wave, never a failed run; no rollback/delivery/CLI change — awaiting the explicit kit go-ahead |
 
 ## Appendix A — Core seam (required, additive)
 
@@ -786,6 +787,52 @@ semantics, config, docs, or CLI output for users who never open the UI.
 ### A.6 Delivery truth (additive, read-only)
 - `KitReadout` gains an additive `delivery` section: `mode` — the configured `delivery.mode` (§4.6: `none | commit | pr`) — and `rows` — the wave log's kind `"delivery"` rows echoed as plain JSON-able shapes (`ts`, `task`, `verb`, `wave?`, `detail?`). Both modes serve it: storage reads the mode from the open config; side-car mode best-effort re-reads `.orch/config.toml` (a static file, not the owned storage) and omits `mode` when the config itself is unreadable, while the outcome rows still come from the wave log.
 - Read-only, and deliberately WITHOUT a UI mutation: per §5 delivery stays a config + CLI decision. The CLI's only delivery paths are the config's `delivery.mode` and the `--deliver` run qualifier the `pr` mode requires (a per-run override of what a human typed, not a safe toggle) — exposing either as an action would be the §5 non-goal and a §7.2 action-table change. No config write, no new CLI flag/command, no behavior change when the UI is absent. Delivery/config editing stays deferred to M5 (§18). Seam version stays `readout.seam = 1` (A.6 is additive surface, not a new seam version).
+
+### A.7 — Per-wave isolated diffs (PROPOSAL — additive; written, NOT implemented)
+
+Drafted during the 0.7.1 wrap-up. This section is a proposal only: it touches
+the engine's wave rows, so it stays unwritten until an explicit kit go-ahead
+is given. Until then §18's deferral and §7.4's cumulative label stand.
+
+- **The gap:** the engine already snapshots a git tree per task baseline
+  (throwaway index; the project's real index is never touched —
+  `captureBaselineTree` in `util/git.ts`). What one wave added to a task is
+  derivable but never recorded, so the UI cannot name a wave's own change.
+- **Engine change (additive):** at every wave START and wave END, capture the
+  tree with the SAME `captureBaselineTree` call, made inside the wave's
+  existing `commitState` windows (no new lock discipline, no extra window),
+  and record it as an optional additive `treeSha` on the `wave` start/end
+  rows (`WaveRow` gains `treeSha?: string`). Old readers ignore the field;
+  no CLI output, config, or docs change. Cost: two throwaway-index git
+  snapshots per wave; the objects live in `.git` — no new artifact dir, no
+  retention policy beyond git's own.
+- **Display wrapper (additive):** `util/git.ts` gains a tree-to-tree diff +
+  stats wrapper with the A.2 exclusions and caps (`.orch/**`, `router.md`,
+  `PROMPT.md` excluded; 5 MiB cap, `truncated: true`), endpoints being
+  immutable shas — pure `git diff --binary <tree> <tree>` (including
+  untracked-relevant states already captured in the trees). Existing
+  `savePatch` semantics are unchanged; rollback still uses `restoreTree`.
+- **Read path:** wave-log rows and the readout's wave timeline spans pass
+  `treeSha` through as plain JSON-able shapes (the A.6 echo style). `seam`
+  stays 1: additive surface only.
+- **UI (§7.4 gains a wave scope):** `GET /api/tasks/:id/diff?wave=N` serves
+  wave N's isolated patch + stats — the wave's end tree vs its start tree
+  (both recorded by that same wave's rows) — computed on demand, stored
+  nowhere new, labeled "wave N — isolated to this wave". Task views offer
+  the wave numbers they already carry from the wave log. The default "task
+  diff" view KEEPS its cumulative label. Quarantine rollback, gate and
+  delivery behavior are untouched; display patches are never used for
+  rollback.
+- **Failure posture:** a failed wave-tree capture never fails the wave — the
+  row is written WITHOUT `treeSha` and the UI labels that wave "not isolated
+  (no wave tree recorded)". (Deliberately softer than the baseline path,
+  which throws: a missing baseline is fatal, a missing wave tree is only a
+  missing view.) Git is a precondition the loop already has.
+- **Non-goals:** no per-wave rollback or wave-level approve/regate, no
+  wave-log format version bump, no delivery change (D3/D5 hold), no CLI
+  output change, no new UI deps.
+
+## Appendix B — Detached job runner
 
 ## Appendix B — Detached job runner
 
