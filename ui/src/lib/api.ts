@@ -1,7 +1,10 @@
 /** Client API access + the wire types the ui server speaks (§11.2). */
 import type { KitReadout } from "../../../src/engine/inspector.ts";
-import type { JobRecord, AttachedRun } from "../../server/jobs.ts";
+import type { JobRecord, JobView, AttachedRun } from "../../server/jobs.ts";
+import type { RoleModelInfo } from "../../server/readout.ts";
 import type { DiffStats, DisplayDiffStats } from "../../../src/util/git.ts";
+
+export type { RoleModelInfo, JobView };
 
 /** Stats-sidecar-free per-file view (wire shape from the live endpoint). */
 export type { DiffStats, DisplayDiffStats };
@@ -79,13 +82,18 @@ export interface ReadoutSnapshot {
 	at: number;
 	/** Augmented from status.json: the governor's armed sleep (§8.5). */
 	sleep?: { until: number; cycleCount?: number; alert?: string };
+	/** Augmented from status.json + config: the configured role models (plan/run dialogs render them). */
+	roles?: RoleModelInfo[];
+	/** The project config failed to load mid-session: the reason in kind words (dialogs explain instead of spawning doomed jobs). */
+	configError?: string;
 	/** Augmented from status.json: the PRD path (§8.2 plan prefill). */
 	prdPath?: string;
 }
 
 export interface JobsPayload {
 	at: number;
-	jobs: JobRecord[];
+	/** Records with a bounded reason tail attached on diagnostic outcomes (failed/stale/42). */
+	jobs: JobView[];
 	attached?: AttachedRun;
 }
 

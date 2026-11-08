@@ -12,6 +12,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readJson } from "../../src/util/fsx.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
+import { loadConfig, type RoleName } from "../../src/config.ts";
 import {
 	activeJobs,
 	jobPid,
@@ -321,7 +322,68 @@ async function readLockHolder(projectRoot: string): Promise<number | undefined> 
 // start + stop
 // ---------------------------------------------------------------------------
 
-export type StartError = { status: number; error: string; holderPid?: number; phase?: string; jobId?: string };
+export type StartError = { status: number; error: string; holderPid?: number; phase?: string; jobId?: string; missing?: string[]; configError?: string };
+
+// ---------------------------------------------------------------------------
+// Model preflight (§7.2 friendliness): plan/run/verify need their roles to
+// name provider+modelId in .orch/config.toml — the CLI fails those instantly,
+// and until the snapshot gained visible role models the only evidence lived in
+// a failed job's log. Answer 422 BEFORE spawning, in kind words. Read-only
+// (one loadConfig): the UI never writes the config (CLI-only mutation path).
+// ---------------------------------------------------------------------------
+
+/** The roles each model-carrying action needs (handoff/export/stop need none). */
+export const ACTION_ROLE_NEEDS: Record<"plan" | "run" | "verify", readonly RoleName[]> = {
+	plan: ["planner"],
+	run: ["implementer", "verifier"],
+	verify: ["verifier"],
+};
+
+/** 422 (no doomed job) when the config lacks the models the action needs. */
+export async function configPreflight(projectRoot: string, body: ActionBody): Promise<StartError | undefined> {
+	const needed = ACTION_ROLE_NEEDS[body.kind as keyof typeof ACTION_ROLE_NEEDS];
+	if (!needed) return undefined;
+	try {
+		const config = loadConfig(projectRoot);
+		const missing = needed.filter((role) => {
+			const r = config.roles[role];
+			return !r || !String(r.provider).trim() || !String(r.modelId).trim();
+		});
+		if (missing.length === 0) return undefined;
+		const blocks = missing
+			.map((role) => `[roles.${role}]\nprovider = "openrouter"\nmodelId = "openai/gpt-5-nano"`)
+			.join("\n\n");
+		return {
+			status: 422,
+			missing,
+			error:
+				`${body.kind} can't start yet: ${missing.map((r) => `roles.${r}`).join(", ")} has no model configured.\n` +
+				`In .orch/config.toml add:\n${blocks}\n` +
+				"this UI never edits the config for you — set the block(s), save, and try again.",
+		};
+	} catch (err) {
+		const message = (err as Error).message;
+		// The loader's most common throw IS the missing-roles diagnostic (it bails
+		// on the first role that has no provider/modelId). Convert it to the same
+		// prescriptive shape the missing-branch gives, so the client dialog can
+		// quote the block verbatim; fixing it re-runs the whole preflight.
+		const named: string[] = [];
+		for (const match of message.matchAll(/roles\.([A-Za-z_][A-Za-z0-9_]*): needs provider and modelId/g)) named.push(match[1]!);
+		if (named.length > 0) {
+			const blocks = named.map((role) => `[roles.${role}]\nprovider = "openrouter"\nmodelId = "openai/gpt-5-nano"`).join("\n\n");
+			return {
+				status: 422,
+				missing: named,
+				error:
+					`${body.kind} can't start yet: ${named.map((r) => `roles.${r}`).join(", ")} has no model configured.\n` +
+					`In .orch/config.toml add:\n${blocks}\n` +
+					"this UI never edits the config for you — set the block(s), save, and try again.",
+			};
+		}
+		// Any other config break: hand over the loader's plain-words reason.
+		return { status: 422, configError: message, error: `the project config can't be read, so ${body.kind} can't start: ${message}` };
+	}
+}
 
 /**
  * Serialize conflict-check → record-write → spawn inside this one server process
@@ -341,6 +403,8 @@ export function startAction(
 ): Promise<{ ok: true; job: JobRecord; via: string } | { ok: false; fail: StartError }> {
 	return serializeAction(async () => {
 		try {
+			const preflight = await configPreflight(projectRoot, body);
+			if (preflight) return { ok: false as const, fail: preflight };
 			const conflict = await conflictFor(projectRoot, body);
 			if (conflict) return { ok: false as const, fail: conflict };
 

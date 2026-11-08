@@ -320,6 +320,24 @@ input.input:focus-visible {
 .dialog-body { font-size: 12.5px; color: var(--text); white-space: pre-wrap; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
+/* model-readiness row (plan/run/resume dialogs): what's configured, and the
+   kind warning with a paste-ready TOML block when it isn't (§7.2 friendliness) */
+.dialog-models { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); }
+.dialog-models-label { font-size: 11px; margin-bottom: 6px; letter-spacing: 0.2px; }
+.dialog-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.dialog-chips .chip { font-size: 11px; padding: 2px 8px; }
+.dialog-warning {
+	margin-top: 8px;
+	font-size: 12px;
+	color: var(--warn);
+	padding: 8px 10px;
+	border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));
+	border-radius: var(--radius);
+	white-space: pre-wrap;
+}
+.dialog-snippet { margin: 6px 0; padding: 8px 10px; font-size: 11.5px; color: var(--text); background: var(--bg); border-radius: var(--radius); max-height: 160px; overflow: auto; }
+.jobreason { font-size: 10.5px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* plan review */
 .review-grid {
 	display: grid;

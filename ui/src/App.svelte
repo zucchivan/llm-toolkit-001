@@ -6,7 +6,7 @@
 	 * replaces on each snapshot.
 	 */
 	import { fetchReadout, fetchJobs, postAction, type ReadoutSnapshot, type JobsPayload, type ActionBody } from "./lib/api.ts";
-	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, type FailureRow } from "./lib/view.ts";
+	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, firstFailureLine, type FailureRow } from "./lib/view.ts";
 	import type { ToastMessage } from "./components/Toasts.svelte";
 	import { actionRequestToBody, describeStopTarget } from "./lib/dialog-requests.ts";
 	import type { ActionRequest } from "./lib/actions-model.ts";
@@ -196,7 +196,8 @@
 	/** Newest diff-bearing artifact → the jobs panel's "diffs" shortcut. */
 	const latestDiff = $derived(latestDiffTask(snapshot?.readout.artifacts));
 
-	// --- job end→toast (exit codes surfaced plainly, §7.3)
+	// --- job end→toast (exit codes surfaced plainly, §7.3; the reason line
+	// comes from the record's log tail when the payload carried one)
 	let seenJobEnds = $state<Set<string>>(new Set());
 	$effect(() => {
 		if (!jobs || !rowsSeen) return;
@@ -206,8 +207,9 @@
 			if (seenJobEnds.has(key)) continue;
 			seenJobEnds.add(key);
 			const outcome = jobOutcome(job.exitCode);
+			const reason = firstFailureLine(job.tail);
 			if (outcome === "failed") {
-				pushToast("error", `${job.kind} job failed (exit ${job.exitCode}) — see its log tail in the jobs panel`);
+				pushToast("error", `${job.kind} job failed (exit ${job.exitCode}): ${reason ?? "see its log in the jobs panel"}`);
 			} else if (outcome === "interrupted") {
 				pushToast("warn", `${job.kind} job interrupted (exit 130) — durable state stays resumable`);
 			}
@@ -352,7 +354,7 @@
 
 {#if dialog}
 	{#key dialog.kind + dialog.title}
-		<ActionDialog request={dialog} onConfirm={confirmDialog} onCancel={() => (dialog = undefined)} />
+		<ActionDialog request={dialog} models={snapshot?.roles} configError={snapshot?.configError} onConfirm={confirmDialog} onCancel={() => (dialog = undefined)} />
 	{/key}
 {/if}
 

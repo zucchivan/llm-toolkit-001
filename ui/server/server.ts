@@ -27,7 +27,7 @@ import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact,
 import { startAction, stopAction, validateAction } from "./actions.ts";
 import { serveStatic } from "./static.ts";
 import { currentJobsEvent, startSnapshotHub, type SnapshotHub } from "./sse.ts";
-import { markStaleRecords, pruneJobs, readJobRecord, tailJobLog } from "./jobs.ts";
+import { jobsViewList, markStaleRecords, pruneJobs, readJobRecord, tailJobLog } from "./jobs.ts";
 
 export interface UiServerOptions {
 	/** The project directory this server reads (one project per server). */
@@ -407,6 +407,8 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 			...(result.fail.holderPid ? { holderPid: result.fail.holderPid } : {}),
 			...(result.fail.phase ? { phase: result.fail.phase } : {}),
 			...(result.fail.jobId ? { jobId: result.fail.jobId } : {}),
+			...(result.fail.missing ? { missing: result.fail.missing } : {}),
+			...(result.fail.configError ? { configError: result.fail.configError } : {}),
 		});
 		return;
 	}

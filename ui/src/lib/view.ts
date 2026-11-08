@@ -3,10 +3,85 @@
  * the view to render, action enabling, plan-review selection, failure rows for
  * toasts. No DOM, no Svelte — unit-testable.
  */
-import type { ReadoutSnapshot, JobsPayload } from "./api.ts";
+import type { ReadoutSnapshot, JobsPayload, RoleModelInfo } from "./api.ts";
 import type { JobRecord } from "../../server/jobs.ts";
 import type { KitTaskView, KitUsage, HealthCheck } from "../../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../../src/engine/infos.ts";
+import type { RoleName } from "../../../src/config.ts";
+
+// ---------------------------------------------------------------------------
+// Model readiness (§7.2 friendliness): a plan/run/verify only makes sense
+// when its roles name a provider+model in .orch/config.toml. The dialogs
+// show the configured models as chips and — when a needed role is empty —
+// a kind warning with a paste-ready TOML block instead of a doomed job.
+// Server-side twin: ui/server/actions.ts configPreflight (422 backstop).
+// ---------------------------------------------------------------------------
+
+export type DialogKind = "plan" | "run-all" | "run-selected" | "resume";
+
+/** The roles a dialog's action will need (stop/handoff/export need none). */
+export function rolesNeeded(kind: DialogKind): readonly RoleName[] {
+	switch (kind) {
+		case "plan":
+			return ["planner"];
+		case "run-all":
+		case "run-selected":
+		case "resume":
+			return ["implementer", "verifier"];
+	}
+}
+
+export type ModelPreflight = { ok: true } | { ok: false; missing: string[]; reason: string; snippet: string };
+
+/**
+ * Client-side mirror of the server's configPreflight, from the snapshot's
+ * `roles` extra (fetched per read; the server stays authoritative — this
+ * just makes the DIALOG say it before the POST is even sent). Unknown role
+ * info (no snapshot yet / degraded-without-extras) stays permissive: unknown
+ * is not missing — the server's 422 backstop catches what this can't see.
+ */
+export function modelPreflight(kind: DialogKind, roles?: RoleModelInfo[], configError?: string): ModelPreflight {
+	if (configError) {
+		// Mirror the server: when the config error IS the missing-roles diagnostic
+		// (the loader bails on the first role block with no provider/modelId),
+		// quote the named missing roles prescriptively; anything else stays a
+		// plain unreadable-config reason.
+		const named: string[] = [];
+		for (const match of configError.matchAll(/roles\.([A-Za-z_][A-Za-z0-9_]*): needs provider and modelId/g)) named.push(match[1]!);
+		if (named.length > 0) {
+			return {
+				ok: false,
+				missing: named,
+				reason: `${named.map((r) => `roles.${r}`).join(", ")} has no model configured`,
+				snippet: named.map((role) => `[roles.${role}]\nprovider = "openrouter"\nmodelId = "openai/gpt-5-nano"`).join("\n\n"),
+			};
+		}
+		return {
+			ok: false,
+			missing: [],
+			reason: `the project config can't be read, so this action can't start: ${configError}`,
+			snippet: "",
+		};
+	}
+	if (!roles) return { ok: true };
+	const missing = rolesNeeded(kind).filter((name) => {
+		const r = roles?.find((x) => x.name === name);
+		return !r || !r.provider?.trim() || !r.modelId?.trim();
+	});
+	if (missing.length === 0) return { ok: true };
+	const snippet = missing.map((role) => `[roles.${role}]\nprovider = "openrouter"\nmodelId = "openai/gpt-5-nano"`).join("\n\n");
+	return {
+		ok: false,
+		missing,
+		reason: `${missing.map((r) => `roles.${r}`).join(", ")} has no model configured`,
+		snippet,
+	};
+}
+
+/** First diagnostic line of a failed job's log tail (ANSI already stripped server-side); undefined when none. */
+export function firstFailureLine(tail?: string[]): string | undefined {
+	return tail?.find((line) => line.trim().length > 0)?.trim();
+}
 
 export type PhaseView = "connecting" | "setup" | "planning" | "review" | "monitor" | "report";
 

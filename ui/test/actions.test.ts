@@ -11,9 +11,115 @@ import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { buildArgv, resolveCli, startAction, stopAction, validateAction } from "../server/actions.ts";
-import { markStaleRecords, pruneJobs, statusForExit, jobsList, readJobRecord, tailJobLog } from "../server/jobs.ts";
+import { buildArgv, resolveCli, startAction, stopAction, validateAction, configPreflight, ACTION_ROLE_NEEDS } from "../server/actions.ts";
+import { markStaleRecords, pruneJobs, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
 import { bake, postAction, actionHeaders, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
+
+describe("model preflight (422 before a doomed job spawns)", () => {
+	async function rootWithConfig(config: string): Promise<string> {
+		const root = await mkdtemp(join(tmpdir(), "ui-preflight-"));
+		await mkdir(join(root, ".orch"), { recursive: true });
+		await writeFile(join(root, ".orch", "config.toml"), config, "utf8");
+		return root;
+	}
+	const goodConfig = '[roles.planner]\nprovider = "faux"\nmodelId = "kit-planner"\n[roles.implementer]\nprovider = "faux"\nmodelId = "kit-impl"\n[roles.verifier]\nprovider = "faux"\nmodelId = "kit-verifier"\n';
+
+	it("needs exactly the roles the action uses", () => {
+		expect(ACTION_ROLE_NEEDS["plan"]).toEqual(["planner"]);
+		expect(ACTION_ROLE_NEEDS["run"]).toEqual(["implementer", "verifier"]);
+		expect(ACTION_ROLE_NEEDS["verify"]).toEqual(["verifier"]);
+	});
+
+	it("a fully configured config passes; no-model and blank-string configs 422 in kind words", async () => {
+		const root = await rootWithConfig(goodConfig);
+		try {
+			expect(await configPreflight(root, { kind: "plan", prd: "docs/prd.md" })).toBeUndefined();
+			expect(await configPreflight(root, { kind: "run", approve: true })).toBeUndefined();
+			expect(await configPreflight(root, { kind: "verify", task: "t1" })).toBeUndefined();
+			expect(await configPreflight(root, { kind: "export" })).toBeUndefined(); // no models needed
+			expect(await configPreflight(root, { kind: "handoff", note: "n" })).toBeUndefined();
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+
+		const noRoles = await rootWithConfig('[engine]\npiDurable = "1.5.0"\n\n[paths]\nprd = "docs/prd.md"\nspecs = "specs/"\n');
+		try {
+			const plan = await configPreflight(noRoles, { kind: "plan" });
+			expect(plan).toMatchObject({ status: 422 });
+			expect(plan!.error).toMatch(/plan can't start yet: roles\.planner has no model configured/);
+			expect(plan!.error).toMatch(/\.orch\/config\.toml/);
+			expect(plan!.error).toMatch(/\[roles\.planner\]/);
+			expect(plan!.missing).toEqual(["planner"]);
+
+			// the loader names the first role block it could not validate (planner);
+			// fixing it re-runs the preflight, which then names the next gap
+			const run = await configPreflight(noRoles, { kind: "run", approve: true });
+			expect(run!.missing).toEqual(["planner"]);
+			expect(run!.error).toMatch(/\[roles\.planner\]/);
+		} finally {
+			await rm(noRoles, { recursive: true, force: true });
+		}
+
+		const broken = await rootWithConfig("[roles.planner]\nprovider = \"\n"); // invalid TOML
+		try {
+			const plan = await configPreflight(broken, { kind: "plan" });
+			expect(plan).toMatchObject({ status: 422 });
+			expect(plan!.configError).toMatch(/not valid TOML/);
+			expect(plan!.error).toMatch(/config can't be read/);
+		} finally {
+			await rm(broken, { recursive: true, force: true });
+		}
+	});
+
+	it("over HTTP: 422 replaces the doomed 202 — no job record appears — and fixing the config restores the 202", async () => {
+		const baked = await bake({ skipJobSweep: false });
+		const savedEnv = process.env["KIT_UI_CLI_BIN"];
+		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
+		try {
+			const configPath = join(baked.root, ".orch", "config.toml");
+			const original = await readFile(configPath, "utf8");
+			await writeFile(configPath, "[engine]\npiDurable = \"1.5.0\"\n", "utf8"); // roles gone
+			const rejected = await postAction(baked.base, baked.cookie, { kind: "plan", prd: "docs/prd.md" }, actionHeaders(baked.csrf));
+			expect(rejected.status).toBe(422);
+			const body = (await rejected.json()) as { error: string; missing?: string[] };
+			expect(body.error).toMatch(/roles\.planner has no model configured/);
+			expect(body.missing).toEqual(["planner"]);
+			expect((await jobsList(baked.root)).length).toBe(0); // nothing spawned
+
+			await writeFile(configPath, original, "utf8"); // restored: the same POST succeeds
+			const accepted = await postAction(baked.base, baked.cookie, { kind: "plan", prd: "docs/prd.md" }, actionHeaders(baked.csrf));
+			expect(accepted.status).toBe(202);
+		} finally {
+			if (savedEnv === undefined) delete process.env["KIT_UI_CLI_BIN"]; else process.env["KIT_UI_CLI_BIN"] = savedEnv;
+			await baked.running.shutdown().catch(() => {});
+			await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("failed job records carry their reason tail in /api/jobs and SSE payloads", async () => {
+		const baked = await bake({ skipJobSweep: false });
+		const savedEnv = process.env["KIT_UI_CLI_BIN"];
+		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
+		try {
+			const accept = await startAction(baked.root, { kind: "export" });
+			expect(accept.ok).toBe(true);
+			if (accept.ok) {
+				const job = (await waitFor(() => readJobRecord(baked.root, accept.job.id), (j) => j !== undefined && j.status !== "running", 8_000))!;
+				expect(job.status).toBe("failed");
+				const views = await waitFor(async () => jobsViewList(baked.root), (v) => v.length > 0 && (v.find((x) => x.id === accept.job.id)?.tail?.length ?? 0) > 0, 8_000);
+				const view = views.find((x) => x.id === accept.job.id)!;
+				expect(view.tail?.join("\n")).toMatch(/exported:|went wrong/); // the log's last meaningful lines, ANSI-stripped
+				// the same view shape rides the HTTP /api/jobs route (SSE emits this too)
+				const httpPayload = (await (await fetch(`${baked.base}/api/jobs`, { headers: { cookie: baked.cookie } })).json()) as { jobs: { id: string; tail?: string[] }[] };
+				expect((httpPayload.jobs.find((x) => x.id === accept.job.id)?.tail ?? []).join("\n")).toMatch(/exported:|went wrong/);
+			}
+		} finally {
+			if (savedEnv === undefined) delete process.env["KIT_UI_CLI_BIN"]; else process.env["KIT_UI_CLI_BIN"] = savedEnv;
+			await baked.running.shutdown().catch(() => {});
+			await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
 
 describe("action validation (allowlist, per-kind shapes)", () => {
 	it("rejects unknown kinds, unknown fields, non-objects", () => {

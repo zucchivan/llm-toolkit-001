@@ -3,7 +3,8 @@
  * topological order + selection defaults, failure-row toasts.
  */
 import { describe, expect, it } from "vitest";
-import { decideView, topoOrder, jobOutcome, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget } from "../src/lib/view.ts";
+import { decideView, topoOrder, jobOutcome, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded } from "../src/lib/view.ts";
+import type { RoleModelInfo } from "../src/lib/api.ts";
 import type { HealthCheck } from "../../src/engine/inspector.ts";
 import type { ReadoutSnapshot } from "../src/lib/api.ts";
 import type { JobRecord } from "../server/jobs.ts";
@@ -346,5 +347,80 @@ describe("keyboard binding derivations (§10)", () => {
 		expect(escapeTarget({ sheetOpen: false, dialogOpen: true, drawerOpen: true })).toBe("dialog");
 		expect(escapeTarget({ sheetOpen: false, dialogOpen: false, drawerOpen: true })).toBe("drawer");
 		expect(escapeTarget({ sheetOpen: false, dialogOpen: false, drawerOpen: false })).toBeNull();
+	});
+});
+
+describe("modelPreflight (dialog readiness, §7.2 friendliness)", () => {
+	const models = (values: Partial<Record<string, string>>): RoleModelInfo[] =>
+		(["planner", "implementer", "verifier"] as const).map((name) => ({ name, provider: values[name]?.split(" ")[0] ?? "", modelId: values[name]?.split(" ")[1] ?? "" }));
+	const full: RoleModelInfo[] = [
+		{ name: "planner", provider: "anthropic", modelId: "claude-sonnet-4-5" },
+		{ name: "implementer", provider: "anthropic", modelId: "claude-sonnet-4-5" },
+		{ name: "verifier", provider: "openrouter", modelId: "openai/gpt-5-nano" },
+	];
+
+	it("plan needs planner only; run/resume need implementer + verifier", () => {
+		expect(rolesNeeded("plan")).toEqual(["planner"]);
+		expect(rolesNeeded("run-all")).toEqual(["implementer", "verifier"]);
+		expect(rolesNeeded("run-selected")).toEqual(["implementer", "verifier"]);
+		expect(rolesNeeded("resume")).toEqual(["implementer", "verifier"]);
+	});
+
+	it("configured roles are fine; no snapshot info stays permissive (server is authoritative)", () => {
+		expect(modelPreflight("plan", full)).toEqual({ ok: true });
+		// roles arrive with every snapshot; the undefined case is "unknown", not "missing"
+		expect(modelPreflight("plan", undefined)).toEqual({ ok: true });
+	});
+
+	it("empty provider/modelId or a missing role warns with a paste-ready TOML block", () => {
+		const result = modelPreflight("plan", models({ implementer: "anthropic/claude-sonnet-4-5" }));
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.missing).toEqual(["planner"]);
+			expect(result.reason).toMatch(/roles\.planner has no model configured/);
+			expect(result.snippet).toMatch(/\[roles\.planner\]/);
+			expect(result.snippet).toMatch(/provider = "openrouter"/);
+			expect(result.snippet).toMatch(/modelId = "openai\/gpt-5-nano"/);
+		}
+		const runResult = modelPreflight("run-all", models({ planner: "anthropic/claude-sonnet-4-5" }));
+		expect(runResult.ok).toBe(false);
+		if (!runResult.ok) {
+			expect(runResult.missing.sort()).toEqual(["implementer", "verifier"]);
+			expect(runResult.snippet).toContain("[roles.implementer]");
+			expect(runResult.snippet).toContain("[roles.verifier]");
+		}
+	});
+
+	it("blank-string provider/modelId count as missing, not ready", () => {
+		const blank = models({ planner: "x z", implementer: " / ", verifier: "openrouter openai/gpt-5-nano" });
+		expect(modelPreflight("plan", blank).ok).toBe(true);
+		expect(modelPreflight("run-all", blank).ok).toBe(false);
+	});
+
+	it("a config the readout could not parse disables everything with its reason", () => {
+		const result = modelPreflight("plan", undefined, "config.toml is not valid TOML: oops");
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.reason).toMatch(/config can't be read/);
+			expect(result.snippet).toBe("");
+		}
+	});
+
+	it("a missing-roles config error becomes the prescriptive warning, mirroring the server", () => {
+		const result = modelPreflight("plan", undefined, 'roles.planner: needs provider and modelId — e.g. provider = "openrouter"\n  modelId = "openai/gpt-5-nano"');
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.missing).toEqual(["planner"]);
+			expect(result.reason).toMatch(/roles\.planner has no model configured/);
+			expect(result.snippet).toContain("[roles.planner]");
+		}
+	});
+});
+
+describe("firstFailureLine (failed-job toast reason)", () => {
+	it("first non-empty line, trimmed; undefined when no tail", () => {
+		expect(firstFailureLine(undefined)).toBeUndefined();
+		expect(firstFailureLine([""])).toBeUndefined();
+		expect(firstFailureLine(["", "  plan failed: roles.planner needs provider and modelId", "hint: run init"])).toBe("plan failed: roles.planner needs provider and modelId");
 	});
 });

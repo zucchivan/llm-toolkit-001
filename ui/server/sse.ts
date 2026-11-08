@@ -16,8 +16,8 @@ import { watch } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { readOnce, type ReadoutSnapshot } from "./readout.ts";
-import { attachedRun, jobsDir, jobsList, type AttachedRun } from "./jobs.ts";
-import type { JobRecord } from "./jobs.ts";
+import { attachedRun, jobsDir, jobsList, jobsViewList, type AttachedRun } from "./jobs.ts";
+import type { JobRecord, JobView } from "./jobs.ts";
 
 export interface HubOptions {
 	pollMs?: number;
@@ -29,15 +29,15 @@ export interface HubOptions {
 	watchJobs?: boolean;
 }
 
-/** Payload of a `job` SSE event: the full job list + the attached run if any. */
+/** Payload of a `job` SSE event: the full job list + the attached run if any. Records carry a bounded reason tail on diagnostic outcomes (failed/stale/42) so toasts can cite it. */
 export interface JobsEventPayload {
 	at: number;
-	jobs: JobRecord[];
+	jobs: JobView[];
 	attached?: AttachedRun;
 }
 
 export async function currentJobsEvent(projectRoot: string): Promise<JobsEventPayload> {
-	const jobs = await jobsList(projectRoot);
+	const jobs = await jobsViewList(projectRoot);
 	return { at: Date.now(), jobs, attached: await attachedRun(projectRoot, jobs) };
 }
 

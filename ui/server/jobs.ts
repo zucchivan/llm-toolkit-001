@@ -46,6 +46,55 @@ export interface JobRecord {
 	logPath: string;
 }
 
+/**
+ * A listing view of a record: adds a bounded `tail` (the reason, ANSI-stripped)
+ * for terminal outcomes where the log holds the human-relevant explanation
+ * (config errors, gate/verify messages, spawn failures). A 0-exit or a plain
+ * interrupt stays tail-free — the exit code alone is the full story there.
+ */
+export interface JobView extends JobRecord {
+	/** Last meaningful log lines, ANSI stripped; present only when diagnostic. */
+	tail?: string[];
+}
+
+/** Terminal outcomes whose log tail explains the outcome ("what do I do now"). */
+export function wantsReasonTail(record: Pick<JobRecord, "status" | "exitCode" | "detail">): boolean {
+	if (record.detail) return true; // runner-side spawn/observation detail: the log may be empty
+	if (record.status === "running") return false;
+	if (record.status === "failed" || record.status === "stale") return true;
+	// exited with a real outcome: sleeping (42) and any nonzero error tail in;
+	// 0 ok and 130 (the user interrupted) are self-explanatory.
+	return record.exitCode !== undefined && record.exitCode !== 0 && record.exitCode !== 130;
+}
+
+/** Strip ANSI SGR/color sequences for display (the CLI colors its messages). */
+export function stripAnsi(text: string): string {
+	return text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+/**
+ * The bounded reason tail for a record listing: last few non-empty log lines,
+ * ANSI-stripped. Reads whole (job logs are small; the CLI is not a server),
+ * capped at 6 lines so a pathological log cannot bloat a job payload.
+ */
+export async function reasonTail(record: JobRecord, maxLines = 6): Promise<string[] | undefined> {
+	if (!wantsReasonTail(record)) return undefined;
+	const raw = await tailJobLog(record.logPath, maxLines);
+	const lines = raw.map((l) => stripAnsi(l).trim()).filter((l) => l.length > 0);
+	return lines.length ? lines : undefined;
+}
+
+/** The /api/jobs + SSE `job` payload shape: every record scored for a reason tail. */
+export async function jobsViewList(root: string): Promise<JobView[]> {
+	const records = await jobsList(root);
+	return Promise.all(
+		records.map(async (record) => {
+			const tail = await reasonTail(record);
+			return tail ? { ...record, tail } : record;
+		}),
+	);
+}
+
 /** Attached-run discovery result: a terminal-started live run (never a record). */
 export interface AttachedRun {
 	pid: number;

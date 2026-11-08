@@ -85,10 +85,13 @@
 		{#each records as job (job.id)}
 			{@const chip = chipFor(job)}
 			<div class="jobrow" class:job-cur={job.status === "running"}>
-				<span class="chip {chip.cls}" title={chip.title}>{chip.text}</span>
+				<span class="chip {chip.cls}" title={chip.title ?? (job.tail ? `\n${job.tail.join("\n")}` : "")}>{chip.text}</span>
 				<span class="mono">{verbLabel[job.kind] ?? job.kind}</span>
 				<span class="mono muted" style="font-size:11px">{job.id}</span>
 				<span class="muted" style="font-size:11px">{relativeAge(Math.max(0, now - job.startedAt))}</span>
+				{#if job.tail?.length}
+					<span class="muted jobreason" title={job.tail.join("\n")}>{job.tail[0]!.slice(0, 80)}</span>
+				{/if}
 				<span style="margin-left:auto; display:flex; gap:6px">
 					<button class="btn tiny" onclick={() => toggle(job.id)}>{expanded === job.id ? "hide log" : "log"}</button>
 					{#if job.status === "running" && job.kind !== "handoff"}

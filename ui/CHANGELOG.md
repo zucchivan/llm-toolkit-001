@@ -4,6 +4,39 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.4.1 — M3+ verification feedback (model readiness + failed-job reasons)
+
+Found during the M4-entry approval walk: clicking **Plan** on a project whose
+config has no role models spawned a doomed job that died at boot — the only
+evidence was a toast with an exit code and a log file nobody opens. Three
+fixes, all in `ui/`, no seam change (still kit 0.2.2, A.1–A.3), no deps:
+
+- **Models are visible** — plan/run/resume dialogs render the configured role
+  models as chips (`planner · anthropic · claude-sonnet-4-5`, or `· not
+  configured`) from a new readout extra (`roles`, config-derived per snapshot —
+  the same UI-only pattern as `sleep`/`prdPath`; the server reads
+  `.orch/config.toml` per read, never writes it).
+- **Preflight instead of a doomed job** — `POST /api/actions` for
+  plan/run/verify answers `422` in kind words when the config misses the role
+  block(s) the action needs (or the file itself is unreadable): `plan can't
+  start yet: roles.planner has no model configured. In .orch/config.toml add:
+  [roles.planner] provider = "openrouter" modelId = "openai/gpt-5-nano" …`.
+  The dialog mirrors the same check (pure `modelPreflight` in `lib/view.ts`),
+  disables the positive button, and quotes the block verbatim — unknown role
+  info stays permissive (unknown is not missing; the server is authoritative).
+  The kit's own loader diagnostic (`roles.planner: needs provider and
+  modelId — e.g. …`) maps onto the prescriptive shape.
+- **Failed jobs say why** — job payloads (`/api/jobs` + the SSE `job` event)
+  carry a bounded, ANSI-stripped log tail on diagnostic outcomes (failed,
+  stale, exit 42, runner-detail records; none for plain 0-exits/interrupts).
+  The failed-job toast quotes the first diagnostic line; failed rows in the
+  jobs panel show it inline with the full tail on hover.
+
+
+Manual semver discipline: keep `package.json` version and the newest section
+in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
+`ui/PRD.md` Appendix A.
+
 ## 0.4.0 — M3 polish + hardening (health panel, alerts/empty/error states, keyboard + a11y, CI e2e)
 
 - **Health panel** (§7.1): a collapsible `HealthPanel` renders the readout's

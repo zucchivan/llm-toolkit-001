@@ -84,6 +84,20 @@ What M3 adds around that core (§16 M3 polish):
   progresses) or failing-first by status (quarantined → in progress → todo →
   done, stable within a status). Row filtering stays a §13/§16 deferral.
 
+### Model readiness + failed-job reasons (0.4.1, M4-entry approval feedback)
+
+- Every action dialog that needs a model (plan, approve & run, run selected,
+  resume) shows the configured role models as chips and refuses to start —
+  disabled button + a paste-ready TOML block — when the needed block is
+  missing or the config is unreadable. The server answers `422` first:
+  no doomed job, no exit-code mystery.
+- A failed/stale/42 job's payload carries its log's last meaningful lines
+  (ANSI stripped): the toast quotes the first diagnostic line and the jobs
+  panel shows it inline. Hovering a row gives the whole bounded tail.
+- The UI still never writes `.orch/config.toml` (CLI-only mutation rule):
+  the dialog tells you exactly which block to add and where, then re-reads
+  it on the next snapshot.
+
 ### Performance window + deferred bits (§13/§16 deferrals, M3 exit record)
 
 - The event log keeps the **newest 300 rows in the DOM** (a plain windowed

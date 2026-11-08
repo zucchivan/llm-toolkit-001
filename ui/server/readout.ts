@@ -17,7 +17,14 @@ import type { KitReadout } from "../../src/engine/inspector.ts";
 import { LockBusyError } from "../../src/util/lockfile.ts";
 import { dirname, join } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
-import { loadConfig } from "../../src/config.ts";
+import { loadConfig, ROLES } from "../../src/config.ts";
+
+/** One configured role, as the plan/run dialogs render it (§7.2 friendliness). */
+export interface RoleModelInfo {
+	name: (typeof ROLES)[number];
+	provider: string;
+	modelId: string;
+}
 
 export interface ReadoutSnapshot {
 	readout: KitReadout;
@@ -28,6 +35,10 @@ export interface ReadoutSnapshot {
 	sleep?: { until: number; cycleCount?: number; alert?: string };
 	/** PRD path for the Plan prefill (status.json last knows it). */
 	prdPath?: string;
+	/** The configured role models straight from .orch/config.toml; undefined when the config itself is unreadable (see configError). */
+	roles?: RoleModelInfo[];
+	/** The config failed to load mid-session (bad TOML edit): the reason, the UI's words, so dialogs can be kind about it. */
+	configError?: string;
 }
 
 const LOCK_RETRIES = 2;
@@ -66,24 +77,23 @@ export async function readOnce(projectRoot: string): Promise<ReadoutSnapshot> {
 	}
 }
 
-async function statusExtras(projectRoot: string): Promise<Pick<ReadoutSnapshot, "sleep" | "prdPath">> {
+async function statusExtras(projectRoot: string): Promise<Pick<ReadoutSnapshot, "sleep" | "prdPath" | "roles" | "configError">> {
 	const statusPath = join(projectRoot, ".orch", "status.json");
 	const payload = await readJson<StatusPayloads>(statusPath).catch(() => undefined);
 	const sleep =
 		payload?.sleepUntil !== undefined
 			? { until: payload.sleepUntil, cycleCount: payload.sleepCycleCount, alert: payload.alert }
 			: undefined;
-	// §8.2 prefill: the config's [paths].prd is the fallback before any flush knows a prdPath.
-	const prdPath = payload?.prdPath ?? readConfigPrdPathSilent(join(projectRoot, ".orch", "config.toml"));
-	return { sleep, prdPath };
-}
-
-function readConfigPrdPathSilent(configPath: string): string | undefined {
+	// One config load per snapshot covers every config-derived extra: the plan
+	// prefill (§8.2), the visible role models (§7.2 — "is a model even set?"),
+	// and a mid-session config break rendered in kind words. Read-only; the UI
+	// never writes the config (the CLI is the only mutation path).
 	try {
-		const config = loadConfig(dirname(configPath), configPath);
-		const prd = (config as { paths?: { prd?: string } }).paths?.prd;
-		return typeof prd === "string" && prd.trim() ? prd : undefined;
-	} catch {
-		return undefined; // no config or parse issue: no prefill (the plan CLI reports it)
+		const config = loadConfig(projectRoot);
+		const prdPath = payload?.prdPath ?? config.paths.prd;
+		const roles = ROLES.map((name) => ({ name, provider: config.roles[name].provider, modelId: config.roles[name].modelId }));
+		return { sleep, prdPath, roles };
+	} catch (err) {
+		return { sleep, prdPath: payload?.prdPath, configError: (err as Error).message };
 	}
 }
