@@ -4,6 +4,30 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.7.1 — attached stop: §7.2.1 check 1's "ui-job" refusal enforced at the POST gate
+
+Post-ship inspection of 0.7.0 found an enforcement gap in §7.2.1 check 1: the
+refusal for a lock holder "a running UI job record claims" lives in
+`verifyAttachedStop()` behind the caller-supplied `uiJobPids`, and only the
+enablement path passed them — the authoritative `POST /api/actions`
+`{ kind: "stop", target: "attached" }` route did not, so a hand-crafted or
+stale POST naming a UI-launched run's CLI pid verified through the /proc
+checks and sent the SIGINT instead of refusing with "use its ordinary Stop
+button". No wrong-target signal ever resulted: the record's pid IS the CLI
+child holding `.orch/lock` (the runner patches it in — `ui/server/
+job-runner.mjs`) and the ordinary Stop sends the same one SIGINT to that same
+pid — but the shipped §7.2.1 + 0.7.0 text promised the refusal comes first.
+Now the route reads a FRESH record list and passes `runningJobPids()` — one
+new helper in `ui/server/jobs.ts` that ports the enablement path's exact
+filter (running, not a handoff, pid known), so both call sites enforce the
+clause identically. A failed claim answers its plain-words reason and signals
+nothing, as every §7.2.1 check does. New route-level test: a live holder a
+running record claims → 409 with the ordinary-Stop wording and the holder
+survives (no signal). Also: `ui/package-lock.json`'s root version, stale at
+0.4.0 since before 93488bb, syncs to 0.7.1 (bundled, explicit word given).
+Kit stays 0.2.2; `readout.seam` stays 1; no new deps; the plain
+`{ kind: "stop" }` UI-job path is byte-for-byte unchanged.
+
 ## 0.7.0 — M5-slice-3: verified attached stop — Ctrl-C (SIGINT) to terminal-started runs (§7.2.1, decision D6)
 
 The third M5 slice lifts the §18 deferral "safe stop for attached

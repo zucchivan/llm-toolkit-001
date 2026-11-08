@@ -16,7 +16,7 @@ import { watch } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { readOnce, type ReadoutSnapshot } from "./readout.ts";
-import { attachedRun, jobsDir, jobsList, jobsViewList, type AttachedRun } from "./jobs.ts";
+import { attachedRun, jobsDir, jobsList, jobsViewList, runningJobPids, type AttachedRun } from "./jobs.ts";
 import type { JobRecord, JobView } from "./jobs.ts";
 import { attachedStopView } from "./attached-stop.ts";
 
@@ -43,10 +43,7 @@ export async function currentJobsEvent(projectRoot: string): Promise<JobsEventPa
 	if (attached) {
 		// §7.2.1: the attached run's stop affordance, verified read-only per
 		// payload (a failed check never signals; the POST re-verifies anyway).
-		const uiJobPids = jobs
-			.filter((j) => j.status === "running" && j.kind !== "handoff" && j.pid !== undefined)
-			.map((j) => j.pid!);
-		attached.stop = await attachedStopView(projectRoot, attached.pid, uiJobPids);
+		attached.stop = await attachedStopView(projectRoot, attached.pid, runningJobPids(jobs));
 	}
 	return { at: Date.now(), jobs, attached };
 }

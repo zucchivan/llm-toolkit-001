@@ -38,7 +38,7 @@ import { startAction, stopAction, validateAction } from "./actions.ts";
 import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
 import { currentJobsEvent, startSnapshotHub, type SnapshotHub } from "./sse.ts";
-import { jobsViewList, markStaleRecords, pruneJobs, readJobRecord, tailJobLog } from "./jobs.ts";
+import { jobsList, jobsViewList, markStaleRecords, pruneJobs, readJobRecord, runningJobPids, tailJobLog } from "./jobs.ts";
 
 export interface UiServerOptions {
 	/** The project directory this server reads (one project per server). */
@@ -426,7 +426,14 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 	// and signals nothing). Everything else spawns a job.
 	if (body.kind === "stop") {
 		if (body.target === "attached") {
-			const attached = await attachedStopAction(opts.root, { expectedPid: body.pid });
+			// §7.2.1 check 1 at the authoritative gate too: a holder a running UI
+			// job record claims belongs to the ordinary Stop — the route reads a
+			// FRESH record list, so a hand-crafted or stale POST naming that pid
+			// is refused with the plain reason and signals nothing.
+			const attached = await attachedStopAction(opts.root, {
+				expectedPid: body.pid,
+				uiJobPids: runningJobPids(await jobsList(opts.root)),
+			});
 			if (!attached.ok) {
 				jsonError(res, attached.fail.status, attached.fail.error, {
 					...(attached.fail.pid !== undefined ? { holderPid: attached.fail.pid } : {}),

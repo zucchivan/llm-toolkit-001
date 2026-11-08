@@ -15,7 +15,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
 import { validateAction } from "../server/actions.ts";
 import { attachedStopAction, attachedStopView, verifyAttachedStop } from "../server/attached-stop.ts";
-import { pidAlive } from "../server/jobs.ts";
+import { jobsDir, pidAlive } from "../server/jobs.ts";
 import { bake, postAction, actionHeaders, waitFor } from "./actions-helper.ts";
 
 const SKIP = !existsSync("/proc"); // checks 3–4 read /proc; §7.2.1 documents the platform line
@@ -288,6 +288,45 @@ describe("attached stop: action-body validation + routes (target/pid shapes)", (
 			expect(absent.status).toBe(409);
 			const body = (await absent.json()) as { error: string };
 			expect(body.error).toMatch(/nothing to stop|not alive/);
+		} finally {
+			await baked.running.shutdown().catch(() => {});
+			await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("route: a holder a running UI job record claims refuses with the ordinary-Stop reason — nothing is signalled (§7.2.1 check 1 at the POST gate)", async () => {
+		const baked = await bake({ skipJobSweep: true });
+		try {
+			const headers = actionHeaders(baked.csrf);
+			// A real live process in the project dir: alive and not the server's own
+			// window, so checks 1a and 1b pass and the clause that must speak is the
+			// running-record claim — post-fix even before any /proc identity work.
+			const holder = spawn(process.execPath, ["-e", "const t = Date.now() + 30000; while (Date.now() < t) {}"], { cwd: baked.root, stdio: "ignore" });
+			try {
+				await writeFile(join(baked.root, ".orch", "status.json"), JSON.stringify({ lockedByPid: holder.pid!, phase: "wave-running", ts: Date.now() }), "utf8");
+				const record = {
+					id: "jobclaim1",
+					kind: "run",
+					argv: [baked.stubCli, "run"],
+					cwd: baked.root,
+					pid: holder.pid!,
+					startedAt: Date.now(),
+					status: "running",
+					logPath: join(".orch", "ui", "jobs", "jobclaim1.log"),
+				};
+				await mkdir(jobsDir(baked.root), { recursive: true });
+				await writeFile(join(jobsDir(baked.root), "jobclaim1.json"), JSON.stringify(record), "utf8");
+
+				const res = await postAction(baked.base, baked.cookie, { kind: "stop", target: "attached", pid: holder.pid! }, headers);
+				expect(res.status).toBe(409);
+				const body = (await res.json()) as { error: string };
+				expect(body.error).toMatch(/ordinary Stop/);
+
+				await new Promise((r) => setTimeout(r, 300)); // a stray signal would kill a bare busy loop this fast
+				expect(pidAlive(holder.pid!)).toBe(true); // survived — the refusal signalled nothing
+			} finally {
+				holder.kill("SIGKILL");
+			}
 		} finally {
 			await baked.running.shutdown().catch(() => {});
 			await rm(baked.root, { recursive: true, force: true }).catch(() => {});

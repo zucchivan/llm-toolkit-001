@@ -127,6 +127,21 @@ export function jobPid(record: Pick<JobRecord, "pid" | "runnerPid">): number | u
 	return record.pid ?? record.runnerPid;
 }
 
+/**
+ * The pids the running non-handoff records claim (§7.2.1 check 1): a lock
+ * holder a running UI job record claims is the ordinary Stop's business — the
+ * attached stop must refuse it, never signal it, at BOTH the payload/enablement
+ * path and the authoritative POST route (so a hand-crafted or stale POST naming
+ * such a pid cannot slip past check 1). Handoff records are excluded — they
+ * write the atomic side-car and never hold the run loop's lock, so their pid
+ * must not block an attached verification.
+ */
+export function runningJobPids(records: readonly JobRecord[]): number[] {
+	return records
+		.filter((j) => j.status === "running" && j.kind !== "handoff" && j.pid !== undefined)
+		.map((j) => j.pid!);
+}
+
 /** signal-0 probe: live when it does not throw ESRCH; EPERM counts as alive. */
 export function pidAlive(pid: number | undefined): boolean {
 	if (!Number.isInteger(pid) || !pid || pid <= 0) return false;
