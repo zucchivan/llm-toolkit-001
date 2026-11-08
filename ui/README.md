@@ -97,6 +97,12 @@ What M2 adds on top of M1 control (kit seam genome A.2/A.3 → root 0.2.2):
   line coloring, lazy per-file, 2000-lines/file cap, binary/truncated notices,
   raw download; deep link `#/diff/<task>`; `Esc` closes. Open from task rows,
   completion-report rows, and the jobs panel's newest-diff shortcut.
+- **Wave scope (0.8.0, Appendix A.7)** — the drawer also offers one wave's
+  own delta: a select lists the task's waves that carry recorded trees
+  ("wave N — isolated to this wave", computed on demand between the wave's
+  start/end trees, never persisted, never a rollback input); waves without
+  trees and running waves answer in plain words. The cumulative task diff
+  stays the default.
 - **Live preview** — while a task's wave runs, a dashed **live** button opens
   the same drawer marked `live preview — may be incomplete`, refetching on each
   SSE snapshot; computed on demand vs the task's baseline, never persisted,
