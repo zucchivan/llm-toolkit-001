@@ -4,6 +4,46 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.8.0 — M5-slice-4: per-wave isolated diffs ship Appendix A.7
+
+The §18 deferral "per-wave isolated diffs (wave-start snapshots)" — the A.7
+proposal drafted during this wrap-up and implemented at the owner's explicit
+go-ahead. The kit side is 0.2.3's additive seam (`readout.seam` stays 1):
+every wave start/end row carries its own git `treeSha`, a tree-to-tree
+display wrapper diffs two captured trees, and readout wave spans echo
+`startTreeSha`/`endTreeSha`. What the UI gains:
+
+- **`GET /api/tasks/:id/diff?wave=N`** — one wave's isolated delta: computed
+  on demand between that wave's own recorded trees (start row's vs end
+  row's), the A.2 exclusions and 5 MiB cap applied; never persisted, never
+  a rollback input, the lock never taken. Failure postures answer in plain
+  words and never invent data: a wave without a start tree (rows predate
+  A.7 or the capture failed), an end row without a tree, and a
+  still-running/short-cut wave (no end row yet — the in-flight view is the
+  live diff) answer 409 with the reason; a wave whose raw delta is only
+  engine-owned churn (the router.md mirror) answers 200 empty with the
+  stated reason.
+- **The diff drawer gains a wave scope** — when the readout's timeline
+  carries spans with recorded trees for the task, a small select offers
+  "task (cumulative)" plus each wave; picking one labels the view "wave N —
+  isolated to this wave" and names the two trees. The default view stays
+  the cumulative "task diff" with its raw download; the wave scope is
+  computed ("never persisted") so its raw-download anchor is replaced by
+  that statement. A task switch resets the scope to cumulative.
+- **Non-goals kept** — no per-wave rollback or wave-level approve/regate,
+  quarantine rollback behavior unchanged (the quarantined wave's tree was
+  captured BEFORE the rollback, so its isolated diff still names the
+  evidence), no delivery change (D3/D5), no editors, no new ui deps, no
+  router/hash changes, the {kind:"stop"} paths unchanged.
+- **Validation** — new route-level wave tests (real captured trees in a
+  baked project: the isolated delta is exactly the wave's own files; the
+  400/409 plain-words refusals; the 200-empty note), the client
+  `normalizeWaveDiff` shapes, and the kit's A.7 tests (row treeShas across
+  real waves, span echo, the caught captureBaselineTree stale-index bug).
+  All suites green locally: root `npm test` (49/49) + `npm run build`; ui
+  `npm test` (224 passed/4 skipped), `typecheck`, `check` (0/0), `build`,
+  `test:e2e` (4/4).
+
 ## 0.7.1 — attached stop: §7.2.1 check 1's "ui-job" refusal enforced at the POST gate
 
 Post-ship inspection of 0.7.0 found an enforcement gap in §7.2.1 check 1: the

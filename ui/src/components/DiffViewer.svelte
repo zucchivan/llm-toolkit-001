@@ -7,7 +7,7 @@
 	 * It fetches its own data (persisted vs live by the `live` prop); App owns
 	 * the drawer chrome.
 	 */
-	import { fetchTaskDiff, fetchLiveDiff, diffDownloadUrl, normalize, normalizePersisted, type DiffDoc, type ReadoutSnapshot } from "../lib/api.ts";
+	import { fetchTaskDiff, fetchLiveDiff, fetchWaveDiff, diffDownloadUrl, normalize, normalizePersisted, normalizeWaveDiff, type DiffDoc, type ReadoutSnapshot } from "../lib/api.ts";
 	import { parseUnifiedDiff, cumulativeLabel, DIFF_FILE_LINE_CAP, statusLabel } from "../lib/diff.ts";
 	import type { ParsedDiff, ParsedDiffFile } from "../lib/diff.ts";
 
@@ -30,8 +30,23 @@
 	let loading = $state(false);
 	let openFiles = $state<Record<string, boolean>>({});
 
+	// A.7 (per-wave isolated diffs): the wave scope this drawer shows (undefined =
+	// the default cumulative task diff). Chosen from the readout's wave spans that
+	// carry recorded trees; persisted mode only — the live drawer stays the
+	// in-flight preview. Nothing is selected from the tree by default.
+	let waveScope = $state<number | undefined>(undefined);
+	let changedTask: string | undefined = undefined; // task-switch detection (resets the scope)
+	const waveChoices = $derived<number[]>(
+		(snapshot?.readout.timeline ?? [])
+			.filter((s) => s.task === task && s.startTreeSha !== undefined && s.endTreeSha !== undefined)
+			.map((s) => s.wave)
+			.sort((a, b) => b - a),
+	);
+
 	let parsed = $derived<ParsedDiff>(doc ? parseUnifiedDiff(doc.diff) : { files: [], truncated: false });
-	let waveLabel = $derived(cumulativeLabel(waves));
+	let waveLabel = $derived(
+		waveScope !== undefined && doc?.isolated ? `wave ${waveScope} — isolated to this wave` : cumulativeLabel(waves),
+	);
 
 	async function load(): Promise<void> {
 		loading = true;
@@ -46,6 +61,8 @@
 					if (!/not the current in-flight/i.test((err as Error).message)) throw err;
 					doc = normalizePersisted(await fetchTaskDiff(task));
 				}
+			} else if (waveScope !== undefined && !live) {
+				doc = normalizeWaveDiff(await fetchWaveDiff(task, waveScope));
 			} else {
 				doc = normalizePersisted(await fetchTaskDiff(task));
 			}
@@ -56,10 +73,14 @@
 		}
 	}
 
-	// (Re)load whenever the drawer's task or mode changes.
+	// (Re)load whenever the drawer's task, mode, or wave scope changes; a task
+	// switch resets the scope to the cumulative default.
 	$effect(() => {
 		void task;
 		void live;
+		void waveScope;
+		if (changedTask !== task) waveScope = undefined;
+		changedTask = task;
 		void load();
 	});
 
@@ -122,6 +143,29 @@
 		<div class="banner diffbanner">live preview — may be incomplete: the wave is still running; this is the working tree vs the task baseline right now</div>
 	{/if}
 
+	{#if waveChoices.length && !live}
+		<div class="diffmeta" style="font-size:11px">
+			<label for="wave-scope">wave scope</label>
+			<select
+				id="wave-scope"
+				style="font-size:11px"
+				value={waveScope ?? ""}
+				onchange={(e) => {
+					const v = (e.currentTarget as HTMLSelectElement).value;
+					waveScope = v === "" ? undefined : Number(v);
+				}}
+			>
+				<option value="">task (cumulative)</option>
+				{#each waveChoices as w (w)}
+					<option value={w}>wave {w}</option>
+				{/each}
+			</select>
+			{#if waveScope !== undefined && doc?.startTreeSha && doc?.endTreeSha}
+				<span class="muted mono" title="the wave's own recorded trees (start/end rows)">trees {doc.startTreeSha.slice(0, 8)}…{doc.endTreeSha.slice(0, 8)}…</span>
+			{/if}
+		</div>
+	{/if}
+
 	{#if error}
 		<!-- §15.1: kind wording for the known statuses; everything else stays raw -->
 		<div class="banner error">
@@ -146,7 +190,11 @@
 				<span class="badge ph-blocked" title="the stored patch was cut at the 5 MiB cap; the stats side-car records the cut">truncated at the 5&nbsp;MiB cap</span>
 			{/if}
 			{#if !doc.statsJson && !doc.live}<span class="muted" title="older kit run without the A.2 stats side-car">no stats side-car</span>{/if}
-			<a href={diffDownloadUrl(task)} download title="raw patch bytes as an attachment">raw download</a>
+			{#if doc.isolated === true}
+				<span class="muted" title="computed between the wave's own trees; the cumulative patch keeps its raw download">wave scope — computed, never persisted</span>
+			{:else}
+				<a href={diffDownloadUrl(task)} download title="raw patch bytes as an attachment">raw download</a>
+			{/if}
 		</div>
 		{#if doc.note}
 			<div class="banner diffbanner">{doc.note}</div>

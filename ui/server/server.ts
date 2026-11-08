@@ -8,6 +8,8 @@
  *   GET  /api/jobs/:id      one job record
  *   GET  /api/jobs/:id/log  tail of a job log (?n=200, max 5000)
  *   GET  /api/tasks/:id/diff       persisted patch + stats (§11.2; 404 if none)
+ *   GET  /api/tasks/:id/diff?wave=N  A.7 per-wave isolated diff (computed between the wave's recorded trees;
+ *                                  409 when the wave has no recorded trees / no end row yet)
  *   GET  /api/tasks/:id/diff/live  live patch vs the task baseline (409 if not in-flight)
  *   GET  /api/conversations/:id/entries  A.5 bounded transcript excerpt
  *                                  (404 unknown conversation; 409 while a
@@ -33,7 +35,7 @@ import type { AddressInfo } from "node:net";
 import { checkMutationAuth, csrfCookie, hasValidCookie, isLoopbackPeer, MutationAuthError, sessionCookie, tokenEquals } from "./auth.ts";
 import { readConversationEntries, readOnce } from "./readout.ts";
 import { readProjectSources } from "./sources.ts";
-import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName } from "./diff.ts";
+import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName, waveTaskDiff } from "./diff.ts";
 import { startAction, stopAction, validateAction } from "./actions.ts";
 import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
@@ -198,7 +200,7 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 		const taskDiffMatch = /^\/api\/tasks\/([^/]+)\/diff(\/live)?$/.exec(pathname);
 		if (taskDiffMatch) {
 			if (req.method !== "GET") return void jsonError(res, 405, `method ${req.method ?? "?"} not allowed`);
-			return await serveTaskDiffRoute(req, res, opts.root, taskDiffMatch[1]!, taskDiffMatch[2] === "/live", url.searchParams.get("download") === "1");
+			return await serveTaskDiffRoute(req, res, opts.root, taskDiffMatch[1]!, taskDiffMatch[2] === "/live", url.searchParams.get("download") === "1", url.searchParams.get("wave"));
 		}
 		const artifactMatch = /^\/api\/artifacts(?:\/([^/]+))?$/.exec(pathname);
 		if (artifactMatch) {
@@ -246,9 +248,23 @@ async function serveTaskDiffRoute(
 	taskId: string,
 	live: boolean,
 	download: boolean,
+	waveRaw: string | null, // A.7: `?wave=N` — the per-wave isolated diff (computed, never persisted)
 ): Promise<void> {
 	if (live) {
 		const result = await liveTaskDiff(root, taskId);
+		if (!result.ok) {
+			jsonError(res, result.status, result.error, result.detail);
+			return;
+		}
+		res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+		res.end(JSON.stringify(result.payload));
+		return;
+	}
+	if (waveRaw !== null) {
+		// A.7: the per-wave isolated diff — computed between the wave's own recorded
+		// trees on demand; nothing is persisted or downloadable from this scope
+		// (`?download=1` stays the cumulative artifact's).
+		const result = await waveTaskDiff(root, taskId, waveRaw);
 		if (!result.ok) {
 			jsonError(res, result.status, result.error, result.detail);
 			return;

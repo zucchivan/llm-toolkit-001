@@ -36,11 +36,27 @@ export interface LiveDiffPayload {
 	note?: string;
 }
 
+/** The A.7 wave payload (GET /api/tasks/:id/diff?wave=N). */
+export interface WaveDiffPayload {
+	at: number;
+	task: string;
+	wave: number;
+	startTreeSha: string;
+	endTreeSha: string;
+	bytes: number;
+	truncated: boolean;
+	diff: string;
+	stats: DiffStats;
+	note?: string;
+}
+
 /** One normalized diff doc for the drawer (either endpoint). */
 export interface DiffDoc {
 	task: string;
 	wave?: number;
 	live: boolean;
+	/** A.7: true when this doc is a single wave's isolated delta (a wave-scope request) */
+	isolated?: boolean;
 	diff: string;
 	bytes: number;
 	truncated: boolean;
@@ -49,6 +65,9 @@ export interface DiffDoc {
 	statsFiles?: DiffStats["files"];
 	note?: string;
 	baselineTreeSha?: string;
+	/** A.7: the wave's own trees when the doc is wave-scoped */
+	startTreeSha?: string;
+	endTreeSha?: string;
 }
 
 export function normalize(live: LiveDiffPayload): DiffDoc {
@@ -61,6 +80,22 @@ export function normalize(live: LiveDiffPayload): DiffDoc {
 		truncated: live.truncated,
 		statsFiles: live.stats.files,
 		...(live.note !== undefined ? { note: live.note } : {}),
+	};
+}
+
+export function normalizeWaveDiff(w: WaveDiffPayload): DiffDoc {
+	return {
+		task: w.task,
+		wave: w.wave,
+		live: false,
+		isolated: true,
+		diff: w.diff,
+		bytes: w.bytes,
+		truncated: w.truncated,
+		statsFiles: w.stats.files,
+		...(w.note !== undefined ? { note: w.note } : {}),
+		startTreeSha: w.startTreeSha,
+		endTreeSha: w.endTreeSha,
 	};
 }
 
@@ -119,6 +154,13 @@ export async function fetchTaskDiff(task: string): Promise<TaskDiffPayload> {
 	const res = await fetch(`/api/tasks/${encodeURIComponent(task)}/diff`);
 	if (!res.ok) throw new Error(await errorMessage(res) || `HTTP ${res.status}`);
 	return (await res.json()) as TaskDiffPayload;
+}
+
+/** GET /api/tasks/:id/diff?wave=N (A.7): one wave's isolated delta between its own recorded trees. */
+export async function fetchWaveDiff(task: string, wave: number): Promise<WaveDiffPayload> {
+	const res = await fetch(`/api/tasks/${encodeURIComponent(task)}/diff?wave=${wave}`);
+	if (!res.ok) throw new Error(await errorMessage(res) || `HTTP ${res.status}`);
+	return (await res.json()) as WaveDiffPayload;
 }
 
 /** GET /api/tasks/:id/diff/live: computed vs the baseline; 409 when not in-flight. */

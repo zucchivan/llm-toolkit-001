@@ -5,6 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { parseUnifiedDiff, cumulativeLabel, statusLabel, DIFF_FILE_LINE_CAP, type DiffHunk } from "../src/lib/diff.ts";
+import { normalizeWaveDiff } from "../src/lib/api.ts";
 
 const SIMPLE = `diff --git a/src/list.ts b/src/list.ts
 index 1111111..2222222 100644
@@ -128,5 +129,49 @@ ${many}`;
 		const hunk: DiffHunk = file.hunks[0]!;
 		expect(file.insertions).toBe(2500);
 		expect(hunk.lines).toHaveLength(2500); // parser keeps data; the VIEWER caps rendering
+	});
+});
+
+describe("A.7 wave payload → DiffDoc (normalizeWaveDiff)", () => {
+	it("shapes a wave payload: isolated flag, wave number, plain stats, trees echoed", () => {
+		const doc = normalizeWaveDiff({
+			at: 1,
+			task: "t1",
+			wave: 2,
+			startTreeSha: "a".repeat(40),
+			endTreeSha: "b".repeat(40),
+			bytes: 12,
+			truncated: false,
+			diff: "diff-text",
+			stats: { files: [{ path: "src/x.ts", status: "M", insertions: 1, deletions: 1, binary: false }], totalInsertions: 1, totalDeletions: 1 },
+		});
+		expect(doc).toEqual(
+			expect.objectContaining({
+				task: "t1",
+				wave: 2,
+				live: false,
+				isolated: true,
+				diff: "diff-text",
+				bytes: 12,
+				statsFiles: [{ path: "src/x.ts", status: "M", insertions: 1, deletions: 1, binary: false }],
+				startTreeSha: "a".repeat(40),
+				endTreeSha: "b".repeat(40),
+			}),
+		);
+		expect(doc.note).toBeUndefined();
+
+		const quiet = normalizeWaveDiff({ ...{
+			at: 1,
+			task: "t1",
+			wave: 2,
+			startTreeSha: "a".repeat(40),
+			endTreeSha: "b".repeat(40),
+			bytes: 0,
+			truncated: false,
+			diff: "",
+			stats: { files: [], totalInsertions: 0, totalDeletions: 0 },
+		}, note: "no display diff (nothing changed outside engine-owned paths)" });
+		expect(quiet.note).toMatch(/no display diff/);
+		expect(quiet.diff).toBe("");
 	});
 });

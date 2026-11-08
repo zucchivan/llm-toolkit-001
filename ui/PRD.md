@@ -237,8 +237,13 @@ authoritative gate.
   are excluded from display and stats.
 - **Semantics:** because retries do not reset the tree, the per-task patch is
   cumulative since the task baseline (all attempts), not "only the last wave".
-  The UI labels it "task diff" and shows the wave count. Per-wave isolated
-  diffs are deferred (proposal drafted: Appendix A.7 — not implemented).
+  The UI labels it "task diff" and shows the wave count.
+- **Wave scope (A.7, shipped 0.8.0):** when a wave's rows carry recorded
+  trees, the drawer offers that wave's own delta — the difference between
+  the wave's start and end trees — labeled "wave N — isolated to this
+  wave". Computed on demand, never persisted; not isolatable (older rows,
+  failed capture, still-running wave) answers a plain-words refusal; the
+  cumulative view stays the default.
 
 ### 7.5 Conversation visibility
 
@@ -412,6 +417,7 @@ JSON errors: `{ error: string, detail?: string }` with the listed status codes.
 | GET | `/api/jobs/:id/log` | tail of a job log (`?n=200`, max 5000 lines) |
 | POST | `/api/actions` | `{ kind, ...params }` → `202 { jobId }` |
 | GET | `/api/tasks/:id/diff` | persisted patch + stats; `404` if none |
+| GET | `/api/tasks/:id/diff?wave=N` | A.7 per-wave isolated diff between the wave's recorded trees; computed on demand, never persisted; `400` bad wave, `409` not isolatable (plain reason) |
 | GET | `/api/tasks/:id/diff/live` | live patch vs baseline; `409` if not running |
 | GET | `/api/conversations/:id/entries` | A.5 bounded transcript excerpt (≤ 2,000 entries; storage-mode lock-per-read; `404` unknown id, `409` while a run owns the lock) |
 | GET | `/api/project/sources` | M5 read-only source viewers' data — M5-a: config + PRD; M5-b: PROMPT.md (fixed root path) + `evals/recipes.toml` (the engine gate loader's verdict; absence = defined empty-gates state). Raw text + verdicts; static files, no lock, ≤ 5 MiB text, `binary` labeled; there is NO mutation route for these files (§5) |
@@ -675,7 +681,7 @@ together with the milestone that consumes it.
 ## 18. Deferred (explicitly not v1)
 
 - Read-only conversation transcript drawer (first fast-follow).
-- Per-wave isolated diffs (wave-start snapshots) — proposed, not implemented (Appendix A.7).
+- Per-wave isolated diffs — shipped in ui 0.8.0 (Appendix A.7; kit 0.2.3).
 - Light theme.
 - Browser notifications (opt-in Notification API).
 - LAN/Tailscale access with the same token model.
@@ -707,7 +713,7 @@ together with the milestone that consumes it.
 | alerts | in-page + tab-title badge |
 | execution | vertical slices, walking skeleton first |
 | attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
-| per-wave isolated diffs | proposed, not implemented (Appendix A.7, drafted alongside 0.7.1): wave start/end rows gain an optional additive `treeSha` (throwaway-index capture inside the engine's existing windows), a tree-to-tree display wrapper with the A.2 exclusions/caps, and `GET /api/tasks/:id/diff?wave=N` labeled per-wave; a failed wave capture degrades to an unlabeled wave, never a failed run; no rollback/delivery/CLI change — awaiting the explicit kit go-ahead |
+| per-wave isolated diffs | shipped as Appendix A.7 (drafted alongside 0.7.1, implemented at the explicit go-ahead in the same wrap-up): wave start/end rows carry the wave's own git tree (optional additive `treeSha`; failed capture → row without the field, never a failed run; quarantine captures BEFORE the rollback), a tree-to-tree display wrapper with the A.2 exclusions/caps, readout spans echo start/end trees, and `GET /api/tasks/:id/diff?wave=N` + a wave selector in the drawer — the isolated view is labeled, the cumulative default stays, display diffs are never a rollback input (kit 0.2.3; readout.seam stays 1) |
 
 ## Appendix A — Core seam (required, additive)
 
@@ -788,11 +794,11 @@ semantics, config, docs, or CLI output for users who never open the UI.
 - `KitReadout` gains an additive `delivery` section: `mode` — the configured `delivery.mode` (§4.6: `none | commit | pr`) — and `rows` — the wave log's kind `"delivery"` rows echoed as plain JSON-able shapes (`ts`, `task`, `verb`, `wave?`, `detail?`). Both modes serve it: storage reads the mode from the open config; side-car mode best-effort re-reads `.orch/config.toml` (a static file, not the owned storage) and omits `mode` when the config itself is unreadable, while the outcome rows still come from the wave log.
 - Read-only, and deliberately WITHOUT a UI mutation: per §5 delivery stays a config + CLI decision. The CLI's only delivery paths are the config's `delivery.mode` and the `--deliver` run qualifier the `pr` mode requires (a per-run override of what a human typed, not a safe toggle) — exposing either as an action would be the §5 non-goal and a §7.2 action-table change. No config write, no new CLI flag/command, no behavior change when the UI is absent. Delivery/config editing stays deferred to M5 (§18). Seam version stays `readout.seam = 1` (A.6 is additive surface, not a new seam version).
 
-### A.7 — Per-wave isolated diffs (PROPOSAL — additive; written, NOT implemented)
+### A.7 — Per-wave isolated diffs (additive; shipped — kit 0.2.3 + ui 0.8.0)
 
-Drafted during the 0.7.1 wrap-up. This section is a proposal only: it touches
-the engine's wave rows, so it stays unwritten until an explicit kit go-ahead
-is given. Until then §18's deferral and §7.4's cumulative label stand.
+Drafted during the 0.7.1 wrap-up; implemented at the owner's explicit
+go-ahead in the same wrap-up (the kit 0.2.3 seam + this UI's 0.8.0 route and
+drawer).
 
 - **The gap:** the engine already snapshots a git tree per task baseline
   (throwaway index; the project's real index is never touched —
@@ -805,7 +811,12 @@ is given. Until then §18's deferral and §7.4's cumulative label stand.
   rows (`WaveRow` gains `treeSha?: string`). Old readers ignore the field;
   no CLI output, config, or docs change. Cost: two throwaway-index git
   snapshots per wave; the objects live in `.git` — no new artifact dir, no
-  retention policy beyond git's own.
+  retention policy beyond git's own. A quarantine captures the wave's
+  produced tree BEFORE its rollback, so the isolated diff names the wave's
+  evidence, not the empty post-restore tree. Shipped-out fix: the throwaway
+  index is now uniquely named and removed after each capture (a pid-named,
+  never-removed one leaked staged state between captures, so files deleted
+  between captures wrongly survived every later tree).
 - **Display wrapper (additive):** `util/git.ts` gains a tree-to-tree diff +
   stats wrapper with the A.2 exclusions and caps (`.orch/**`, `router.md`,
   `PROMPT.md` excluded; 5 MiB cap, `truncated: true`), endpoints being
@@ -813,8 +824,8 @@ is given. Until then §18's deferral and §7.4's cumulative label stand.
   untracked-relevant states already captured in the trees). Existing
   `savePatch` semantics are unchanged; rollback still uses `restoreTree`.
 - **Read path:** wave-log rows and the readout's wave timeline spans pass
-  `treeSha` through as plain JSON-able shapes (the A.6 echo style). `seam`
-  stays 1: additive surface only.
+  `treeSha` through as plain JSON-able shapes (`startTreeSha`/`endTreeSha`; the
+  A.6 echo style). `seam` stays 1: additive surface only.
 - **UI (§7.4 gains a wave scope):** `GET /api/tasks/:id/diff?wave=N` serves
   wave N's isolated patch + stats — the wave's end tree vs its start tree
   (both recorded by that same wave's rows) — computed on demand, stored

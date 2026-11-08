@@ -2,6 +2,10 @@
  * Diff + artifact HTTP contract tests (§11.2/§11.4 + Appendix A.2/A.3):
  *   GET /api/tasks/:id/diff        persisted patch + parsed stats; 404 when absent;
  *                                  400 on a traversal-shaped task id
+ *   GET /api/tasks/:id/diff?wave=N A.7 per-wave isolated diff: computed between
+ *                                  the wave's own recorded trees (409 plain-words
+ *                                  when not isolatable; 200 empty + note when the
+ *                                  wave's delta is engine-owned-only churn)
  *   GET /api/tasks/:id/diff/live   200 mid-wave vs the task baseline (exclusions
  *                                  still applied); empty 200 before anything writes;
  *                                  409 when the task is not the in-flight one
@@ -265,6 +269,82 @@ describe("GET /api/artifacts (§11.4)", () => {
 		expect(bad.status).toBe(400);
 		const missing = await get("/api/artifacts/no-such-thing.log");
 		expect(missing.status).toBe(404);
+	});
+});
+
+describe("GET /api/tasks/:id/diff?wave=N (A.7 per-wave isolated)", () => {
+	beforeAll(async () => {
+		// A real wave history for task "wtest" — trees captured the way the engine
+		// does (captureBaselineTree), rows appended to the side-car log:
+		//   wave 1: src/wave.ts appears inside the wave (its own delta)
+		//   wave 2: engine-owned-only churn inside the wave (router.md) → 200 empty
+		//   wave 3: rows without treeSha (the capture-failed posture)
+		//   wave 4: a start row with a tree but no end row yet
+		await mkdir(join(root, "src"), { recursive: true });
+		const w1Start = await captureBaselineTree(root);
+		await writeFile(join(root, "src", "wave.ts"), "export const w = 1;\n", "utf8");
+		const w1End = await captureBaselineTree(root);
+		const w2Start = await captureBaselineTree(root);
+		await writeFile(join(root, "router.md"), "router mirror churn inside wave 2\n", "utf8");
+		const w2End = await captureBaselineTree(root);
+		const rows = [
+			{ ts: 1_000, kind: "wave", task: "wtest", wave: 1, verb: "start", treeSha: w1Start },
+			{ ts: 1_100, kind: "wave", task: "wtest", wave: 1, verb: "end", detail: "approved", treeSha: w1End },
+			{ ts: 2_000, kind: "wave", task: "wtest", wave: 2, verb: "start", treeSha: w2Start },
+			{ ts: 2_100, kind: "wave", task: "wtest", wave: 2, verb: "end", detail: "approved", treeSha: w2End },
+			{ ts: 3_000, kind: "wave", task: "wtest", wave: 3, verb: "start" },
+			{ ts: 3_100, kind: "wave", task: "wtest", wave: 3, verb: "end", detail: "approved" },
+			{ ts: 4_000, kind: "wave", task: "wtest", wave: 4, verb: "start", treeSha: w2Start },
+		];
+		const logPath = join(root, ".orch", "wave-log.jsonl");
+		const prior = await readFile(logPath, "utf8").catch(() => "");
+		await writeFile(logPath, prior + rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+	});
+
+	it("400 on a wave that is not a positive integer", async () => {
+		const nope = await get("/api/tasks/wtest/diff?wave=nope");
+		expect(nope.status).toBe(400);
+		expect(((await nope.json()) as { error: string }).error).toMatch(/positive integer/);
+		const zero = await get("/api/tasks/wtest/diff?wave=0");
+		expect(zero.status).toBe(400);
+	});
+
+	it("409 in plain words when the wave has no recorded trees (end-tree missing / start-tree missing)", async () => {
+		const none = await get("/api/tasks/never-existed/diff?wave=1");
+		expect(none.status).toBe(409);
+		expect(((await none.json()) as { error: string }).error).toMatch(/no start row in the wave log/);
+
+		const treeless = await get("/api/tasks/wtest/diff?wave=3");
+		expect(treeless.status).toBe(409);
+		expect(((await treeless.json()) as { error: string }).error).toMatch(/tree was not captured/);
+	});
+
+	it("409 when the wave has no end row yet (still running or cut short mid-flight)", async () => {
+		const running = await get("/api/tasks/wtest/diff?wave=4");
+		expect(running.status).toBe(409);
+		const why = ((await running.json()) as { error: string }).error;
+		expect(why).toMatch(/no end row yet/);
+		expect(why).toMatch(/live diff/);
+	});
+
+	it("200 isolated: exactly the wave's own delta, trees echoed back", async () => {
+		const wave1 = await get("/api/tasks/wtest/diff?wave=1");
+		expect(wave1.status).toBe(200);
+		const body = (await wave1.json()) as { startTreeSha: string; endTreeSha: string; diff: string; stats: { files: { path: string }[] }; truncated: boolean; note?: string };
+		expect(body.stats.files.map((f) => f.path)).toEqual(["src/wave.ts"]);
+		expect(body.diff).toContain("wave.ts");
+		expect(body.startTreeSha).toMatch(/^[0-9a-f]{40}$/);
+		expect(body.endTreeSha).toMatch(/^[0-9a-f]{40}$/);
+		expect(body.note).toBeUndefined();
+	});
+
+	it("200 with a stated empty when the wave's raw delta is engine-owned-only churn", async () => {
+		const wave2 = await get("/api/tasks/wtest/diff?wave=2");
+		expect(wave2.status).toBe(200);
+		const body = (await wave2.json()) as { diff: string; note?: string; truncated: boolean };
+		expect(body.diff).toBe("");
+		expect(body.truncated).toBe(false);
+		expect(body.note).toMatch(/no display diff/);
 	});
 });
 

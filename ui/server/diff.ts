@@ -15,9 +15,10 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve as resolvePath, sep } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
-import { computeDisplayPatch, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
+import { computeDisplayPatch, diffDisplayTrees, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
 import type { DiffStats, DisplayDiffStats } from "../../src/util/git.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
+import type { WaveRow } from "../../src/engine/infos.ts";
 
 /** §11.4: artifact (and task-id) names stay inside this class; anything with
  *  separators or outside it is `400` (path traversal → 400, never a peek). */
@@ -199,6 +200,116 @@ export async function liveTaskDiff(root: string, taskId: string): Promise<Api<Li
 			diff: computed.text,
 			stats: computed.stats,
 		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Per-wave isolated diffs (Appendix A.7)
+// ---------------------------------------------------------------------------
+
+export interface WaveDiffPayload {
+	at: number;
+	task: string;
+	wave: number;
+	/** the wave start row's treeSha */
+	startTreeSha: string;
+	/** the wave end row's treeSha */
+	endTreeSha: string;
+	/** response diff bytes (≤ 5 MiB cap) */
+	bytes: number;
+	truncated: boolean;
+	/** patch TEXT between the wave's own trees; "" + note when nothing to show */
+	diff: string;
+	stats: DiffStats;
+	note?: string;
+}
+
+/** `?wave=` validation: a positive integer, never a doc reference. */
+export function validateWaveNumber(raw: unknown): { ok: true; wave: number } | { ok: false; status: 400; error: string } {
+	if (typeof raw !== "string" || !/^[1-9][0-9]*$/.test(raw)) {
+		return { ok: false, status: 400, error: `bad wave ${JSON.stringify(raw)} — expected a positive integer (e.g. ?wave=2), the wave number the task's wave count reports` };
+	}
+	return { ok: true as const, wave: Number(raw) };
+}
+
+/** The wave-log side-car, parsed tolerantly: a torn append skips its line and keeps the rest. */
+async function readWaveRows(root: string): Promise<WaveRow[]> {
+	const raw = await readFile(join(root, ".orch", "wave-log.jsonl"), "utf8").catch(() => undefined);
+	if (raw === undefined) return [];
+	const rows: WaveRow[] = [];
+	for (const line of raw.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			rows.push(JSON.parse(line) as WaveRow);
+		} catch {
+			/* torn append mid-flush: skip the line, keep the rest */
+		}
+	}
+	return rows;
+}
+
+/**
+ * GET /api/tasks/:id/diff?wave=N — A.7's per-wave isolated diff between the
+ * wave's own recorded trees (start row's vs end row's). Reads ONLY the
+ * wave-log side-car + git plumbing between two immutable shas — never
+ * persisted, never a lock, never a rollback input. Rows without treeSha
+ * (pre-seam log, failed capture) and end-row-less waves answer 409 in plain
+ * words; the task's cumulative diff stands as-is.
+ */
+export async function waveTaskDiff(root: string, taskId: string, waveRaw: unknown): Promise<Api<WaveDiffPayload>> {
+	const id = validateTaskId(taskId);
+	if (!id.ok) return id;
+	const wave = validateWaveNumber(waveRaw);
+	if (!wave.ok) return wave;
+	const rows = await readWaveRows(root);
+	const startRow = rows.find((r) => r.kind === "wave" && r.task === taskId && r.wave === wave.wave && r.verb === "start");
+	if (!startRow) {
+		return {
+			ok: false,
+			status: 409,
+			error: `wave ${wave.wave} of task ${taskId} has no start row in the wave log — the log predates seam A.7 or wave ${wave.wave} is not this task's; the task's diff stays cumulative since its baseline`,
+		};
+	}
+	if (!startRow.treeSha) {
+		return {
+			ok: false,
+			status: 409,
+			error: `wave ${wave.wave} of task ${taskId} started but its tree was not captured (the capture failed) — that wave is not isolatable; the task's diff stays cumulative since its baseline`,
+		};
+	}
+	const endRow = rows.find((r) => r.kind === "wave" && r.task === taskId && r.wave === wave.wave && r.verb === "end");
+	if (!endRow) {
+		return {
+			ok: false,
+			status: 409,
+			error: `wave ${wave.wave} of task ${taskId} has no end row yet — the wave is still running or was cut short mid-flight; the in-flight view is the live diff (…/diff/live)`,
+		};
+	}
+	if (!endRow.treeSha) {
+		return {
+			ok: false,
+			status: 409,
+			error: `wave ${wave.wave} of task ${taskId} ended but its end tree was not captured (the capture failed) — that wave is not isolatable; the task's diff stays cumulative since its baseline`,
+		};
+	}
+	const computed = await diffDisplayTrees(root, startRow.treeSha, endRow.treeSha);
+	const base = {
+		at: Date.now(),
+		task: taskId,
+		wave: wave.wave,
+		startTreeSha: startRow.treeSha,
+		endTreeSha: endRow.treeSha,
+		stats: computed.stats,
+	};
+	if (!computed.ok) {
+		return {
+			ok: true as const,
+			payload: { ...base, bytes: 0, truncated: false, diff: "", note: computed.reason ?? "no isolated wave diff" },
+		};
+	}
+	return {
+		ok: true as const,
+		payload: { ...base, bytes: computed.bytes, truncated: computed.truncated, diff: computed.text },
 	};
 }
 
