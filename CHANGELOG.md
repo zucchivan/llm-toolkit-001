@@ -2,6 +2,57 @@
 
 Manual semver discipline: keep `package.json` version and the newest section in sync.
 
+## 0.2.2 — 2026-11-07
+
+- **UI seam A.2/A.3 — display diffs (consumed by `ui/` 0.3.0, additive)**:
+  - every task that reaches `done` writes `.orch/artifacts/task-<id>.patch`
+    plus a stats side-car `task-<id>.json` BEFORE delivery, and every
+    `quarantined` task keeps its `quarantined-<id>-w<N>.patch` and gains the
+    matching `.json` side-car; reduces to the same `savePatch` throwaway-index
+    semantics with a display wrapper (`src/util/git.ts`
+    `computeDisplayPatch`/`saveDisplayPatch`):
+    - engine-owned paths excluded (`.orch/**`, `router.md`, `PROMPT.md`),
+    - 5 MiB cap (capped patch stored, `truncated: true` in stats),
+    - stats via `git diff --numstat/--name-status` vs the baseline tree
+      (untracked included, binary flagged),
+    - ROLLBACK never reads these patches (`restoreTree` keeps the tree truth).
+  - the per-task patch is CUMULATIVE since the baseline (retries don't reset
+    the tree); it is rewritten at each terminal outcome.
+  - `status.json` task entries carry `baselineTreeSha` (A.3) so an attached
+    process can compute a live diff vs the baseline while a run owns the lock;
+    the side-car's `wave-running` phase is now sticky across wave-internal
+    commits (budget/verifier rows) so elapsed/live views stay truthful.
+  - `readout()` gains `seam`'s `tasks[].diff` refs (`{ task, patch, stats?,
+    bytes, truncated }`) and a `"diff"` artifact kind in both modes; no DB
+    migration, no wave-log rows, no CLI output changes.
+  - fix: the wave driver's `quarantine()` now receives the in-scope baseline
+    (a wave-1 quarantine previously saw the stale task object and silently
+    skipped the evidence patch; visible only when retryLimit = 0).
+- No behavior change for users without the UI: the whole root suite
+  (guards/breakers/e2e.smoke/inspect) passes unchanged.
+
+## 0.2.1 — 2026-11-06
+
+- **fix**: a run whose queue drained with quarantined tasks no longer reports
+  plain success — the terminal check counted terminal `quarantined` tasks as
+  "done", so a fully-rolled-back session read `exit "complete"` with router
+  doc phase "complete" and the green `STATUS: COMPLETE` line. Now:
+  - a quarantine-free drain is unchanged: exit "complete", phase
+    "complete", wave-log detail "queue empty", CLI `STATUS: COMPLETE`
+  - drained with ≥1 quarantined → the run stops short (mirroring
+    arrived-blocked): `RunSummaryInfo` gains `quarantined: string[]` with
+    `complete` staying false (exit keeps its plain value — the id list is the
+    truth), the router doc phase does NOT advance to "complete",
+    status.json surfaces `complete — N task(s) quarantined: t3, t7`, the
+    terminal wave-log row carries `queue empty; quarantined: t3, t7`, and the
+    run-end console line names the quarantined ids (exit code stays 0) — no
+    more bare "run stopped" line for the stop-short case; new progress event
+    kind `quarantine-stop` with the ids
+  - `statusPhase.message` now actually reaches `.orch/status.json` (the
+    payload shape always declared `message`; `postCommit` dropped it)
+  - todo tasks merely blocked by quarantined dependencies keep the existing
+    arrived-blocked path; the `--tasks` filtered stop is untouched
+
 ## 0.2.0 — 2026-11-06
 
 - **visibility**: one read-only `readout()` seam (`src/engine/inspector.ts`) that

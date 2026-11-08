@@ -8,7 +8,7 @@
  */
 import { mkdir, readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { readJson } from "../util/fsx.ts";
+import { atomicWriteJson, readJson } from "../util/fsx.ts";
 import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock } from "./harness.ts";
@@ -20,7 +20,8 @@ import type { GateOutcome } from "./gates.ts";
 import { runVerify, gateSummaryText } from "./verifier.ts";
 import type { VerifyResult } from "./verifier.ts";
 import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, waitOutSleep } from "./governor.ts";
-import { captureBaselineTree, restoreTree, savePatch, changedFilesVsTree } from "../util/git.ts";
+import { captureBaselineTree, restoreTree, saveDisplayPatch, changedFilesVsTree } from "../util/git.ts";
+import type { DisplayDiffStats } from "../util/git.ts";
 import { runDelivery } from "./delivery.ts";
 import type { ProgressEvent } from "./driver-events.ts";
 
@@ -41,8 +42,12 @@ Discipline:
 
 export function pickNextTask(tasks: readonly RouterTask[]): RouterTask | undefined {
 	const doneOrGone = new Set(tasks.filter((t) => t.status === "done").map((t) => t.id));
+	// UI seam A.1: waves set their task in_progress while running (and reset it at
+	// every wave end), so a run killed mid-wave leaves exactly one in_progress
+	// task behind. Resuming it is durability as before — `run --approve` picks it
+	// up; omitting in_progress here would turn every crashed wave into a dead end.
 	const candidates = tasks.filter(
-		(t) => t.status === "todo" && t.dependsOn.every((d) => doneOrGone.has(d)),
+		(t) => (t.status === "todo" || t.status === "in_progress") && t.dependsOn.every((d) => doneOrGone.has(d)),
 	);
 	if (candidates.length === 0) return undefined;
 	candidates.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
@@ -70,6 +75,11 @@ export interface RunSummaryInfo {
 	exit: DriverExit;
 	ranWaves: number[];
 	complete: boolean;
+	/** Arrived-stop extra: task ids that ended "quarantined" when the queue
+	 *  drained. Non-empty means the run stopped short of a clean complete —
+	 *  i.e. exit "complete" with complete=false (never a plain success);
+	 *  empty means the only terminal stop (or a non-terminal exit). */
+	quarantined: string[];
 	alert?: string;
 }
 
@@ -118,7 +128,7 @@ export async function runWaves(
 	const slept = await waitOutSleep(kit);
 	if (slept) await recomputeSpent(kit);
 
-	const summary: RunSummaryInfo = { exit: "complete", ranWaves: [], complete: false };
+	const summary: RunSummaryInfo = { exit: "complete", ranWaves: [], complete: false, quarantined: [] };
 
 	for (;;) {
 		const stateNow = await readSessionState(kit.loop.harness);
@@ -126,6 +136,24 @@ export async function runWaves(
 		if (!options.tasksFilter.length) {
 			const done = routerTasks.every((t) => t.status !== "todo" && t.status !== "in_progress");
 			if (done) {
+				// "quarantined" is terminal and rides the check above — a drained
+				// queue that still has quarantined members is NOT a plain success:
+				// stop short instead, mirroring "arrived-blocked" (no router phase
+				// change; exit stays "complete" while complete=false + the ids
+				// below carry the truth).
+				const quarantinedIds = routerTasks.filter((t) => t.status === "quarantined").map((t) => t.id);
+				if (quarantinedIds.length) {
+					summary.complete = false;
+					summary.quarantined = quarantinedIds;
+					const quarantinedText = `${quarantinedIds.length} task(s) quarantined: ${quarantinedIds.join(", ")}`;
+					emit({ kind: "quarantine-stop", quarantined: quarantinedIds, message: `the task queue drained with ${quarantinedText}` });
+					await commitState(kit, {
+						// no router phase change: only a clean (quarantine-free) drain is "complete"
+						statusPhase: { phase: "idle", message: `complete — ${quarantinedText}` },
+						rows: [{ ts: Date.now(), kind: "wave", task: "session", verb: "complete", detail: `queue empty; quarantined: ${quarantinedIds.join(", ")}` }],
+					});
+					break;
+				}
 				summary.complete = true;
 				summary.exit = "complete";
 				emit({ kind: "complete", message: "STATUS: COMPLETE — the task queue is empty" });
@@ -266,6 +294,18 @@ export async function driveTaskWaves(
 
 		const promptMd = await readFile(join(paths.root, "PROMPT.md"), "utf8").catch(() => undefined);
 		const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
+		// UI seam A.1, at wave start (before the run is submitted): task → in_progress,
+		// wave-log start row (`ts` IS startedAt), and a wave-running status.json with
+		// task/wave/startedAt so an attached UI shows the live wave without storage.
+		const startedAt = Date.now();
+		await commitState(kit, {
+			router: (d) => {
+				const t = d.tasks.find((x) => x.id === task.id)!;
+				t.status = "in_progress";
+			},
+			rows: [{ ts: startedAt, kind: "wave", task: task.id, wave, verb: "start" }],
+			statusPhase: { phase: "wave-running", task: task.id, wave, startedAt },
+		});
 		const outcomeWave = await convKit.submitAndAwait(conv, `${task.id}-w${wave}`, waveInput);
 
 		const warnRows: WaveRow[] = [];
@@ -285,12 +325,18 @@ export async function driveTaskWaves(
 			const reason = outcomeWave.reason ?? "unanswered";
 			const handled = await handleUnanswered(kit, current, wave, reason, outcomeWave.detail, outcomeWave.usage.usd);
 			if (handled === "sleeping") {
+				// UI seam A.1 at wave end: close the wave (sleep is a wave outcome — the
+				// run resumes at a later `run`, never inside this one).
+				await commitState(kit, {
+					rows: [waveEndRow(task.id, wave, "sleeping")],
+					statusPhase: { phase: "idle", message: `${task.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
+				});
 				emit({ kind: "sleeping", taskId: task.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
 				return "sleeping";
 			}
 			if (handled === "budget") return "budget";
 			if (handled === "faulted") {
-				await quarantine(kit, current, wave, `run failed: ${reason}`);
+				await quarantine(kit, current, wave, `run failed: ${reason}`, baseline);
 				continue;
 			}
 			continue; // retried wave under the retry limit
@@ -307,7 +353,7 @@ export async function driveTaskWaves(
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave produced zero file changes" }],
 			});
-			await quarantine(kit, current, wave, "zero progress: no file changes");
+			await quarantine(kit, current, wave, "zero progress: no file changes", baseline);
 			continue;
 		}
 
@@ -321,7 +367,7 @@ export async function driveTaskWaves(
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gate.failHash.slice(0, 12) }],
 			});
-			await quarantine(kit, current, wave, "duplicate failure: identical gate failure hash two waves running");
+			await quarantine(kit, current, wave, "duplicate failure: identical gate failure hash two waves running", baseline);
 			continue;
 		}
 
@@ -333,14 +379,23 @@ export async function driveTaskWaves(
 					t.lastGateHash = gate.failHash;
 					t.waveCount = wave;
 					if (underLimit) {
+						// Wave ends on retry: back to todo so the next wave-start can set
+						// in_progress again (UI seam A.1).
+						t.status = "todo";
 						t.feedback.push({ wave, from: "gate", text: gate.feedbackText, ts: Date.now() } satisfies TaskFeedback);
 					} else {
 						t.status = "quarantined";
 					}
 				},
-				rows: [
-					gateRowFor(task.id, wave, gate),
-				],
+				rows: underLimit
+					? [gateRowFor(task.id, wave, gate), waveEndRow(task.id, wave, "retry: gates failed")]
+					: [gateRowFor(task.id, wave, gate)],
+				// UI seam A.1 at wave end: on retry the wave window closes here (idle);
+				// the next wave's start row re-opens it. Terminal outcomes flush via
+				// quarantine() below.
+				...(underLimit
+					? { statusPhase: { phase: "idle" as const, message: `${task.id} gates failed (wave ${wave}) — retry queued` } }
+					: {}),
 			});
 			emit({
 				kind: "gate-result",
@@ -350,7 +405,7 @@ export async function driveTaskWaves(
 				message: gate.allPassed ? "gates pass" : gate.feedbackText.slice(0, 160),
 			});
 			if (underLimit) continue; // loop to next wave with structured feedback
-			await quarantine(kit, current, wave, "gate failures exhausted the wave retry limit");
+			await quarantine(kit, current, wave, "gate failures exhausted the wave retry limit", baseline);
 			continue;
 		}
 
@@ -371,9 +426,17 @@ export async function driveTaskWaves(
 					t.status = "done";
 					t.waveCount = wave;
 				},
-				rows: [{ ts: Date.now(), kind: "task", task: task.id, wave, verb: "done", verdict: "approve" }],
+				rows: [
+					{ ts: Date.now(), kind: "task", task: task.id, wave, verb: "done", verdict: "approve" },
+					// UI seam A.1: the wave ends here — the span outcome stays "approved".
+					waveEndRow(task.id, wave, "approved"),
+				],
 				statusPhase: { phase: "idle", message: `${task.id} approved (wave ${wave})` },
 			});
+			// UI seam A.2: the task's display patch + stats side-car land in
+			// .orch/artifacts BEFORE delivery — the tree is the task's final state
+			// here (delivery may commit; the patch is cumulative since baseline).
+			await writeTaskDiffArtifacts(kit, task.id, wave, baseline);
 			emit({ kind: "task-done", taskId: task.id, wave, message: `${task.id} verified + approved` });
 			await runDelivery(kit, task.id, wave, { deliverExplicit: opts.deliverExplicit });
 			return "done";
@@ -384,14 +447,25 @@ export async function driveTaskWaves(
 			router: (d) => {
 				const t = d.tasks.find((x) => x.id === task.id)!;
 				t.waveCount = wave;
-				if (canRetry) t.feedback.push({ wave, from: "verifier", text: verdict.notes, ts: Date.now() } satisfies TaskFeedback);
-				else t.status = "quarantined";
+				if (canRetry) {
+					// Wave ends on retry (UI seam A.1): back to todo.
+					t.status = "todo";
+					t.feedback.push({ wave, from: "verifier", text: verdict.notes, ts: Date.now() } satisfies TaskFeedback);
+				} else {
+					t.status = "quarantined";
+				}
 			},
-			rows: [{ ts: Date.now(), kind: "verdict", task: task.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes }],
+			rows: [
+				{ ts: Date.now(), kind: "verdict", task: task.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes },
+				...(canRetry ? [waveEndRow(task.id, wave, "retry: verifier rejected")] : []),
+			],
+			...(canRetry
+				? { statusPhase: { phase: "idle" as const, message: `${task.id} verifier rejected (wave ${wave}) — retry queued` } }
+				: {}),
 		});
 		emit({ kind: "verifier-verdict", taskId: task.id, wave, verdict: verdict.verdict, message: verdict.notes || "(no notes)" });
 		if (canRetry) continue;
-		await quarantine(kit, current, wave, verdict.verdict === "needs_human" ? "verifier needs a human" : "verifier rejects exhausted the retry limit");
+		await quarantine(kit, current, wave, verdict.verdict === "needs_human" ? "verifier needs a human" : "verifier rejects exhausted the retry limit", baseline);
 	}
 }
 
@@ -405,6 +479,37 @@ async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, 
 		model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
 		maxTurns: kit.loop.config.engine.maxTurns,
 	});
+}
+
+/**
+ * UI seam A.2: persist the task's cumulative display patch + stats side-car to
+ * .orch/artifacts (task-<id>.patch / task-<id>.json). Retries never reset the
+ * tree, so the patch spans every attempt since the baseline; each terminal
+ * outcome rewrites both files. Best-effort evidence: a failed write is
+ * swallowed — the loop never breaks for the UI.
+ */
+async function writeTaskDiffArtifacts(kit: LoopAndLock, taskId: string, wave: number, baseline: string | undefined): Promise<void> {
+	if (!baseline) return;
+	const artifacts = kit.loop.paths.artifacts;
+	const patchFile = join(artifacts, `task-${taskId}.patch`);
+	try {
+		const display = await saveDisplayPatch(kit.loop.paths.root, baseline, patchFile);
+		if (!display.ok) return; // nothing displayable — no patch, no stats side-car
+		const stats: DisplayDiffStats = {
+			task: taskId,
+			wave,
+			baselineTreeSha: baseline,
+			generatedAt: Date.now(),
+			files: display.stats.files,
+			totalInsertions: display.stats.totalInsertions,
+			totalDeletions: display.stats.totalDeletions,
+			bytes: display.bytes,
+			truncated: display.truncated,
+		};
+		await atomicWriteJson(join(artifacts, `task-${taskId}.json`), stats);
+	} catch {
+		/* UI-seam evidence only — the run outcome stands on its own */
+	}
 }
 
 /**
@@ -468,16 +573,19 @@ async function handleUnanswered(
 		return "faulted"; // the driver quarantines once
 	}
 	await commitState(kit, {
-		rows,
+		rows: [...rows, waveEndRow(task.id, wave, `retry: run failed: ${reason.slice(0, 120)}`)],
 		router: (d) => {
 			const t = d.tasks.find((x) => x.id === task.id)!;
 			t.waveCount = wave;
+			// UI seam A.1 at wave end: back to todo; the next wave sets in_progress.
+			t.status = "todo";
 			t.feedback.push({ wave, from: "gate", text: `run failed: ${reason}`, ts: Date.now() } satisfies TaskFeedback);
 		},
 		runStatus: (d) => {
 			d.consecutiveErrors = nextCount;
 			d.budgetSpentUsd = Math.max(d.budgetSpentUsd, waveUsd);
 		},
+		statusPhase: { phase: "idle", message: `${task.id} wave ${wave} run failed (${reason.slice(0, 160)}) — retry queued` },
 	});
 	return "retried";
 }
@@ -486,17 +594,38 @@ async function handleUnanswered(
 // Quarantine (§4.2.7): patch the wave's changes, roll back to baseline
 // ---------------------------------------------------------------------------
 
-export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: number, cause: string): Promise<void> {
+export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: number, cause: string, baselineTreeSha?: string): Promise<void> {
 	const paths = kit.loop.paths;
-	const baseline = task.baselineTreeSha;
+	// The caller's in-scope baseline (captured at wave start) beats the stale
+	// task copy: on a wave-1 quarantine the task object predates the capture.
+	// Without this, first-wave quarantines never wrote their evidence patch.
+	const baseline = baselineTreeSha ?? task.baselineTreeSha;
 	let patchFile: string | undefined;
 	if (baseline) {
 		const artifactName = `quarantined-${task.id}-w${wave}.patch`;
 		patchFile = join(paths.artifacts, artifactName);
 		try {
 			await mkdir(dirname(patchFile), { recursive: true });
-			const saved = await savePatch(paths.root, baseline, patchFile);
-			if (!saved) patchFile = undefined;
+			// UI seam A.2: the display wrapper keeps this an evidence artifact
+			// (engine paths excluded, 5 MiB cap) and enables the stats side-car;
+			// rollback itself stays restoreTree — never the (possibly truncated) patch.
+			const saved = await saveDisplayPatch(paths.root, baseline, patchFile);
+			if (saved.ok) {
+				const stats: DisplayDiffStats = {
+					task: task.id,
+					wave,
+					baselineTreeSha: baseline,
+					generatedAt: Date.now(),
+					files: saved.stats.files,
+					totalInsertions: saved.stats.totalInsertions,
+					totalDeletions: saved.stats.totalDeletions,
+					bytes: saved.bytes,
+					truncated: saved.truncated,
+				};
+				await atomicWriteJson(join(paths.artifacts, `quarantined-${task.id}-w${wave}.json`), stats);
+			} else {
+				patchFile = undefined;
+			}
 		} catch {
 			patchFile = undefined;
 		}
@@ -523,6 +652,9 @@ export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: numbe
 				reason: cause,
 				detail: patchFile ? `working tree rolled back to ${baseline!.slice(0, 12)}; patch at ${artifact(patchFile)}` : "working tree rolled back to baseline",
 			},
+			// UI seam A.1: the terminal wave outcome closes the span; detail keeps the
+			// cause so the timeline leaves no dead-end "wave/end" label.
+			waveEndRow(task.id, wave, `quarantined: ${cause.slice(0, 200)}`),
 		],
 		statusPhase: { phase: "idle", message: `${task.id} quarantined: ${cause}` },
 	});
@@ -530,6 +662,13 @@ export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: numbe
 
 function artifact(path: string): string {
 	return path.split("/").slice(-2).join("/");
+}
+
+/** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
+/** UI seam A.1: the close of one (task, wave) — outcome in `detail` so the
+ *  timeline spans keep real start/end times and messages. */
+function waveEndRow(taskId: string, wave: number, outcome: string): WaveRow {
+	return { ts: Date.now(), kind: "wave", task: taskId, wave, verb: "end", detail: outcome };
 }
 
 /** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */

@@ -394,14 +394,25 @@ export interface StatusPayloads {
 	root: string;
 	lockedByPid?: number;
 	phase: "planning" | "wave-running" | "idle" | "closed";
-	task?: { id: string; wave: number; status: string };
+	/** UI seam A.1: `startedAt` rides the wave-running task so an attached UI can
+	 *  render a truthful elapsed timer without storage. */
+	task?: { id: string; wave: number; status: string; startedAt?: number };
 	budget: { spentUsd: number; sessionCeilingUsd: number; waveWarnUsd: number };
-	tasks: { id: string; status: string; waveCount: number; title: string }[];
+	tasks: { id: string; status: string; waveCount: number; title: string;
+		/** UI seam A.2 (additive): the task's baseline tree, so an attached UI can compute a live diff without storage. */
+		baselineTreeSha?: string }[];
 	reports?: ReportRow[];
 	alert?: string;
 	message?: string;
 	/** Session usage estimate at flush time, USD. */
 	usageNote?: number;
+	// --- UI seam A.1 (additive): governor state mirrored so an attached UI can
+	// render it without opening storage while a run owns the lock. ---
+	/** Armed durable sleep deadline (epoch ms) when a rate limit is being waited out. */
+	sleepUntil?: number;
+	consecutiveErrors?: number;
+	sleepCycleCount?: number;
+	prdPath?: string;
 }
 
 export async function flushStated(paths: ProjectPaths, payload: StatusPayloads): Promise<void> {

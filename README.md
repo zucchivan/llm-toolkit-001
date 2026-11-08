@@ -79,8 +79,36 @@ Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 | `verify --task id` | one-off read-only verification incl. your manual edits |
 | `export` | per-project JSON+HTML report from storage into `.orch/artifacts/` |
 | `handoff "note"` | queue a note the driver ingests at the start of the next wave |
+| `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
 Exit codes: `0` done · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` error or lock busy.
+
+## Web UI (sub-product)
+
+`llm-toolkit-001 ui` forwards to the small local control surface that lives in
+`ui/` — it is an independent package with its own version, lockfile, and
+CHANGELOG (nothing is added to this package's dependency footprint). M0 shows
+the truthful live state of one loop: phase, current task/wave + elapsed,
+budget, task table, event-log tail — attaching to runs started in a terminal.
+Install and run it once, from the kit repo root:
+
+```bash
+npm --prefix ui install
+npm --prefix ui run build
+llm-toolkit-001 ui --no-open
+```
+
+See [`ui/README.md`](ui/README.md) and [`ui/PRD.md`](ui/PRD.md); the only core
+changes are the additive `readout.seam = 1` fields (ui/PRD.md Appendix A).
+CI (`.github/workflows/ui.yml`) runs the engine suite and the ui sub-product's
+suites — including the faux e2e against the real CLI — on every push/PR.
+
+The seam now (A.2/A.3) also persists a display-oriented per-task patch + stats
+side-car for every done/quarantined task (`.orch/artifacts/task-<id>.patch` +
+`task-<id>.json`; engine paths excluded, 5 MiB cap, cumulative since baseline,
+never a rollback input — see the 0.2.2 changelog) and carries each task's
+`baselineTreeSha` in `status.json` so the UI's live in-flight diff works while
+the run owns the lock.
 
 ## The cycle
 

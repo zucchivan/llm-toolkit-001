@@ -1,6 +1,9 @@
 /** Git plumbing helpers: baseline tree capture, change detection, rollback, delivery. */
 import { exec } from "./exec.ts";
 import { createHash } from "node:crypto";
+import { mkdir, rm } from "node:fs/promises";
+import { dirname } from "node:path";
+import { spawn } from "node:child_process";
 
 export interface GitResult {
 	ok: boolean;
@@ -246,4 +249,197 @@ export async function savePatch(cwd: string, baseTree: string, outFile: string):
 	if (r.code !== 0 || !r.stdout.trim()) return false;
 	await import("node:fs/promises").then((fs) => fs.writeFile(outFile, r.stdout, "utf8"));
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Display diffs (UI seam Appendix A.2): patch + stats side-car for the UI.
+// Same throwaway-index semantics as savePatch (untracked included, binary
+// allowed, project index untouched), minus what the engine should not show:
+// .orch/** churn, router.md (mirrors the RouterDoc), PROMPT.md (user-edited).
+// A truncated result is DISPLAY ONLY — rollback never reads these patches
+// (restoreTree re-checks-out the baseline tree directly).
+// ---------------------------------------------------------------------------
+
+/** Cap for stored/displayed patches: anything larger is cut and flagged. */
+export const DISPLAY_PATCH_CAP_BYTES = 5 * 1024 * 1024;
+
+/** Engine-owned paths hidden from display diffs + stats (same set the
+ *  zero-progress breaker discounts: .orch/**, router.md, PROMPT.md). */
+export function isEngineOwnedPath(rel: string): boolean {
+	return rel === ".orch" || rel.startsWith(".orch/") || rel === "router.md" || rel === "PROMPT.md";
+}
+
+/** Pathspecs mirroring isEngineOwnedPath (git exclude magic; the all-in `.`
+ *  anchor balances the `:(exclude)` entries). */
+const DISPLAY_DIFF_PATHSPECS: string[] = [
+	"--", ".", ":(exclude).orch", ":(exclude).orch/**", ":(exclude)router.md", ":(exclude)PROMPT.md",
+];
+
+export interface DiffFileStat {
+	path: string;
+	/** git name-status letter: A (added), M (modified), D (deleted), … */
+	status: string;
+	insertions: number;
+	deletions: number;
+	binary: boolean;
+}
+
+/** Per-file stats vs a captured baseline tree (the diff side-car's core). */
+export interface DiffStats {
+	files: DiffFileStat[];
+	totalInsertions: number;
+	totalDeletions: number;
+}
+
+/** The full stats side-car the engine writes next to each display patch. */
+export interface DisplayDiffStats extends DiffStats {
+	task: string;
+	wave: number;
+	baselineTreeSha: string;
+	generatedAt: number;
+	/** Stored patch size in bytes (the cap applies when true). */
+	bytes: number;
+	truncated: boolean;
+}
+
+export interface DisplayPatchOutcome {
+	/** false: nothing to show (empty diff / git failure). */
+	ok: boolean;
+	/** Patch text, cut at DISPLAY_PATCH_CAP_BYTES when truncated. */
+	text: string;
+	/** Bytes actually carried (stored patch size / response size). */
+	bytes: number;
+	/** The raw diff exceeded the cap and was cut (never a rollback input). */
+	truncated: boolean;
+	/** Per-file stats vs the baseline tree (empty when not ok). */
+	stats: DiffStats;
+	/** Why ok is false (diagnostic hint). */
+	reason?: string;
+}
+
+function noDisplayDiff(reason: string): DisplayPatchOutcome {
+	return { ok: false, text: "", bytes: 0, truncated: false, stats: { files: [], totalInsertions: 0, totalDeletions: 0 }, reason };
+}
+
+/**
+ * Full-stream capture for display diffs: `exec` tail-caps at 256 KiB for gate
+ * tails — patches must keep their `diff --git` headers and can reach the 5 MiB
+ * seam cap, so this helper head-caps instead. `overflow` reports bytes beyond
+ * the cap so the caller can set `truncated`.
+ */
+function spawnCapture(argv: string[], cwd: string, timeoutMs: number, maxBytes: number, env?: Record<string, string | undefined>): Promise<{ code: number | null; stdout: string; overflow: boolean; stderr: string }> {
+	return new Promise((done) => {
+		const proc = spawn(argv[0] ?? "", argv.slice(1), {
+			cwd,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: env ? { ...process.env, ...env } : undefined,
+		});
+		const out: Buffer[] = [];
+		let size = 0;
+		let stderr = "";
+		const kill = setTimeout(() => {
+			try {
+				proc.kill("SIGTERM");
+			} catch {
+				/* already exiting */
+			}
+		}, timeoutMs);
+		const decode = (): string => Buffer.concat(out).toString("utf8");
+		proc.stdout!.on("data", (chunk: Buffer) => {
+			size += chunk.length;
+			if (size <= maxBytes) out.push(chunk);
+		});
+		proc.stderr!.on("data", (chunk: Buffer) => {
+			stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+		});
+		proc.on("close", (code) => {
+			clearTimeout(kill);
+			done({ code, stdout: decode(), overflow: size > maxBytes, stderr });
+		});
+		proc.on("error", () => {
+			clearTimeout(kill);
+			done({ code: null, stdout: decode(), overflow: false, stderr });
+		});
+	});
+}
+
+/** numstat + name-status parses against two trees, engine-owned paths excluded. */
+async function statsAgainstTrees(cwd: string, baseTree: string, compareTree: string): Promise<DiffStats> {
+	const [numstat, nameStatus] = await Promise.all([
+		spawnCapture(["git", "diff", "--numstat", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, 32 * 1024 * 1024),
+		spawnCapture(["git", "diff", "--name-status", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, 32 * 1024 * 1024),
+	]);
+	const statuses = new Map<string, string>();
+	if (nameStatus.code === 0) {
+		for (const line of nameStatus.stdout.split("\n")) {
+			if (!line.trim()) continue;
+			const [code, ...paths] = line.split("\t");
+			const path = paths.at(-1);
+			if (code && path) statuses.set(path, code);
+		}
+	}
+	const stats: DiffStats = { files: [], totalInsertions: 0, totalDeletions: 0 };
+	if (numstat.code !== 0) return stats; // the patch already failed upstream; empty, not stale
+	for (const line of numstat.stdout.split("\n")) {
+		if (!line.trim()) continue;
+		const parts = line.split("\t");
+		if (parts.length < 3) continue;
+		const insRaw = parts[0]!;
+		const delRaw = parts[1]!;
+		const path = parts.slice(2).join("\t");
+		const binary = insRaw === "-" || delRaw === "-";
+		const insertions = binary ? 0 : Number.parseInt(insRaw, 10) || 0;
+		const deletions = binary ? 0 : Number.parseInt(delRaw, 10) || 0;
+		stats.files.push({ path, status: statuses.get(path) ?? "?", insertions, deletions, binary });
+		stats.totalInsertions += insertions;
+		stats.totalDeletions += deletions;
+	}
+	return stats;
+}
+
+/**
+ * Free-standing display diff vs a captured baseline tree (the live endpoint's
+ * engine): throwaway index so untracked files enter the diff, engine-owned
+ * paths excluded, capped at DISPLAY_PATCH_CAP_BYTES. Nothing is persisted: the
+ * caller renders (and optionally stores) `text` and decides.
+ */
+export async function computeDisplayPatch(cwd: string, baseTree: string): Promise<DisplayPatchOutcome> {
+	// Unique temp index per call: a live run's own savePatch and any two server
+	// requests must not share index state.
+	const tmpIdx = `${cwd}/.orch/.patch-idx-${process.pid}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+	try {
+		await mkdir(dirname(tmpIdx), { recursive: true });
+		const add = await exec(["git", "add", "-A", "."], { cwd, timeoutMs: 120_000, env: { GIT_INDEX_FILE: tmpIdx } });
+		if (add.code !== 0) return noDisplayDiff(`git add failed: ${(add.stderr || add.stdout).trim().slice(0, 200)}`);
+		const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env: { GIT_INDEX_FILE: tmpIdx } });
+		if (wt.code !== 0) return noDisplayDiff(`git write-tree failed: ${(wt.stderr || wt.stdout).trim().slice(0, 200)}`);
+		const compareTree = wt.stdout.trim();
+		const diff = await spawnCapture(["git", "diff", "--binary", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, DISPLAY_PATCH_CAP_BYTES + 1);
+		if (diff.code !== 0) return noDisplayDiff(`git diff failed: ${(diff.stderr || diff.stdout).trim().slice(0, 200)}`);
+		if (diff.stdout.trim() === "") return noDisplayDiff("no display diff (nothing changed outside engine-owned paths)");
+		// Cap by bytes: slice whole bytes, then drop a UTF-8 rune cut in half.
+		const raw = Buffer.from(diff.stdout, "utf8");
+		const truncated = diff.overflow || raw.length > DISPLAY_PATCH_CAP_BYTES;
+		const capped = truncated ? raw.subarray(0, DISPLAY_PATCH_CAP_BYTES) : raw;
+		const text = capped.toString("utf8").replace(/\uFFFD+$/, "");
+		const stats = await statsAgainstTrees(cwd, baseTree, compareTree);
+		return { ok: true, text, bytes: Buffer.byteLength(text, "utf8"), truncated, stats };
+	} finally {
+		await rm(tmpIdx, { force: true }).catch(() => {});
+		await rm(`${tmpIdx}.lock`, { force: true }).catch(() => {});
+	}
+}
+
+/**
+ * savePatch's display twin: same throwaway-index semantics, but engine-owned
+ * paths excluded, the stored text capped at 5 MiB, and stats captured on the
+ * spot for the side-car. Callers that persist (engine done/quarantine)
+ * assemble the DisplayDiffStats JSON around the returned outcome.
+ */
+export async function saveDisplayPatch(cwd: string, baseTree: string, outFile: string): Promise<DisplayPatchOutcome> {
+	const outcome = await computeDisplayPatch(cwd, baseTree);
+	if (!outcome.ok) return outcome;
+	await mkdir(dirname(outFile), { recursive: true });
+	await import("node:fs/promises").then((fs) => fs.writeFile(outFile, outcome.text, "utf8"));
+	return outcome;
 }

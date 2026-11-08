@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock, ToolRegistration } from "./harness.ts";
-import { commitState } from "./state.ts";
+import { commitState, flushStatusSnapshot } from "./state.ts";
 import { shasum } from "../util/git.ts";
 import type { RouterTask, RouterDocValue } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
@@ -58,6 +58,10 @@ export async function loadPrd(kit: LoopAndLock, prdPathArg?: string): Promise<st
 
 /** Run the one planning conversation and commit "planned" state. */
 export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText: string): Promise<PlanOutcome> {
+	// UI seam A.1: flush { phase: "planning" } BEFORE the conversation starts so an
+	// attached UI sees the live planning state (and keeps the existing planned
+	// commit after the answer). Read-only side-car snapshot, no commit.
+	await flushStatusSnapshot(kitAndLock, { phase: "planning" });
 	const kit = new ConversationKit(kitAndLock, kitAndLock.loop.toolBox);
 	const role = kitAndLock.loop.config.roles.planner;
 	const conv = await kit.createUnit({

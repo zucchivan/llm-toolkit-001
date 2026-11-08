@@ -7,9 +7,10 @@
  */
 import { describe, expect, it, beforeEach } from "vitest";
 import { initProject } from "../src/init.ts";
-import { openProjectHarness } from "../src/engine/harness.ts";
+import { openProjectHarness, type StatusPayloads } from "../src/engine/harness.ts";
 import { readSessionState, commitState } from "../src/engine/state.ts";
 import { runWaves, pickNextTask } from "../src/engine/waves.ts";
+import type { ProgressEvent } from "../src/engine/driver-events.ts";
 import { runVerify, parseVerdictStrict } from "../src/engine/verifier.ts";
 import { runGates } from "../src/engine/gates.ts";
 import { writeGateFile } from "./helpers2.ts";
@@ -17,6 +18,7 @@ import { bakeProject, scripted, accomplish } from "./fixtures2.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { readJson } from "../src/util/fsx.ts";
 
 beforeEach(() => {
 	process.env["NO_COLOR"] = "1";
@@ -96,6 +98,138 @@ describe("breakers (§4.5)", () => {
 		await accomplish(kit);
 		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
 		expect(summary.exit).toBe("budget");
+	});
+});
+
+describe("terminal-stop semantics (drained queue with quarantined ≠ plain success)", () => {
+	const eventsOf = (events: ProgressEvent[], kind: ProgressEvent["kind"]) => events.filter((e) => e.kind === kind);
+	const statusJson = async (root: string) => (await readJson(join(root, ".orch", "status.json"))) as unknown as StatusPayloads;
+	// implementer writes a real file then COMPLETES; verifier approves
+	const donePlaylist = (path: string, content: string) => [
+		fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" }),
+		fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "diff satisfies the criterion" }), { stopReason: "stop" }),
+	];
+
+	it("all tasks quarantined → run stops short: complete=false, ids surfaced, no router phase 'complete', wave-log row names them", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [
+				{ id: "t1", title: "x", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 2 },
+				{ id: "t2", title: "y", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 },
+			] }), { stopReason: "stop" }),
+			// both implementers produce zero file changes → immediate quarantine
+			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
+			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
+		], models.faux);
+		await accomplish(kit);
+
+		const events: ProgressEvent[] = [];
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] }, (e) => events.push(e));
+		// Exit vocabulary is unchanged by design (the quarantine-free drain keeps
+		// exit "complete"); the stop-short truth rides complete=false + the ids.
+		expect(summary.exit).toBe("complete");
+		expect(summary.complete).toBe(false);
+		expect([...summary.quarantined].sort()).toEqual(["t1", "t2"]);
+		// the terminal event names the quarantined ids (not a plain success)
+		const stops = eventsOf(events, "quarantine-stop");
+		expect(stops).toHaveLength(1);
+		expect(stops[0]).toMatchObject({ quarantined: expect.arrayContaining(["t1", "t2"]) });
+		expect(eventsOf(events, "complete")).toHaveLength(0);
+		// router phase does NOT advance to "complete" (mirrors arrived-blocked)
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.router.phase).toBe("running");
+		expect(state.router.tasks.map((t) => t.status)).toEqual(["quarantined", "quarantined"]);
+		// the final wave-log row names the ids in the existing row style
+		const lastRow = state.rows[state.rows.length - 1]!;
+		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "complete" });
+		expect(lastRow.detail).toContain("queue empty; quarantined: t1, t2");
+		// status.json surfaces the truth via statusPhase
+		const payload = await statusJson(project.root);
+		expect(payload.phase).toBe("idle");
+		expect(payload.message).toContain("2 task(s) quarantined: t1, t2");
+		// CLI-withheld exit code contract: not "sleeping" (which maps to 42)
+		expect(summary.exit).not.toBe("sleeping");
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("mixed done + quarantined → same stop-short treatment", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [
+				{ id: "t1", title: "good", spec: "write src/one.ts with the module.", dependsOn: [], acceptance: ["When src/one.ts exists, the system shall compile."], targetPaths: ["src/"], priority: 5 },
+				{ id: "t2", title: "stalled", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 },
+			] }), { stopReason: "stop" }),
+			...donePlaylist("src/one.ts", "export const one = 1;\n"),
+			// t2 writes nothing → quarantined
+			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
+		], models.faux);
+		await accomplish(kit);
+
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		expect(summary.exit).toBe("complete");
+		expect(summary.complete).toBe(false);
+		expect(summary.quarantined).toEqual(["t2"]);
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.router.phase).toBe("running"); // not "complete"
+		expect(state.router.tasks.find((t) => t.id === "t1")?.status).toBe("done");
+		expect(state.router.tasks.find((t) => t.id === "t2")?.status).toBe("quarantined");
+		const lastRow = state.rows[state.rows.length - 1]!;
+		expect(lastRow.detail).toContain("queue empty; quarantined: t2");
+		const payload = await statusJson(project.root);
+		expect(payload.message).toContain("1 task(s) quarantined: t2");
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("todo blocked by a quarantined dependency → still arrived-blocked (unchanged)", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [
+				{ id: "t1", title: "x", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 2 },
+				{ id: "t2", title: "y", spec: "needs t1", dependsOn: ["t1"], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 },
+			] }), { stopReason: "stop" }),
+			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
+		], models.faux);
+		await accomplish(kit);
+
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		expect(summary.exit).toBe("arrived-blocked");
+		expect(summary.complete).toBe(false);
+		expect(summary.quarantined).toEqual([]); // arrived-blocked path untouched by the fix
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.router.phase).toBe("running");
+		expect(state.router.tasks.find((t) => t.id === "t2")?.status).toBe("todo");
+		void project;
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("all tasks done and none quarantined → still the plain complete", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [
+				{ id: "t1", title: "one", spec: "write src/one.ts with the module.", dependsOn: [], acceptance: ["When src/one.ts exists, the system shall compile."], targetPaths: ["src/"], priority: 1 },
+			] }), { stopReason: "stop" }),
+			...donePlaylist("src/one.ts", "export const one = 1;\n"),
+		], models.faux);
+		await accomplish(kit);
+
+		const events: ProgressEvent[] = [];
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] }, (e) => events.push(e));
+		expect(summary.exit).toBe("complete");
+		expect(summary.complete).toBe(true);
+		expect(summary.quarantined).toEqual([]);
+		expect(eventsOf(events, "complete")).toHaveLength(1);
+		expect(eventsOf(events, "quarantine-stop")).toHaveLength(0);
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.router.phase).toBe("complete");
+		const lastRow = state.rows[state.rows.length - 1]!;
+		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "complete", detail: "queue empty" });
+		void project;
+		await kit.loop.close();
+		kit.lock.release();
 	});
 });
 

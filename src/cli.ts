@@ -7,9 +7,11 @@
  * 42 "sleeping until provider reset" (rerun `run` to resume).
  */
 import { parseArgs } from "node:util";
-import { resolve } from "node:path";
+import { dirname, delimiter, join, resolve } from "node:path";
 import { cwd as procCwd } from "node:process";
 import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 const pjson = createRequire(import.meta.url)("../package.json") as { name?: string; version: string };
 import { initProject } from "./init.ts";
 import { KIT_VERSION, ConfigError } from "./config.ts";
@@ -65,6 +67,9 @@ function main(): void {
 			break;
 		case "handoff":
 			void cmdHandoff(rest);
+			break;
+		case "ui":
+			void cmdUi(rest);
 			break;
 		default:
 			we.error(`unknown command: ${command}\n\n${HELP()}`);
@@ -170,11 +175,17 @@ async function cmdRun(argv: string[]): Promise<void> {
 			process.exitCode = 42;
 			return;
 		}
-		we.log(
-			summary.complete
-				? `\n${c.green}STATUS: COMPLETE${RESET} — task queue drained. Paper trail: router.md · .orch/wave-log.jsonl`
-				: `\n${c.yellow}run stopped: ${summary.exit}${RESET} — rerun to resume`,
-		);
+		if (summary.quarantined.length) {
+			// Arrived-stop like arrived-blocked: exit code stays 0, but never read
+			// as plain success — the message names the quarantined task ids.
+			we.log(`\n${c.yellow}run stopped short${RESET} — ${summary.quarantined.length} task(s) quarantined: ${summary.quarantined.join(", ")}. Paper trail: router.md · .orch/wave-log.jsonl`);
+		} else {
+			we.log(
+				summary.complete
+					? `\n${c.green}STATUS: COMPLETE${RESET} — task queue drained. Paper trail: router.md · .orch/wave-log.jsonl`
+					: `\n${c.yellow}run stopped: ${summary.exit}${RESET} — rerun to resume`,
+			);
+		}
 	} catch (err) {
 		kit?.lock.release();
 		fail(err, "run");
@@ -203,6 +214,9 @@ function printProgress(event: ProgressEvent): void {
 			break;
 		case "blocked":
 			we.log(`${c.red}║ ${event.message}${RESET}`);
+			break;
+		case "quarantine-stop":
+			we.log(`${c.yellow}◇ ${event.message}${RESET}`);
 			break;
 		case "complete":
 			we.log(`${c.green}✦ ${event.message}${RESET}`);
@@ -413,6 +427,79 @@ async function cmdHandoff(argv: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// ui — the web UI sub-product: a process boundary, never an import (ui/PRD.md
+// Appendix A.4). The UI package owns the real entry point so the sub-product
+// can move or be published independently without a cycle.
+// ---------------------------------------------------------------------------
+
+async function cmdUi(argv: string[]): Promise<void> {
+	const bin = findUiBin();
+	if (!bin) {
+		we.error(`the web UI lives in its own package (${join("ui", "package.json")}) — install it once in the kit repo:`);
+		we.error(`  ${c.cyan}npm --prefix ui install${RESET}`);
+		we.error(`then rerun: ${CLI_NAME} ui`);
+		process.exitCode = 1;
+		return;
+	}
+	const { spawn } = await import("node:child_process");
+	// .bin shims spawn directly; a bin/<name>.js shim (npm does not self-link the
+	// package's own bin into .bin) runs through this same node.
+	const args = bin.route === "node" ? [process.execPath, bin.path, ...argv] : [bin.path, ...argv];
+	const child = spawn(args[0]!, args.slice(1), { stdio: "inherit", env: process.env, cwd: procCwd() });
+	// Kill the signal contract: `kill <this pid>` (or a service manager) must take
+	// the spawned UI server with it, not orphan it holding the port. Ctrl-C still
+	// reaches both processes naturally (same process group).
+	const forward = (signal: NodeJS.Signals): void => {
+		if (process.env["KIT_DEBUG"]) we.error(`[kit-debug] ${CLI_NAME} ui got ${signal} → forwarding to child ${child.pid}`);
+		if (child.pid !== undefined) child.kill(signal);
+	};
+	process.on("SIGINT", forward);
+	process.on("SIGTERM", forward);
+	child.on("error", (err) => {
+		we.error(`failed to start ${bin}: ${(err as Error).message}`);
+		process.exitCode = 1;
+	});
+	const code: number | null = await new Promise((done) => {
+		child.on("close", (exitCode) => done(exitCode));
+		child.on("error", () => done(null));
+	});
+	if (code !== null && code !== 0) process.exitCode = code;
+}
+
+interface UiBinRoute {
+	path: string;
+	route: "direct" | "node";
+}
+
+/** Resolve the llm-toolkit-ui bin: kit repo ui/, the CWD ui/, then PATH. */
+function findUiBin(): UiBinRoute | undefined {
+	// This entry (src/cli.ts via tsx, dist/cli.js built) → the kit repo root.
+	const kitRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+	const suffixes = process.platform === "win32" ? ["", ".cmd", ".exe"] : [""];
+	const candidates: UiBinRoute[] = [];
+	const winSuffix = (item: string): UiBinRoute | undefined => {
+		if (!existsSync(item)) return undefined;
+		return { path: item, route: item.endsWith(".js") ? "node" : "direct" };
+	};
+	for (const root of new Set([kitRoot, procCwd()])) {
+		for (const suffix of suffixes) {
+			const hit = winSuffix(join(root, "ui", "node_modules", ".bin", `llm-toolkit-ui${suffix}`));
+			if (hit) return hit;
+		}
+		const shim = winSuffix(join(root, "ui", "bin", "llm-toolkit-ui.js"));
+		if (shim) return shim;
+	}
+	for (const dir of (process.env["PATH"] ?? "").split(delimiter)) {
+		if (!dir) continue;
+		for (const suffix of suffixes) {
+			const hit = winSuffix(join(dir, `llm-toolkit-ui${suffix}`));
+			if (hit) return hit;
+		}
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------
 // shared
 // ---------------------------------------------------------------------------
 
@@ -439,6 +526,7 @@ function HELP(): string {
   ${CLI_NAME} verify --task id            # one-off read-only verification (works after manual edits)
   ${CLI_NAME} export                      # HTML/JSON report into .orch/artifacts/
   ${CLI_NAME} handoff "note"              # queue a note the next wave ingests
+  ${CLI_NAME} ui [--port n] [--no-open]    # the web UI (sub-product, ui/PRD.md); spawns llm-toolkit-ui
 
 kit ${RUN_VERSION_HEADER()} · run inside the target project (its .orch/config.toml)`;
 }

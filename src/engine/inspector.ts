@@ -74,6 +74,8 @@ export interface KitTaskView {
 	lastGateHash?: string;
 	/** Feedback entries on the task (previous waves' gate/verifier/handoff text). */
 	feedback: number;
+	/** A.3: viewable diff for done/quarantined tasks (artifact names, not content). */
+	diff?: DiffArtifactRef;
 }
 
 export interface KitUsage {
@@ -98,6 +100,15 @@ export interface WaveSpan {
 	outcome: string;
 }
 
+/** UI seam A.1: live wave state from the status side-car (both readout modes). */
+export interface KitLiveView {
+	task: string;
+	wave: number;
+	startedAt: number;
+	elapsedMs: number;
+	pid?: number;
+}
+
 export interface ConvSummary {
 	id: number;
 	role: "planner" | "implementer" | "verifier" | "none";
@@ -118,7 +129,20 @@ export interface ArtifactFile {
 	name: string;
 	bytes: number;
 	mtimeMs: number;
-	kind: "gate" | "quarantine" | "other";
+	/** A.3: "diff" marks the per-task display patches + their stats side-cars. */
+	kind: "gate" | "quarantine" | "diff" | "other";
+}
+
+/** A.3: where a task's viewable diff lives (artifact NAMES, not content). */
+export interface DiffArtifactRef {
+	task: string;
+	/** Stored patch artifact name: task-<id>.patch (done) or quarantined-<id>-w<N>.patch (quarantined). */
+	patch: string;
+	/** Stats side-car artifact name when present (written alongside by A.2). */
+	stats?: string;
+	bytes: number;
+	/** The stored patch was cut at the 5 MiB cap (from the stats side-car). */
+	truncated: boolean;
 }
 
 export interface HealthCheck {
@@ -139,11 +163,15 @@ export interface StorageReadout {
 
 export interface KitReadout {
 	at: number;
+	/** UI seam version (Appendix A). Present in both modes; M0 ships A.1. */
+	seam: 1;
 	degraded: boolean;
 	degradedReason?: string;
 	identity: KitIdentity;
 	phase: string;
 	current?: { task: string; wave: number };
+	/** Live wave truth from the status side-car; absent when no wave is running. */
+	live?: KitLiveView;
 	tasks: KitTaskView[];
 	rows: WaveRow[];
 	usage: KitUsage;
@@ -151,6 +179,14 @@ export interface KitReadout {
 	artifacts: ArtifactFile[];
 	health: HealthCheck[];
 	storage?: StorageReadout;
+}
+
+/** A.1: the live view is derived from the status side-car's wave-running flush. */
+export function liveFromPayload(payload?: StatusPayloads): KitLiveView | undefined {
+	if (payload?.phase !== "wave-running" || !payload.task?.id) return undefined;
+	const startedAt = payload.task.startedAt;
+	if (typeof startedAt !== "number") return undefined;
+	return { task: payload.task.id, wave: payload.task.wave, startedAt, elapsedMs: Math.max(0, Date.now() - startedAt), pid: payload.lockedByPid };
 }
 
 export interface ReadoutOptions {
@@ -187,7 +223,10 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 	const at = Date.now();
 	const harness = loop.loop.harness;
 	const config = loop.loop.config;
-	const [state, sessionUsage] = await Promise.all([readSessionState(harness), loop.loop.sessionUsage()]);
+	// The side-car is still the freshest source for live elapsed time even when
+	// storage is open (A.3) — the wave-start flush happens before the request is
+	// submitted, so it carries startedAt while the run is mid-wave.
+	const [state, sessionUsage, payload] = await Promise.all([readSessionState(harness), loop.loop.sessionUsage(), readJson<StatusPayloads>(paths.status)]);
 
 	const rates = buildRateMap(config);
 	const conversations = await collectConversations(harness, state.router.tasks, rates);
@@ -209,6 +248,8 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 
 	const readout: KitReadout = {
 		at,
+		seam: 1,
+		live: liveFromPayload(payload),
 		degraded: false,
 		identity: { kit: state.runStatus.kitVersion || KIT_VERSION, piDurable: config.engine.piDurable, root: paths.root, lockedByPid: process.pid, at },
 		phase: state.router.phase,
@@ -238,10 +279,11 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 		health: [],
 		storage: { router: state.router, runStatus: state.runStatus, conversations, reports: loop.loop.reports.slice(-20) },
 	};
+	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts);
 	readout.health = await healthChecks(paths, {
 		degraded: false,
 		state,
-		payload: await readJson<StatusPayloads>(paths.status),
+		payload,
 		artifacts,
 		rows: state.rows,
 		config,
@@ -286,6 +328,8 @@ async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
 
 	const readout: KitReadout = {
 		at,
+		seam: 1,
+		live: liveFromPayload(payload),
 		degraded: true,
 		degradedReason: "storage is owned by another process — showing side-cars only",
 		identity: {
@@ -324,6 +368,7 @@ async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
 		artifacts,
 		health: [],
 	};
+	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts);
 	readout.health = await healthChecks(paths, { degraded: true, payload, artifacts, rows, config: undefined, harness: undefined });
 	return readout;
 }
@@ -435,6 +480,18 @@ function buildByTask(conversations: ConvSummary[], timeline: WaveSpan[]): KitUsa
 function buildTimeline(rows: readonly WaveRow[]): WaveSpan[] {
 	const spans = new Map<string, { task: string; wave: number; startedMs: number; lastMs: number; rowsCount: number; outcome: string }>();
 	const firstWaveOf = new Map<string, number>();
+	// UI seam A.1: wave start/end rows carry the real span boundaries and outcome.
+	// When they are absent (older rows, or a run killed mid-wave) the compute
+	// falls back to the classic min/max over all rows for the (task, wave) pair.
+	const starts = new Map<string, number>();
+	const ends = new Map<string, { ts: number; detail?: string }>();
+	for (const row of rows) {
+		if (row.kind === "wave" && (row.verb === "start" || row.verb === "end") && row.wave !== undefined) {
+			const key = `${row.task}\u0000${row.wave}`;
+			if (row.verb === "start" && !starts.has(key)) starts.set(key, row.ts);
+			else if (row.verb === "end") ends.set(key, { ts: row.ts, detail: row.detail });
+		}
+	}
 	for (const row of rows) {
 		if (row.task === "session") continue;
 		if (row.wave === undefined && !firstWaveOf.has(row.task)) {
@@ -453,8 +510,29 @@ function buildTimeline(rows: readonly WaveRow[]): WaveSpan[] {
 		span.outcome = spanOutcome(row);
 		spans.set(key, span);
 	}
-	return [...spans.values()]
-		.map((s) => ({ task: s.task, wave: s.wave, startedMs: s.startedMs, durationMs: Math.max(0, s.lastMs - s.startedMs), rowsCount: s.rowsCount, outcome: s.outcome }))
+	return [...spans.entries()]
+		.map(([key, s]) => {
+			const out: WaveSpan = {
+				task: s.task,
+				wave: s.wave,
+				startedMs: s.startedMs,
+				durationMs: Math.max(0, s.lastMs - s.startedMs),
+				rowsCount: s.rowsCount,
+				outcome: s.outcome,
+			};
+			const start = starts.get(key);
+			if (start !== undefined) {
+				out.startedMs = start;
+				const end = ends.get(key);
+				if (end) {
+					out.durationMs = Math.max(0, end.ts - start);
+					if (end.detail) out.outcome = end.detail;
+				} else {
+					out.durationMs = Math.max(0, s.lastMs - start);
+				}
+			}
+			return out;
+		})
 		.sort((a, b) => a.startedMs - b.startedMs);
 }
 
@@ -483,6 +561,52 @@ function taskViews(tasks: RouterTask[], extra: (t: RouterTask) => Pick<KitTaskVi
 // Artifacts
 // ---------------------------------------------------------------------------
 
+/**
+ * A.3: per-task diff refs over the artifacts listing — done tasks read
+ * `task-<id>.patch` (+ `.json` stats side-car), quarantined ones the newest
+ * `quarantined-<id>-w<N>.patch`. Both modes use it: the names + bytes come
+ * from the listing; `truncated` reads the small stats side-car when present.
+ */
+async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifacts: readonly ArtifactFile[]): Promise<KitTaskView[]> {
+	const byName = new Map(artifacts.map((a) => [a.name, a]));
+	return Promise.all(
+		tasks.map(async (task) => {
+			let patchName: string | undefined;
+			if (task.status === "done") {
+				patchName = `task-${task.id}.patch`;
+			} else if (task.status === "quarantined") {
+				// One task quarantines at most once (terminal); the newest saved wave
+				// wins in case artifacts from older runs with the same ids linger.
+				const waves = artifacts
+					.filter((a) => a.name.startsWith(`quarantined-${task.id}-w`) && a.name.endsWith(".patch"))
+					.map((a) => Number(/-w(\d+)\.patch$/.exec(a.name)?.[1]))
+					.filter((n): n is number => Number.isInteger(n) && n > 0);
+				const wave = Math.max(...waves, 0);
+				patchName = wave > 0 ? `quarantined-${task.id}-w${wave}.patch` : undefined;
+			}
+			if (!patchName) return task;
+			const patchMeta = byName.get(patchName);
+			if (!patchMeta) return task; // listing says the patch is gone (or never landed)
+			const statsName = patchName.replace(/\.patch$/, ".json");
+			let truncated = false;
+			if (byName.has(statsName)) {
+				const stats = await readJson<{ truncated?: boolean }>(join(paths.artifacts, statsName)).catch(() => undefined);
+				if (typeof stats?.truncated === "boolean") truncated = stats.truncated;
+			}
+			return {
+				...task,
+				diff: {
+					task: task.id,
+					patch: patchName,
+					...(byName.has(statsName) ? { stats: statsName } : {}),
+					bytes: patchMeta.bytes,
+					truncated,
+				} satisfies DiffArtifactRef,
+			};
+		}),
+	);
+}
+
 async function listArtifacts(paths: ProjectPaths): Promise<ArtifactFile[]> {
 	try {
 		const names = await readdir(paths.artifacts);
@@ -490,7 +614,7 @@ async function listArtifacts(paths: ProjectPaths): Promise<ArtifactFile[]> {
 			names.map(async (name) => {
 				const st = await stat(join(paths.artifacts, name)).catch(() => undefined);
 				if (!st || !st.isFile()) return undefined;
-				const kind: ArtifactFile["kind"] = name.startsWith("gate-") ? "gate" : name.startsWith("quarantined-") ? "quarantine" : "other";
+				const kind: ArtifactFile["kind"] = name.startsWith("gate-") ? "gate" : name.startsWith("quarantined-") ? "quarantine" : name.startsWith("task-") ? "diff" : "other";
 				return { name, bytes: st.size, mtimeMs: st.mtimeMs, kind } satisfies ArtifactFile;
 			}),
 		);
@@ -683,6 +807,25 @@ async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<He
 	if (alert) checks.push({ id: "alert", ok: false, severity: "warn", detail: `active alert: ${alert}` });
 	if (state && input.config && state.runStatus.consecutiveErrors >= input.config.budgets.maxConsecutiveErrors) {
 		checks.push({ id: "consecutive-errors", ok: false, severity: "warn", detail: `${state.runStatus.consecutiveErrors} consecutive run failures ≥ cap ${input.config.budgets.maxConsecutiveErrors}` });
+	}
+
+	// seam — the readout schema version this kit publishes (A.3); always present.
+	checks.push({ id: "seam", ok: true, severity: "info", detail: "UI seam available (readout.seam = 1: live wave state, timeline spans)" });
+
+	// live — the side-car's wave must be plausible while the lock is held (A.3):
+	// a future startedAt means clock skew; an ancient one means a killed run left
+	// a stale wave-running flush behind.
+	const liveTask = payload?.phase === "wave-running" ? payload.task : undefined;
+	if (!liveTask?.id) {
+		checks.push({ id: "live", ok: true, severity: "info", detail: "no live wave reported" });
+	} else if (liveTask.startedAt === undefined) {
+		checks.push({ id: "live", ok: true, severity: "info", detail: `live wave ${liveTask.id} #w${liveTask.wave} without startedAt (older kit flush)` });
+	} else if (liveTask.startedAt - Date.now() > 5_000) {
+		checks.push({ id: "live", ok: false, severity: "warn", detail: `wave-running startedAt is ${Math.round((liveTask.startedAt - Date.now()) / 1000)}s in the future — clock skew between the writer and this reader?` });
+	} else if (Date.now() - liveTask.startedAt > 24 * 60 * 60 * 1000) {
+		checks.push({ id: "live", ok: false, severity: "warn", detail: `wave-running side-car is stale: wave ${liveTask.id} #w${liveTask.wave} claims to run since ${new Date(liveTask.startedAt).toISOString()} (>24h)` });
+	} else {
+		checks.push({ id: "live", ok: true, severity: "info", detail: `live wave ${liveTask.id} #w${liveTask.wave} since ${new Date(liveTask.startedAt).toISOString()}` });
 	}
 
 	return checks;
