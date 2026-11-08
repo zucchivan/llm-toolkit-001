@@ -2,6 +2,36 @@
 
 Manual semver discipline: keep `package.json` version and the newest section in sync.
 
+## 0.2.3 — 2026-11-08
+
+- **UI seam A.7 — per-wave isolated diffs (consumed by `ui/` 0.8.0, additive;
+  `readout.seam` stays 1)**:
+  - every wave's start and end rows capture the wave's own git tree (the same
+    `captureBaselineTree` throwaway-index snapshot the baseline path uses,
+    made inside the wave's existing commit windows — no new lock
+    discipline) and record it as an optional additive `treeSha` on the
+    `WaveRow`. A failed capture degrades to a row WITHOUT the field — that
+    wave is simply not isolatable, never a failed run (deliberately softer
+    than the baseline path's throw: a missing baseline is fatal, a missing
+    wave tree is only a missing view). The runner's tree objects live in
+    `.git` — no new artifact dir, no retention policy beyond git's own.
+  - quarantine captures the wave's produced tree BEFORE the rollback, so
+    the isolated wave diff names the evidence the wave made, not the empty
+    post-restore tree.
+  - `util/git.ts` gains `diffDisplayTrees` (tree-to-tree display diff; the
+    exclusions/5 MiB-cap/stats tail is now the shared `displayPatchBetweenTrees`);
+    `computeDisplayPatch` semantics are unchanged.
+  - readout wave timeline spans echo `startTreeSha`/`endTreeSha` (plain
+    JSON-able shapes; the A.6 echo style). No CLI output, config, or doc
+    changes; the wave log stays at `version: 1` (an optional field).
+  - fix (visible now because captures repeat per wave per task):
+    `captureBaselineTree` named its throwaway index by pid and never removed
+    it — a REPEATED capture in one process inherited the previous capture's
+    staged state, so files deleted between captures wrongly survived in
+    every later tree. Per-capture unique index + cleanup.
+- the UI's consumption of all this (route + drawer) is `ui/` 0.8.0; the
+  A.7 spec lives in `ui/PRD.md` Appendix A.7.
+
 ## 0.2.2 — 2026-11-07
 
 - **UI seam A.2/A.3 — display diffs (consumed by `ui/` 0.3.0, additive)**:

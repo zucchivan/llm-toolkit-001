@@ -102,6 +102,12 @@ export interface WaveSpan {
 	durationMs: number;
 	rowsCount: number;
 	outcome: string;
+	/** UI seam A.7: the wave's own git trees (start/end rows' `treeSha`) — used
+	 *  by the UI's per-wave isolated diff (`GET /api/tasks/:id/diff?wave=N`).
+	 *  Optional: rows that predate the seam, or a failed capture, carry none —
+	 *  that wave is simply not isolatable. */
+	startTreeSha?: string;
+	endTreeSha?: string;
 }
 
 /** UI seam A.1: live wave state from the status side-car (both readout modes). */
@@ -704,13 +710,13 @@ function buildTimeline(rows: readonly WaveRow[]): WaveSpan[] {
 	// UI seam A.1: wave start/end rows carry the real span boundaries and outcome.
 	// When they are absent (older rows, or a run killed mid-wave) the compute
 	// falls back to the classic min/max over all rows for the (task, wave) pair.
-	const starts = new Map<string, number>();
-	const ends = new Map<string, { ts: number; detail?: string }>();
+	const starts = new Map<string, { ts: number; treeSha?: string }>();
+	const ends = new Map<string, { ts: number; detail?: string; treeSha?: string }>();
 	for (const row of rows) {
 		if (row.kind === "wave" && (row.verb === "start" || row.verb === "end") && row.wave !== undefined) {
 			const key = `${row.task}\u0000${row.wave}`;
-			if (row.verb === "start" && !starts.has(key)) starts.set(key, row.ts);
-			else if (row.verb === "end") ends.set(key, { ts: row.ts, detail: row.detail });
+			if (row.verb === "start" && !starts.has(key)) starts.set(key, { ts: row.ts, ...(row.treeSha ? { treeSha: row.treeSha } : {}) });
+			else if (row.verb === "end") ends.set(key, { ts: row.ts, detail: row.detail, ...(row.treeSha ? { treeSha: row.treeSha } : {}) });
 		}
 	}
 	for (const row of rows) {
@@ -743,14 +749,17 @@ function buildTimeline(rows: readonly WaveRow[]): WaveSpan[] {
 			};
 			const start = starts.get(key);
 			if (start !== undefined) {
-				out.startedMs = start;
+				out.startedMs = start.ts;
 				const end = ends.get(key);
 				if (end) {
-					out.durationMs = Math.max(0, end.ts - start);
+					out.durationMs = Math.max(0, end.ts - start.ts);
 					if (end.detail) out.outcome = end.detail;
 				} else {
-					out.durationMs = Math.max(0, s.lastMs - start);
+					out.durationMs = Math.max(0, s.lastMs - start.ts);
 				}
+				// A.7: the wave's own trees ride the span (plain JSON-able echo).
+				if (start.treeSha) out.startTreeSha = start.treeSha;
+				if (end?.treeSha) out.endTreeSha = end.treeSha;
 			}
 			return out;
 		})

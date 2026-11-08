@@ -12,7 +12,8 @@
  * pass unchanged).
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { readFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openProjectHarness, projectPaths, type StatusPayloads } from "../src/engine/harness.ts";
 import { readSessionState, commitState, flushStatusSnapshot } from "../src/engine/state.ts";
@@ -27,6 +28,7 @@ import { initProject } from "../src/init.ts";
 import { BACKGROUND_CONTEXT, convId } from "../src/engine/kit.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { readJson, atomicWriteJson } from "../src/util/fsx.ts";
+import { captureBaselineTree, diffDisplayTrees } from "../src/util/git.ts";
 
 beforeEach(() => {
 	process.env["NO_COLOR"] = "1";
@@ -612,5 +614,119 @@ describe("delivery truth (A.6): readout surfaces the mode + outcome rows, read-o
 		expect(read.delivery.mode).toBeUndefined();
 		expect(read.delivery.rows).toHaveLength(1);
 		expect(read.delivery.rows[0]?.task).toBe("t1");
+	});
+});
+
+describe("per-wave isolated diffs (A.7): wave rows carry treeSha; trees diff tree-to-tree", () => {
+	it("real waves: start/end rows carry 40-hex trees; wave 2's start tree equals wave 1's end tree", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify(PLANNER_TASKS), { stopReason: "stop" }),
+			...implWrites([{ path: "src/list.ts", content: LIST_TS }]),
+			verifyApprove(),
+			...implWrites([{ path: "src/list.ts", content: LIST_TS + "\nexport const BROKEN = true;\n" }]),
+			...implWrites([{ path: "src/list.ts", content: LIST_TS }, { path: "src/query.ts", content: QUERY_TS }]),
+			verifyApprove("fixed on wave 2"),
+		], models.faux);
+		await accomplish(kit);
+		await writeGateFile(project.root);
+
+		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		expect(summary.complete).toBe(true);
+		const rows = await waveLogRows(project.root);
+		const treeSha = /^[0-9a-f]{40}$/;
+		// every wave start/end row carries a captured tree (t1 wave 1; t2 waves 1–2)
+		const waveRows = rows.filter((r) => r.kind === "wave" && r.task !== "session");
+		expect(waveRows.length).toBeGreaterThanOrEqual(6);
+		for (const row of waveRows) {
+			expect(row.treeSha, `${row.task} w${row.wave} ${row.verb}`).toMatch(treeSha);
+		}
+		const startTree = (task: string, wave: number) => waveRows.find((r) => r.task === task && r.wave === wave && r.verb === "start")?.treeSha;
+		const endTree = (task: string, wave: number) => waveRows.find((r) => r.task === task && r.wave === wave && r.verb === "end")?.treeSha;
+		expect(startTree("list-query", 1)).not.toBe(endTree("list-query", 1)); // the wave moved the tree
+		expect(endTree("list-query", 2)).not.toBe(startTree("list-query", 2)); // wave 2's content ≠ wave 2's start
+		// the money shot: wave 2's isolated delta is exactly its own changes
+		const wave2 = await diffDisplayTrees(project.root, startTree("list-query", 2)!, endTree("list-query", 2)!);
+		expect(wave2.ok).toBe(true);
+		if (!wave2.ok) return;
+		expect(wave2.stats.files.map((f) => f.path).sort()).toEqual(["src/list.ts", "src/query.ts"]);
+		// between the two captures that straddle consecutive waves only engine-owned
+		// content churns (the router.md mirror) — the display wrapper refuses it
+		const seamGap = await diffDisplayTrees(project.root, endTree("list-query", 1)!, startTree("list-query", 2)!);
+		expect(seamGap.ok).toBe(false);
+		expect(seamGap.reason).toMatch(/no display diff/);
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("the tree-to-tree wrapper isolates one wave's own delta (engine-owned churn excluded)", async () => {
+		const root = await mkdtemp(join(tmpdir(), "a7-wrapper-"));
+		try {
+			await gitInit(root);
+			await mkdir(join(root, ".orch"), { recursive: true }); // captureBaselineTree parks its throwaway index here
+			await writeFile(join(root, "wave-file.ts"), "const a = 1;\n", "utf8");
+			await writeFile(join(root, "gone.ts"), "const gone = true;\n", "utf8");
+			const baseTree = await captureBaselineTree(root);
+
+			// wave-1 work: edit one file, delete another, churn engine-owned paths
+			await writeFile(join(root, "wave-file.ts"), "const a = 2;\n", "utf8");
+			await rm(join(root, "gone.ts"), { force: true });
+			await writeFile(join(root, "router.md"), "router churn\n", "utf8");
+			await writeFile(join(root, "PROMPT.md"), "prompt churn\n", "utf8");
+			const endTree = await captureBaselineTree(root);
+
+			const wave = await diffDisplayTrees(root, baseTree, endTree);
+			expect(wave.ok).toBe(true);
+			if (!wave.ok) return;
+			const paths = wave.stats.files.map((f) => f.path).sort();
+			expect(paths).toEqual(["gone.ts", "wave-file.ts"]);
+			expect(wave.text).toContain("wave-file.ts");
+			expect(wave.text).toContain("gone.ts");
+			expect(wave.text).not.toContain("router churn");
+			expect(wave.text).not.toContain("PROMPT.md");
+
+			// engine-owned-only churn between two trees → a defined empty, not a patch
+			const t2 = await captureBaselineTree(root); // same non-engine content as endTree
+			await writeFile(join(root, "router.md"), "router churn again\n", "utf8");
+			const t3 = await captureBaselineTree(root);
+			const churnPair = await diffDisplayTrees(root, t2, t3);
+			expect(churnPair.ok).toBe(false);
+			expect(churnPair.reason).toMatch(/no display diff/);
+		} finally {
+			await rm(root, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("fabricated side-cars: spans echo start/end trees; treeless rows stay treeless (the failure posture)", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+		const t0 = Date.now() - 4_000;
+		const t1 = t0 + 2_000;
+		const t2 = t0 + 3_500;
+		const rows = [
+			{ ts: t0, kind: "wave", task: "t1", wave: 2, verb: "start", treeSha: "a".repeat(40) },
+			{ ts: t1, kind: "gate", task: "t1", wave: 2, verb: "fail", detail: "type: bad" },
+			{ ts: t2, kind: "wave", task: "t1", wave: 2, verb: "end", detail: "retry: gates failed", treeSha: "b".repeat(40) },
+			{ ts: t0 + 4_000, kind: "wave", task: "t2", wave: 1, verb: "start" }, // capture failed / pre-seam: no tree
+		] as unknown as WaveRow[];
+		await atomicWriteJson(join(project.root, ".orch", "status.json"), {
+			kit: "0.2.3", piDurable: "1.5.0", ts: Date.now(), root: project.root,
+			lockedByPid: 4242, phase: "wave-running",
+			task: { id: "t1", wave: 2, status: "running", startedAt: t0 },
+			budget: { spentUsd: 0.5, sessionCeilingUsd: 25, waveWarnUsd: 6 },
+			tasks: [{ id: "t1", status: "in_progress", waveCount: 1, title: "one" }],
+		});
+		await writeFile(join(project.root, ".orch", "wave-log.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+
+		const read = await readout(projectPaths(project.root));
+		expect(read.seam).toBe(1);
+		const span = read.timeline.find((s) => s.task === "t1");
+		expect(span).toMatchObject({ task: "t1", wave: 2, startTreeSha: "a".repeat(40), endTreeSha: "b".repeat(40) });
+		const treeless = read.timeline.find((s) => s.task === "t2");
+		expect(treeless).toBeTruthy();
+		expect(treeless?.startTreeSha).toBeUndefined();
+		expect(treeless?.endTreeSha).toBeUndefined();
 	});
 });

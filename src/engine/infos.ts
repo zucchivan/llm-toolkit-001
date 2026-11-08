@@ -84,6 +84,11 @@ export type WaveRow = {
 	wave?: number;
 	verb: string;
 	detail?: string;
+	/** UI seam A.7: the wave's own git tree, captured for `wave` start/end rows
+	 *  (throwaway-index capture inside the engine's windows). Optional: rows that
+	 *  predate the seam, or a failed capture, carry no tree — those waves are
+	 *  simply not isolatable, never a failed run. */
+	treeSha?: string;
 	costUsd?: number;
 	tokens?: number;
 	verdict?: string;

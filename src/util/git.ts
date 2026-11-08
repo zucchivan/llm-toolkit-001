@@ -117,15 +117,25 @@ export async function captureBaselineTree(cwd: string): Promise<string> {
 		if (head.ok) return head.stdout;
 		throw new Error("not a usable git repository for baseline capture");
 	}
-	const tmpIndex = `${cwd}/.orch/.baseline-${process.pid}-${process.env["VITEST_WORKER_ID"] ?? "0"}`;
+	// A uniquely-named throwaway index per capture, removed after write-tree:
+	// a REPEATED capture in one process must never inherit the previous capture's
+	// staged state (a pid-only name leaked it, so files deleted between captures
+	// wrongly survived in every later tree — A.7's wave trees made that visible).
+	const tmpIndex = `${cwd}/.orch/.baseline-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 	const env = { GIT_INDEX_FILE: tmpIndex };
-	const add = await exec(["git", "add", "--", ...files], { cwd, timeoutMs: 120_000, env });
-	if (add.code !== 0) {
-		throw new Error(`baseline snapshot failed at git add: ${(add.stderr || "").slice(0, 200)}`);
+	try {
+		const add = await exec(["git", "add", "--", ...files], { cwd, timeoutMs: 120_000, env });
+		if (add.code !== 0) {
+			throw new Error(`baseline snapshot failed at git add: ${(add.stderr || "").slice(0, 200)}`);
+		}
+		const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env });
+		if (wt.code !== 0) throw new Error(`baseline snapshot failed: ${wt.stderr}`);
+		return wt.stdout.trim();
+	} finally {
+		const fs = await import("node:fs/promises");
+		await fs.rm(tmpIndex, { force: true }).catch(() => {});
+		await fs.rm(`${tmpIndex}.lock`, { force: true }).catch(() => {});
 	}
-	const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env });
-	if (wt.code !== 0) throw new Error(`baseline snapshot failed: ${wt.stderr}`);
-	return wt.stdout.trim();
 }
 
 export interface TreeChange {
@@ -414,20 +424,40 @@ export async function computeDisplayPatch(cwd: string, baseTree: string): Promis
 		const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env: { GIT_INDEX_FILE: tmpIdx } });
 		if (wt.code !== 0) return noDisplayDiff(`git write-tree failed: ${(wt.stderr || wt.stdout).trim().slice(0, 200)}`);
 		const compareTree = wt.stdout.trim();
-		const diff = await spawnCapture(["git", "diff", "--binary", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, DISPLAY_PATCH_CAP_BYTES + 1);
-		if (diff.code !== 0) return noDisplayDiff(`git diff failed: ${(diff.stderr || diff.stdout).trim().slice(0, 200)}`);
-		if (diff.stdout.trim() === "") return noDisplayDiff("no display diff (nothing changed outside engine-owned paths)");
-		// Cap by bytes: slice whole bytes, then drop a UTF-8 rune cut in half.
-		const raw = Buffer.from(diff.stdout, "utf8");
-		const truncated = diff.overflow || raw.length > DISPLAY_PATCH_CAP_BYTES;
-		const capped = truncated ? raw.subarray(0, DISPLAY_PATCH_CAP_BYTES) : raw;
-		const text = capped.toString("utf8").replace(/\uFFFD+$/, "");
-		const stats = await statsAgainstTrees(cwd, baseTree, compareTree);
-		return { ok: true, text, bytes: Buffer.byteLength(text, "utf8"), truncated, stats };
+		return await displayPatchBetweenTrees(cwd, baseTree, compareTree);
 	} finally {
 		await rm(tmpIdx, { force: true }).catch(() => {});
 		await rm(`${tmpIdx}.lock`, { force: true }).catch(() => {});
 	}
+}
+
+/**
+ * The shared tree-vs-tree tail of the display diffs (A.7 extracted it from
+ * computeDisplayPatch): engine-owned paths excluded, 5 MiB cap, stats from the
+ * same numstat/name-status pair. Both endpoints are immutable captured trees;
+ * nothing is persisted — the caller renders (and optionally stores).
+ */
+async function displayPatchBetweenTrees(cwd: string, baseTree: string, compareTree: string): Promise<DisplayPatchOutcome> {
+	const diff = await spawnCapture(["git", "diff", "--binary", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, DISPLAY_PATCH_CAP_BYTES + 1);
+	if (diff.code !== 0) return noDisplayDiff(`git diff failed: ${(diff.stderr || diff.stdout).trim().slice(0, 200)}`);
+	if (diff.stdout.trim() === "") return noDisplayDiff("no display diff (nothing changed outside engine-owned paths)");
+	// Cap by bytes: slice whole bytes, then drop a UTF-8 rune cut in half.
+	const raw = Buffer.from(diff.stdout, "utf8");
+	const truncated = diff.overflow || raw.length > DISPLAY_PATCH_CAP_BYTES;
+	const capped = truncated ? raw.subarray(0, DISPLAY_PATCH_CAP_BYTES) : raw;
+	const text = capped.toString("utf8").replace(/\uFFFD+$/, "");
+	const stats = await statsAgainstTrees(cwd, baseTree, compareTree);
+	return { ok: true, text, bytes: Buffer.byteLength(text, "utf8"), truncated, stats };
+}
+
+/**
+ * A.7 — per-wave isolated display diff between two captured trees: the wave
+ * start/end rows' shas (immutable, so no index work at all — unlike
+ * computeDisplayPatch nothing stages the worktree). Same exclusions and cap;
+ * still a display-only result (rollback never reads any of these).
+ */
+export async function diffDisplayTrees(cwd: string, baseTree: string, endTree: string): Promise<DisplayPatchOutcome> {
+	return displayPatchBetweenTrees(cwd, baseTree, endTree);
 }
 
 /**

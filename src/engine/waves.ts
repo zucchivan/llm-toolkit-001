@@ -298,12 +298,15 @@ export async function driveTaskWaves(
 		// wave-log start row (`ts` IS startedAt), and a wave-running status.json with
 		// task/wave/startedAt so an attached UI shows the live wave without storage.
 		const startedAt = Date.now();
+		// UI seam A.7: the wave's own tree at start — per-wave isolated diffs read
+		// this vs the end row's tree. A failed capture drops the field, never the run.
+		const startTree = await waveTreeSoft(paths.root);
 		await commitState(kit, {
 			router: (d) => {
 				const t = d.tasks.find((x) => x.id === task.id)!;
 				t.status = "in_progress";
 			},
-			rows: [{ ts: startedAt, kind: "wave", task: task.id, wave, verb: "start" }],
+			rows: [{ ts: startedAt, kind: "wave", task: task.id, wave, verb: "start", ...(startTree ? { treeSha: startTree } : {}) }],
 			statusPhase: { phase: "wave-running", task: task.id, wave, startedAt },
 		});
 		const outcomeWave = await convKit.submitAndAwait(conv, `${task.id}-w${wave}`, waveInput);
@@ -328,7 +331,7 @@ export async function driveTaskWaves(
 				// UI seam A.1 at wave end: close the wave (sleep is a wave outcome — the
 				// run resumes at a later `run`, never inside this one).
 				await commitState(kit, {
-					rows: [waveEndRow(task.id, wave, "sleeping")],
+					rows: [waveEndRow(task.id, wave, "sleeping", await waveTreeSoft(paths.root) /* A.7: what the wave left behind */)],
 					statusPhase: { phase: "idle", message: `${task.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
 				});
 				emit({ kind: "sleeping", taskId: task.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
@@ -388,7 +391,7 @@ export async function driveTaskWaves(
 					}
 				},
 				rows: underLimit
-					? [gateRowFor(task.id, wave, gate), waveEndRow(task.id, wave, "retry: gates failed")]
+					? [gateRowFor(task.id, wave, gate), waveEndRow(task.id, wave, "retry: gates failed", await waveTreeSoft(paths.root) /* A.7: a retried wave still ends a span */)]
 					: [gateRowFor(task.id, wave, gate)],
 				// UI seam A.1 at wave end: on retry the wave window closes here (idle);
 				// the next wave's start row re-opens it. Terminal outcomes flush via
@@ -429,7 +432,7 @@ export async function driveTaskWaves(
 				rows: [
 					{ ts: Date.now(), kind: "task", task: task.id, wave, verb: "done", verdict: "approve" },
 					// UI seam A.1: the wave ends here — the span outcome stays "approved".
-					waveEndRow(task.id, wave, "approved"),
+					waveEndRow(task.id, wave, "approved", await waveTreeSoft(paths.root) /* A.7: the approved wave's own end tree */),
 				],
 				statusPhase: { phase: "idle", message: `${task.id} approved (wave ${wave})` },
 			});
@@ -457,7 +460,7 @@ export async function driveTaskWaves(
 			},
 			rows: [
 				{ ts: Date.now(), kind: "verdict", task: task.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes },
-				...(canRetry ? [waveEndRow(task.id, wave, "retry: verifier rejected")] : []),
+				...(canRetry ? [waveEndRow(task.id, wave, "retry: verifier rejected", await waveTreeSoft(paths.root) /* A.7: retry-scope end tree */)] : []),
 			],
 			...(canRetry
 				? { statusPhase: { phase: "idle" as const, message: `${task.id} verifier rejected (wave ${wave}) — retry queued` } }
@@ -573,7 +576,7 @@ async function handleUnanswered(
 		return "faulted"; // the driver quarantines once
 	}
 	await commitState(kit, {
-		rows: [...rows, waveEndRow(task.id, wave, `retry: run failed: ${reason.slice(0, 120)}`)],
+		rows: [...rows, waveEndRow(task.id, wave, `retry: run failed: ${reason.slice(0, 120)}`, await waveTreeSoft(kit.loop.paths.root) /* A.7: what the failed wave left behind */)],
 		router: (d) => {
 			const t = d.tasks.find((x) => x.id === task.id)!;
 			t.waveCount = wave;
@@ -600,6 +603,11 @@ export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: numbe
 	// task copy: on a wave-1 quarantine the task object predates the capture.
 	// Without this, first-wave quarantines never wrote their evidence patch.
 	const baseline = baselineTreeSha ?? task.baselineTreeSha;
+	// A.7: the quarantined wave's own tree — captured BEFORE the rollback so the
+	// isolated wave diff names what the wave produced (the evidence saved below),
+	// not the empty post-restore tree. The save below only touches .orch, which
+	// the capture skips, so the tree bytes are the wave's final content either way.
+	const producedTree = await waveTreeSoft(paths.root);
 	let patchFile: string | undefined;
 	if (baseline) {
 		const artifactName = `quarantined-${task.id}-w${wave}.patch`;
@@ -654,7 +662,7 @@ export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: numbe
 			},
 			// UI seam A.1: the terminal wave outcome closes the span; detail keeps the
 			// cause so the timeline leaves no dead-end "wave/end" label.
-			waveEndRow(task.id, wave, `quarantined: ${cause.slice(0, 200)}`),
+			waveEndRow(task.id, wave, `quarantined: ${cause.slice(0, 200)}`, producedTree),
 		],
 		statusPhase: { phase: "idle", message: `${task.id} quarantined: ${cause}` },
 	});
@@ -666,9 +674,23 @@ function artifact(path: string): string {
 
 /** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
 /** UI seam A.1: the close of one (task, wave) — outcome in `detail` so the
- *  timeline spans keep real start/end times and messages. */
-function waveEndRow(taskId: string, wave: number, outcome: string): WaveRow {
-	return { ts: Date.now(), kind: "wave", task: taskId, wave, verb: "end", detail: outcome };
+ *  timeline spans keep real start/end times and messages. A.7: `endTree` (when
+ *  captured) rides the row so the wave's isolated diff has its end point; a row
+ *  without one is a wave that is simply not isolatable, never a failed run. */
+function waveEndRow(taskId: string, wave: number, outcome: string, endTree?: string): WaveRow {
+	return { ts: Date.now(), kind: "wave", task: taskId, wave, verb: "end", detail: outcome, ...(endTree ? { treeSha: endTree } : {}) };
+}
+
+/** A.7's soft capture: the same `captureBaselineTree` throwaway-index snapshot
+ *  the baseline path uses, but a failure degrades to `undefined` — a missing
+ *  view, not a failed wave (deliberately softer than the baseline path's
+ *  throw: a missing baseline is fatal, a missing wave tree is only a view). */
+async function waveTreeSoft(root: string): Promise<string | undefined> {
+	try {
+		return await captureBaselineTree(root);
+	} catch {
+		return undefined;
+	}
 }
 
 /** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
