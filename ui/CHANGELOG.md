@@ -4,6 +4,39 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.9.0 — §18 close-out #1: the read-only conversation transcript drawer is declared shipped
+
+The drawer's functionality landed back in 0.5.0/0.5.1 (M4-a: the summary
+drawer + the bounded transcript excerpt over the Appendix A.5 seam); this
+cut ships the §18 deferral menu catching up with the code, plus the e2e
+witness the faux suite was missing. No new server or client behavior; no kit
+change (`readout.seam` stays 1; kit 0.2.3); no new deps.
+
+- **`ui/PRD.md` bookkeeping (the A.7 precedent)** — §18's "read-only
+  conversation transcript drawer (first fast-follow)" moves to shipped
+  (0.5.1, Appendix A.5); what REMAINS deferred is narrowed to the two
+  things the owner still holds back: live token streaming and conversation
+  search. §2/§5's "full conversation transcripts … (summaries only)"
+  non-goal line narrows to exactly those two (the conversation list stays
+  summaries); §7.5's "no transcript content in v1" now describes the
+  shipped drawer (bounded excerpt, caps stated in the copy, never a chat
+  client); §17's chat-client risk row and §19's decision log say the same
+  sentence.
+- **Faux-CLI e2e step for the drawer** — after the real-CLI plan/run
+  completes, the suite fetches the planner's and an implementer
+  conversation's `GET /api/conversations/:id/entries` through the cookie
+  session and asserts the bounded excerpt end to end (the plan JSON visible
+  in the excerpt, `truncated: false`, plain-JSON shapes) plus the drawer's
+  404 posture for an unknown id — the read path now has a real-run witness,
+  consistent with the KIT_FAUX patterns the suite already uses.
+- **Non-goals kept** — no live streaming, no conversation search, no chat
+  client, no pagination protocol (the ≤ 2,000-entry cap stays the
+  contract), no editing of any project file from the drawer (D5 holds).
+- **Validation** — root `npm test` (49/49) + `npm run build`; ui `npm test`
+  (224 passed/4 skipped — unchanged; the new assertions ride inside the
+  existing e2e cut), `typecheck`, `check` (0/0), `build`, `test:e2e`
+  (4/4).
+
 ## 0.8.0 — M5-slice-4: per-wave isolated diffs ship Appendix A.7
 
 The §18 deferral "per-wave isolated diffs (wave-start snapshots)" — the A.7

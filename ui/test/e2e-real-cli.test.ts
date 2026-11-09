@@ -138,6 +138,36 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// lock is free again: idempotence — our jobs list keeps BOTH records
 		const jobs = await jobsList(root);
 		expect(jobs.map((j) => j.kind).sort()).toEqual(["plan", "run"]);
+
+		// --- transcript drawer (0.9.0 §18 close-out): the real CLI seeded real
+		// conversations; the bounded A.5 excerpt route serves them through the
+		// same cookie session — the drawer's read path end to end.
+		const conversations = final.readout.storage?.conversations ?? [];
+		const plannerConv = conversations.find((c) => c.role === "planner");
+		const implementerConv = conversations.find((c) => c.role === "implementer");
+		expect(plannerConv).toBeDefined();
+		expect(implementerConv).toBeDefined();
+		const excerptRes = await fetch(`${base}/api/conversations/${plannerConv!.id}/entries`, { headers: { cookie } });
+		expect(excerptRes.status).toBe(200);
+		const excerpt = (await excerptRes.json()) as {
+			conversation: number;
+			entries: { id: number; kind: string; text: string; toolCalls?: { name: string; input: string }[] }[];
+			truncated: boolean;
+		};
+		expect(excerpt.conversation).toBe(plannerConv!.id);
+		expect(excerpt.truncated).toBe(false);
+		// the plan JSON the faux planner produced is visible in the excerpt
+		expect(excerpt.entries.some((e) => e.kind === "pi.assistant" && e.text.includes("list-parse"))).toBe(true);
+		// an implementer conversation from the run job excerpts too (bounded, plain JSON)
+		const implRes = await fetch(`${base}/api/conversations/${implementerConv!.id}/entries`, { headers: { cookie } });
+		expect(implRes.status).toBe(200);
+		const implExcerpt = (await implRes.json()) as { conversation: number; entries: { kind: string; text: string }[]; truncated: boolean };
+		expect(implExcerpt.conversation).toBe(implementerConv!.id);
+		expect(implExcerpt.entries.length).toBeGreaterThan(0);
+		expect(() => JSON.parse(JSON.stringify(implExcerpt))).not.toThrow();
+		// the drawer's 404 posture end to end: an id the project has no conversation for
+		const nope = await fetch(`${base}/api/conversations/999999/entries`, { headers: { cookie } });
+		expect(nope.status).toBe(404);
 	});
 
 	it("live diff: exclusions + content mid-wave; 409 for tasks not in flight", { timeout: 300_000 }, async () => {

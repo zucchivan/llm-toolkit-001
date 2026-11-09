@@ -73,7 +73,9 @@ Jobs, in priority order:
 - Delivery override (`commit` / `pr`); delivery stays a config + CLI decision.
 - Multi-project, project switcher, remote/LAN/Tailscale, mobile.
 - User accounts, multi-user, shared servers.
-- Full conversation transcripts or live token streaming (summaries only).
+- Live conversation token streaming or conversation search (the conversation
+  list stays summaries; the drawer serves bounded read-only excerpts —
+  Appendix A.5, shipped in 0.5.1).
 - Editing git state, resolving conflicts, staging, or committing outside
   the CLI's delivery path.
 - Browsing the durable SQLite store directly.
@@ -249,7 +251,10 @@ authoritative gate.
 
 - Conversation list with role (planner/implementer/verifier), task id, entry
   counts, resets, tool rounds, and per-conversation USD.
-- Clicking a conversation highlights its task; no transcript content in v1.
+- Clicking a conversation opens its read-only drawer (and highlights its
+  task): the stage-1 summary plus the A.5 bounded transcript excerpt
+  (newest ≤ 2,000 entries, per-entry text capped, tool results collapsed;
+  the caps state themselves in the drawer copy). Never a chat client.
 - The verifier only receives a diff stat + changed-file list from the engine;
   the UI must not imply it saw the full patch.
 
@@ -675,12 +680,14 @@ together with the milestone that consumes it.
 | Huge diffs/logs block the UI | caps, lazy file rendering, truncation notices, virtualized log |
 | Localhost attack surface | loopback bind, per-session token/cookie, origin checks, hard-coded action allowlist |
 | Svelte 5 ecosystem churn | core Svelte + Vite only; no UI kit/router/state libs |
-| Scope creep into a chat client | transcripts, streaming, and conversation search deferred; summaries only |
+| Scope creep into a chat client | the transcript drawer is read-only and bounded (A.5: newest ≤ 2,000 entries, per-entry caps, no pagination, no writing); live token streaming and conversation search stay deferred; the list stays summaries |
 | Diff semantics misunderstood | label "task diff (cumulative since baseline, N waves)"; per-wave isolated diffs deferred |
 
 ## 18. Deferred (explicitly not v1)
 
-- Read-only conversation transcript drawer (first fast-follow).
+- Read-only conversation transcript drawer — shipped in ui 0.5.1 (Appendix
+  A.5; bounded excerpts, no kit change); the §18 menu caught up at 0.9.0.
+  What remains deferred: live token streaming + conversation search.
 - Per-wave isolated diffs — shipped in ui 0.8.0 (Appendix A.7; kit 0.2.3).
 - Light theme.
 - Browser notifications (opt-in Notification API).
@@ -707,7 +714,7 @@ together with the milestone that consumes it.
 | actions | plan, approve & run, run selected, stop, handoff, verify, export |
 | diffs | per task + quarantine + live preview; cumulative semantics labeled |
 | app shape | one phase-aware page + drawers, hash deep links |
-| conversations | summaries only |
+| conversations | summaries in the list; bounded read-only transcript excerpts in the drawer (Appendix A.5, shipped 0.5.1; the §18 close-out is 0.9.0) — live token streaming + conversation search stay deferred |
 | auth | loopback + per-session token/cookie |
 | visual | dense dark operational dashboard |
 | alerts | in-page + tab-title badge |
