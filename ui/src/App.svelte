@@ -10,6 +10,7 @@
 	import type { ToastMessage } from "./components/Toasts.svelte";
 	import { actionRequestToBody, describeStopTarget, stopAcceptedLine } from "./lib/dialog-requests.ts";
 	import type { ActionRequest } from "./lib/actions-model.ts";
+	import { notifyFailure } from "./lib/notify.ts";
 	import { focusEventFilter } from "./lib/shortcuts.ts";
 	import { msDuration } from "./lib/format.ts";
 	import StatusStrip from "./components/StatusStrip.svelte";
@@ -190,6 +191,9 @@
 		for (const row of failures) {
 			if (row.ts <= lastRowTs) continue;
 			pushToast(row.severity, row.text);
+			// §18 (ui 0.10.0): the opted-in OS notification for the same new row —
+			// the lib gates on permission + pref + the tab being hidden.
+			notifyFailure(row.text);
 		}
 		lastRowTs = maxTs;
 	});

@@ -135,7 +135,10 @@ Always available, non-modal:
 - diff drawer (task or quarantine patch);
 - event log panel (wave-log tail, filter by task/kind, pause, autoscroll);
 - health panel (collapsible; errors and warnings first);
-- notification stack (in-page toasts) and tab-title badge.
+- notification stack (in-page toasts) and tab-title badge; an opt-in
+  browser-notification toggle (§18, ui 0.10.0) raises an OS notification for
+  new failure rows while the tab is hidden — permission is asked only by the
+  toggle, never on page load.
 
 No router library. Hash deep links only:
 `#/task/<id>`, `#/diff/<task>`, `#/plan`, `#/health`.
@@ -604,6 +607,15 @@ with a visible warning. Node >= 22.19, same as the kit.
 
 ### 15.2 Demo acceptance (no API keys)
 
+The acceptance recipe is ALSO a shipped feature: ui 0.10.0 made it the
+official demo mode — `llm-toolkit-ui --demo` (or `npm run demo` in `ui/`)
+performs exactly the bake below in a temp project, sets `KIT_FAUX=1` +
+`KIT_FAUX_SCRIPT=<baked>/smoke.replay` (an already-set script is honored),
+prints a DEMO banner with the baked path, and serves the UI over it. UI-side
+only — existing kit surface (`init`, the faux overlay, the fixture), no kit
+change, `readout.seam` stays 1. The raw recipe remains the documentation of
+what the mode does:
+
 ```bash
 cp -r examples/demo-prd /tmp/demo && cd /tmp/demo
 npm i <kit repo>
@@ -710,7 +722,11 @@ together with the milestone that consumes it.
   What remains deferred: live token streaming + conversation search.
 - Per-wave isolated diffs — shipped in ui 0.8.0 (Appendix A.7; kit 0.2.3).
 - Light theme.
-- Browser notifications (opt-in Notification API).
+- Browser notifications (opt-in Notification API) — shipped in ui 0.10.0:
+  a header toggle opts in; new failure rows raise an OS notification while
+  the tab is hidden, gated on the browser's permission (asked only by the
+  toggle) + the UI's localStorage preference; the in-page toasts +
+  tab-title badge stay the always-on channel.
 - LAN/Tailscale access with the same token model — shipped in ui 0.9.1
   (Appendix C.1; opt-in `--host`/`KIT_UI_HOST`, default loopback unchanged,
   no TLS; the token/cookie/same-origin model is identical on both binds).
@@ -740,6 +756,8 @@ together with the milestone that consumes it.
 | auth | loopback + per-session token/cookie |
 | visual | dense dark operational dashboard |
 | alerts | in-page + tab-title badge |
+| browser notifications | shipped as an opt-in extension of the alerts surface (ui 0.10.0): a header toggle asks the browser's Notification permission (never on page load) and the UI keeps its own localStorage preference; a new failure row raises an OS notification only while the tab is hidden — the in-page toasts + tab-title badge stay the always-on channel |
+| demo mode | §15.2's no-API-keys acceptance recipe is a shipped feature, not just a runbook: `llm-toolkit-ui --demo` bakes `examples/demo-prd` into a temp project (faux roles, init scaffold, broken-gate recipe, git base commit), exports `KIT_FAUX=1` + the replay to its spawned jobs via env inheritance, and serves the UI over it with a stated-words banner (ui 0.10.0; UI-side only — no kit change, `readout.seam` stays 1) |
 | execution | vertical slices, walking skeleton first |
 | attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
 | LAN/Tailscale access | shipped as the opt-in bind (`--host <addr>` / `KIT_UI_HOST`, default `127.0.0.1` unchanged, Appendix C.1): the SAME per-session token/cookie/same-origin model serves non-loopback peers — only the Host/Origin hostname gate widens, to any name that is this machine (interfaces incl. Tailscale, or a name resolving to one); no TLS by design — Tailscale's encrypted mesh is the supported remote path, a raw LAN is plaintext and the docs + startup banner say so in words (ui 0.9.1; kit untouched) |

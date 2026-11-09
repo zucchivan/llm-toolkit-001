@@ -4,6 +4,7 @@
 	import { healthAlertText } from "../lib/view.ts";
 	import type { JobRecord } from "../../server/jobs.ts";
 	import BudgetBar from "./BudgetBar.svelte";
+	import NotifyToggle from "./NotifyToggle.svelte";
 
 	let { snapshot, now, connected, sleepTitle = undefined, activeJob = undefined, attachedPid = undefined, healthOpen = false, onToggleHealth }: {
 		snapshot: ReadoutSnapshot;
@@ -83,6 +84,9 @@
 		</button>
 		<span class="muted alert-text" style="font-size:11.5px" title={failingTitle}>{alertText ?? "health ok"}</span>
 		<span class="muted" style="font-size:11.5px" title="readout at {new Date(snapshot.at).toISOString()}">updated {relativeAge(age)}</span>
+
+		<!-- §18 (ui 0.10.0): the opt-in browser-notification toggle — see NotifyToggle. -->
+		<NotifyToggle />
 	</div>
 
 	<BudgetBar usage={readout.usage} />

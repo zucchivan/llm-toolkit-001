@@ -4,6 +4,52 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.10.0 — §18: browser notifications (opt-in Notification API)
+
+The third §18 menu item shipped; an agent pick, not an owner pick — the
+owner-held pair (live token streaming + conversation search) and the D5-held
+editors stay deferred. Pure UI: no kit change (`readout.seam` stays 1; kit
+0.2.3); no new deps; no server surface (the toggle and the dispatch both
+live in the client).
+
+- **Two gates, both user-controlled** — the browser's Notification
+  permission (asked ONLY when the header toggle is clicked on, never on page
+  load) and the UI's own `localStorage` preference (`kit-ui-notify`,
+  default off). A dismissed or denied prompt never turns the preference on.
+- **Same news stream, extra channel** — a NEW failure row (the exact rows
+  that push toasts and the tab-title badge, §7.1) raises one OS
+  notification titled `llm-toolkit-001 · run needs attention`, only while
+  the tab is hidden: an open dashboard never gets duplicate noise. The
+  in-page toasts + tab-title badge stay the always-on channel; this is an
+  opt-in extension, not a replacement. Permission + preference are read at
+  dispatch time, so a mid-session revoke or toggle-off is honored without a
+  reload.
+- **States say their reason** — `off` (click to ask), `on` (click to turn
+  the pref off), `blocked` (the browser denied it; re-enable in site
+  settings), `unavailable` (no Notification API in this context). Body text
+  caps at 240 chars; a throwing Notification constructor is swallowed, never
+  propagated to the page.
+- **Validation** — ui `npm test` (258 passed/4 skipped = the 235 baseline +
+  21 notifications tests + 2 demo-mode tests), `typecheck`, `check` (0/0),
+  `build`, `test:e2e` (4/4); root `npm test` (49/49) + `npm run build`. PRD
+  §18/§7.1/§15.2/§19 + README bookkeeping per the A.7 precedent.
+- **Demo mode — the official simulated backend (§15.2 as a feature)** —
+  `llm-toolkit-ui --demo` / `npm run demo` bakes `examples/demo-prd` into a
+  temp project (faux-role config, init scaffold, `[broken-gate]` recipe, one
+  git base commit with a local identity), exports `KIT_FAUX=1` +
+  `KIT_FAUX_SCRIPT=<baked>/smoke.replay` to spawned jobs (env inheritance,
+  §12; an already-set script is honored), and serves the UI over it. The
+  startup banner states the simulation in words, prints the baked path (left
+  for post-mortem), and names the expected arc (task `list-query` fails its
+  gate on wave 1, wave 2 fixes it → `STATUS: COMPLETE`). Incompatible with
+  `--project`; `--port`/`--host`/`--no-open` compose. New coverage:
+  `test/demo-mode.test.ts` (bake contract — config parses with all-faux roles,
+  §5 scaffold + gate recipe on disk, git HEAD — plus a real server on the
+  bake serving the readout at seam 1); driven end-to-end through the real bin
+  (banner + token exchange 302 + a UI-spawned plan job exiting 0 on the faux
+  replay). UI-side only: existing kit surface, no kit change (`readout.seam`
+  stays 1); no new deps.
+
 ## 0.9.1 — §18 deferral #4: LAN/Tailscale access with the same token model (opt-in bind)
 
 The loopback default is untouched — this ships the owner's second §18 pick as

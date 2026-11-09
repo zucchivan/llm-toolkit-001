@@ -2,11 +2,18 @@
  * llm-toolkit-ui — bin entry (ui/PRD.md §8.1/§14/Appendix C).
  *
  *   llm-toolkit-ui [--port 0] [--no-open] [--project <dir>] [--host 127.0.0.1]
+ *                    [--demo]
  *
  * One project per server process: resolved from --project or the cwd. Missing
  * `.orch/config.toml` → the CLI's plain-words error + exit 1 (no UI). A random
  * token mints per start and lands only in the printed/opened URL; the loopback
  * server exchanges it for an HttpOnly cookie.
+ *
+ * `--demo` (ui/PRD.md §15.2) is the official simulated backend: it bakes
+ * `examples/demo-prd` into a temp project and serves the UI over it with
+ * `KIT_FAUX=1` + the fixture's `smoke.replay` — zero API keys, the full
+ * plan → gate-fail → reset → complete arc. Incompatible with `--project`
+ * (the demo bakes its own root).
  *
  * Bind (Appendix C / C.1): loopback by default. `--host <addr>` (or KIT_UI_HOST)
  * opts into a LAN/Tailscale bind under the same per-session token model —
@@ -19,11 +26,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bindPostureFor, newToken } from "./auth.ts";
+import { bakeDemoProject } from "./demo.ts";
 import { startServer } from "./server.ts";
 import { openBrowser } from "./browser.ts";
 
 const here = dirname(fileURLToPath(import.meta.url)); // ui/server
 const uiRoot = dirname(here); // ui/
+const repoRoot = dirname(uiRoot); // the kit repo root (the bin shim's layout)
 
 function packageVersion(): string {
 	try {
@@ -40,9 +49,27 @@ async function main(): Promise<void> {
 			"no-open": { type: "boolean", default: false },
 			project: { type: "string" },
 			host: { type: "string" },
+			demo: { type: "boolean", default: false },
 		},
 		strict: false,
 	});
+
+	// Demo mode (§15.2): bake the simulated project BEFORE resolving the root.
+	// An explicit KIT_FAUX_SCRIPT in the environment is honored (e.g. the slow
+	// arc); the default is the fixture's smoke.replay.
+	if (values["demo"] === true) {
+		if (typeof values["project"] === "string" && values["project"].trim()) {
+			console.error("--demo bakes its own project — drop --project (or run without --demo against your project)");
+			process.exit(2);
+		}
+		const baked = await bakeDemoProject(repoRoot);
+		process.env["KIT_FAUX"] = "1";
+		process.env["KIT_FAUX_SCRIPT"] ??= baked.replay;
+		console.log("[demo] SIMULATED BACKEND — no API keys: the kit's faux provider replays examples/demo-prd's scripted conversation");
+		console.log("[demo] expect: plan → 3 review cards → approve & run → task list-query fails its gate on wave 1 → wave 2 fixes it → STATUS: COMPLETE");
+		console.log(`[demo] baked project: ${baked.root} — left in place for post-mortem (delete it any time)`);
+		values["project"] = baked.root;
+	}
 
 	const projectArg = values["project"];
 	const root = resolve(typeof projectArg === "string" && projectArg.trim() ? projectArg : process.cwd());

@@ -78,7 +78,11 @@ entry for the status strip / task table / event log / degradation basics):
 - **Failure surfacing** — toasts for gate fails / verifier rejections /
   quarantines / provider-reset sleeps / failed or interrupted job exits,
   plus a tab-title badge; job records show exit codes plainly
-  (0 ok · 42 sleeping · 130 interrupted · other failed).
+  (0 ok · 42 sleeping · 130 interrupted · other failed). An opt-in
+  browser-notification toggle in the header (§18, ui 0.10.0) raises an OS
+  notification for the same new failures while the tab is hidden — gated on
+  the browser's Notification permission (asked only when you click it on)
+  and the UI's own preference; never on page load.
 - **Safety** (Appendix C step 5) — mutations need the session cookie AND the
   `X-Kit-Token` echo (a non-HttpOnly companion cookie minted at handshake)
   AND a same-origin Origin/Sec-Fetch-Site check; one mutating job at a time;
@@ -291,6 +295,23 @@ npm --prefix ui run test:e2e     # real-CLI faux e2e: plan/run jobs end to end (
 
 `npm --prefix ui test` and `typecheck` do not need the client build; hitting the
 UI in a browser needs `npm --prefix ui run build` first (vite app → `ui/dist`).
+
+### Demo mode — the official simulated backend (no API keys)
+
+`npm --prefix ui run demo` (same as `llm-toolkit-ui --demo`) bakes the kit
+repo's `examples/demo-prd` fixture into a fresh temp project and serves the UI
+over it with the kit's faux provider replaying the fixture's scripted
+conversation — every model request is answered from `smoke.replay`, so you can
+click through Plan → review cards → Approve & run → diffs → completion report
+with zero provider credentials. What to expect: task `list-query` fails its
+gate on wave 1 (the driver resets the conversation) and wave 2 fixes it →
+`STATUS: COMPLETE`. The startup banner says all of this next to the URL, prints
+the baked project path (left in place for post-mortem — delete it any time),
+and an already-set `KIT_FAUX_SCRIPT` is honored, so `KIT_FAUX_SCRIPT=…/smoke-slow.replay
+npm --prefix ui run demo` rides the slow arc. `--demo` is incompatible with
+`--project` (it bakes its own root); `--port`/`--host`/`--no-open` compose.
+The manual recipe and pass criteria live in `ui/PRD.md` §15.2; the fixture and
+the replay-file format are documented in the kit README's "Scripted smoke".
 
 ### Testing policy (M3, §15.1)
 
