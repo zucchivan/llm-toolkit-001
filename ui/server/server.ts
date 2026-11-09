@@ -25,14 +25,17 @@
  *                           process identity must verify — one SIGINT, else
  *                           409 with the plain reason and NO signal)
  *
- * Loopback bind only; the lock is never held between requests; the server never
- * writes loop state — actions run as detached CLI jobs (Appendix B).
+ * Loopback bind by default (Appendix C); `--host` opts into the LAN/Tailscale
+ * posture (Appendix C.1) under the same token model. The lock is never held
+ * between requests; the server never writes loop state — actions run as
+ * detached CLI jobs (Appendix B).
  */
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
 import type { AddressInfo } from "node:net";
-import { checkMutationAuth, csrfCookie, hasValidCookie, isLoopbackPeer, MutationAuthError, sessionCookie, tokenEquals } from "./auth.ts";
+import { networkInterfaces } from "node:os";
+import { bindPostureFor, checkMutationAuth, csrfCookie, hasValidCookie, isLoopbackPeer, MutationAuthError, sessionCookie, tokenEquals, type BindPosture } from "./auth.ts";
 import { readConversationEntries, readOnce } from "./readout.ts";
 import { readProjectSources } from "./sources.ts";
 import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName, waveTaskDiff } from "./diff.ts";
@@ -49,6 +52,12 @@ export interface UiServerOptions {
 	token: string;
 	/** 0 = ephemeral; the resolved port lands in the returned url. */
 	port: number;
+	/**
+	 * Bind address; default "127.0.0.1" (loopback posture, Appendix C). Any
+	 * non-loopback bind — interface address, machine name, or wildcard — is the
+	 * explicit LAN/Tailscale opt-in (Appendix C.1): same token model, no TLS.
+	 */
+	host?: string;
 	/** Built client bundle directory (ui/dist). */
 	distDir: string;
 	heartbeatMs?: number;
@@ -66,6 +75,9 @@ export interface RunningUiServer {
 }
 
 export function startServer(opts: UiServerOptions): Promise<RunningUiServer> {
+	const bindHost = opts.host ?? "127.0.0.1";
+	// C.1: decided from the BIND string, never from the request (see auth.ts).
+	const posture = bindPostureFor(bindHost);
 	const hub = startSnapshotHub(opts.root);
 	if (!opts.skipJobSweep) {
 		void markStaleRecords(opts.root)
@@ -76,19 +88,19 @@ export function startServer(opts: UiServerOptions): Promise<RunningUiServer> {
 			.catch((err) => console.error(`[llm-toolkit-ui] job sweep failed: ${(err as Error).message}`));
 	}
 	const server = createServer((req, res) => {
-		void route(req, res, opts, hub).catch((err) => {
+		void route(req, res, opts, hub, posture).catch((err) => {
 			jsonError(res, 500, `ui server error: ${(err as Error).message}`);
 		});
 	});
 	return new Promise((resolveRunning, rejectRunning) => {
 		server.once("error", rejectRunning);
-		server.listen(opts.port, "127.0.0.1", () => {
+		server.listen(opts.port, bindHost, () => {
 			const address = server.address() as AddressInfo;
 			resolveRunning({
 				server,
 				port: address.port,
 				hub,
-				url: `http://127.0.0.1:${address.port}/?token=${opts.token}`,
+				url: `http://${displayHostFor(bindHost, posture)}:${address.port}/?token=${opts.token}`,
 				shutdown: async () => {
 					hub.stop();
 					await closeServer(server);
@@ -96,6 +108,26 @@ export function startServer(opts: UiServerOptions): Promise<RunningUiServer> {
 			});
 		});
 	});
+}
+
+/**
+ * C.1: the host printed/opened in the session URL. Loopback posture always
+ * prints 127.0.0.1 (the v1 contract). A LAN bind prints the bind host as
+ * given, except a WILDCARD bind prints the machine's first external IPv4
+ * ("0.0.0.0" is not a host anyone can open) — loopback still reaches a
+ * wildcard bind, so the fallback keeps the URL usable on interface-less
+ * machines.
+ */
+function displayHostFor(bindHost: string, posture: BindPosture): string {
+	if (posture === "loopback") return "127.0.0.1";
+	const name = bindHost.trim().toLowerCase();
+	if (name !== "0.0.0.0" && name !== "::" && name !== "") return bindHost;
+	for (const list of Object.values(networkInterfaces())) {
+		for (const entry of list ?? []) {
+			if (entry.family === "IPv4" && !entry.internal) return entry.address;
+		}
+	}
+	return "127.0.0.1";
 }
 
 function jsonError(res: ServerResponse, status: number, error: string, detail?: Record<string, unknown>): void {
@@ -112,7 +144,7 @@ function closeServer(server: Server): Promise<void> {
 	});
 }
 
-async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOptions, hub: SnapshotHub): Promise<void> {
+async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOptions, hub: SnapshotHub, posture: BindPosture): Promise<void> {
 	const port = (res.socket?.localPort) ?? opts.port;
 	const url = new URL(req.url ?? "/", "http://127.0.0.1");
 	const pathname = url.pathname;
@@ -145,7 +177,11 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 
 	// --- API: cookie required for everything under /api (SSE uses the cookie too)
 	if (pathname.startsWith("/api/")) {
-		if (!isLoopbackPeer(req)) {
+		// C.1: the loopback-peer refusal is the DEFAULT posture's gate only. The
+		// opt-in LAN bind serves any reachable peer — the session cookie below is
+		// the peer control in both postures, and mutations still pass the full
+		// Appendix-C triple at the POST route.
+		if (posture === "loopback" && !isLoopbackPeer(req)) {
 			jsonError(res, 403, "this server is loopback-only");
 			return;
 		}
@@ -154,7 +190,7 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 			jsonError(res, 401, "unauthorized — reopen the URL printed by llm-toolkit-ui");
 			return;
 		}
-		if (req.method !== "GET" && !isLoopbackPeer(req)) {
+		if (posture === "loopback" && req.method !== "GET" && !isLoopbackPeer(req)) {
 			jsonError(res, 403, "mutations are loopback-only");
 			return;
 		}
@@ -402,9 +438,12 @@ async function serveJobRoute(
 }
 
 async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: UiServerOptions, hub: SnapshotHub, port: number): Promise<void> {
-	// Appendix C step 5: cookie (already checked) + X-Kit-Token echo + same-origin.
+	// Appendix C step 5 + C.1: cookie (already checked) + X-Kit-Token echo +
+	// same-origin. The posture came from the bind, so the default loopback
+	// server keeps the exact loopback gates; an opt-in LAN bind widens only the
+	// hostname acceptance (to this machine's names) — never the secrets.
 	try {
-		checkMutationAuth(req, opts.token, port);
+		await checkMutationAuth(req, opts.token, port, bindPostureFor(opts.host ?? "127.0.0.1"));
 	} catch (err) {
 		if (err instanceof MutationAuthError) {
 			jsonError(res, err.status, err.message);

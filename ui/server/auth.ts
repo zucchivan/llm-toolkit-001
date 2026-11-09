@@ -1,10 +1,20 @@
 /**
- * Auth (ui/PRD.md Appendix C): one random 256-bit token per server start.
- * `GET /?token=…` exchanges it once for an `HttpOnly; SameSite=Strict` cookie;
- * every /api request after that only needs the cookie. The token never
- * appears in logs and invalidates with the next server restart.
+ * Auth (ui/PRD.md Appendix C + C.1): one random 256-bit token per server
+ * start. `GET /?token=…` exchanges it once for an `HttpOnly; SameSite=Strict`
+ * cookie; every /api request after that only needs the cookie. The token
+ * never appears in logs and invalidates with the next server restart.
+ *
+ * C.1: the bind is loopback by default (the v1 contract — peer gate + the
+ * loopback-only Host/Origin checks below). `--host`/`KIT_UI_HOST` opts into
+ * a non-loopback bind under the SAME token model: the cookie stays the peer
+ * control for every /api route, and the mutation Host/Origin check accepts
+ * any name that IS this machine (interface addresses incl. Tailscale, plus
+ * names that resolve to one). No TLS either way — C.1 says so in words.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 
 export const COOKIE_NAME = "kit_ui";
 /** Non-HttpOnly companion cookie: the SPA reads it to echo X-Kit-Token (Appendix C step 5). */
@@ -64,10 +74,13 @@ export interface RequestLike {
 }
 
 /**
- * Mutation auth (Appendix C step 5, §12): the session cookie (401 path), the
- * `X-Kit-Token` header echo, AND a same-origin referral check — accept only a
- * same-origin `Origin`/`Sec-Fetch-Site`; a genuinely absent pair (non-browser
- * client that already knows the token) passes the other two factors.
+ * Mutation auth (Appendix C step 5 + C.1, §12): the session cookie (401 path),
+ * the `X-Kit-Token` header echo, AND a same-origin referral check — accept
+ * only a same-origin `Origin`/`Sec-Fetch-Site`; a genuinely absent pair
+ * (non-browser client that already knows the token) passes the other two
+ * factors. The cookie + CSRF pair is posture-independent; only the Host and
+ * Origin HOSTNAME gates widen on an opt-in LAN bind (and only to names that
+ * are this machine — see isOwnHostname).
  */
 export class MutationAuthError extends Error {
 	readonly status: 401 | 403;
@@ -83,10 +96,88 @@ export function isLoopbackPeer(req: RequestLike): boolean {
 	return remote === "127.0.0.1" || remote === "::1" || remote === ""; // "" only in direct unit tests
 }
 
-export function checkMutationAuth(req: RequestLike, token: string, servedPort: number): void {
+// ---------------------------------------------------------------------------
+// C.1 — bind posture: the default loopback bind keeps every gate; the opt-in
+// non-loopback bind serves the same token model to LAN/Tailscale peers.
+// ---------------------------------------------------------------------------
+
+/**
+ * The posture a bind host implies (C.1). Loopback names keep the loopback-only
+ * gates byte-for-byte; ANY other bind — a concrete interface address, a
+ * machine name, a wildcard — is the explicit LAN opt-in. Decided from the
+ * bind string, not the request: opting in is the owner's act, and a hostname
+ * that resolves to loopback while named oddly is still an explicit opt-in.
+ */
+export type BindPosture = "loopback" | "lan";
+
+const LOOPBACK_BIND_HOSTS = new Set(["127.0.0.1", "::1", "localhost", "ip6-localhost"]);
+
+export function bindPostureFor(host: string): BindPosture {
+	return LOOPBACK_BIND_HOSTS.has(host.trim().toLowerCase()) ? "loopback" : "lan";
+}
+
+/** Every address this machine answers on (LAN + Tailscale interfaces included), refreshed lazily. */
+let interfaceCache: { at: number; addrs: Set<string> } | undefined;
+const INTERFACE_CACHE_MS = 30_000;
+
+function localInterfaceAddresses(): Set<string> {
+	const now = Date.now();
+	if (interfaceCache && now - interfaceCache.at < INTERFACE_CACHE_MS) return interfaceCache.addrs;
+	const addrs = new Set<string>();
+	for (const list of Object.values(networkInterfaces())) {
+		for (const entry of list ?? []) {
+			// strip the zone id ("fe80::1%eth0") and case-fold IPv6 hex
+			addrs.add(entry.address.split("%")[0]!.toLowerCase());
+		}
+	}
+	interfaceCache = { at: now, addrs };
+	return addrs;
+}
+
+const HOSTNAME_ANSWER_CACHE_LIMIT = 64;
+const hostnameAnswerCache = new Map<string, boolean>();
+
+/**
+ * C.1 same-origin generalization: a hostname names THIS server when it is a
+ * loopback/wildcard name, an IP literal of one of our interfaces, or a name
+ * that resolves (dns.lookup, cached) to one — so a Tailscale MagicDNS name
+ * or a LAN hostname passes the Host/Origin checks exactly like 127.0.0.1
+ * does on the default bind. Unresolvable names are not us (an mDNS hiccup
+ * answers false; use the address — the refusal says so).
+ */
+export async function isOwnHostname(hostname: string): Promise<boolean> {
+	const name = hostname.trim().toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+	if (name === "0.0.0.0" || name === "::") return true; // wildcard names mean "whatever this is"
+	if (isLoopbackName(name)) return true;
+	const literal = isIP(name);
+	if (literal !== 0) return localInterfaceAddresses().has(name);
+	const cached = hostnameAnswerCache.get(name);
+	if (cached !== undefined) return cached;
+	let answer = false;
+	try {
+		const { address } = await lookup(name);
+		answer = localInterfaceAddresses().has(address.split("%")[0]!.toLowerCase());
+	} catch {
+		answer = false;
+	}
+	if (hostnameAnswerCache.size >= HOSTNAME_ANSWER_CACHE_LIMIT) hostnameAnswerCache.clear();
+	hostnameAnswerCache.set(name, answer);
+	return answer;
+}
+
+export async function checkMutationAuth(req: RequestLike, token: string, servedPort: number, posture: BindPosture = "loopback"): Promise<void> {
 	const host = String(req.headers.host ?? "");
-	if (!localHostIntl(host, servedPort)) {
-		throw new MutationAuthError(403, `mutation rejected: this server serves 127.0.0.1:${servedPort} — the request claims host ${host || "(none)"}`);
+	// C.1: the Host gate. Loopback bind: the exact loopback-name check (the v1
+	// contract, unchanged). LAN bind: any of this machine's names on the
+	// session port — the bind was the opt-in, the port is the session.
+	const hostOk = posture === "loopback" ? localHostIntl(host, servedPort) : await ownHostOnPort(host, servedPort);
+	if (!hostOk) {
+		throw new MutationAuthError(
+			403,
+			posture === "loopback"
+				? `mutation rejected: this server serves 127.0.0.1:${servedPort} — the request claims host ${host || "(none)"}`
+				: `mutation rejected: this server serves its own machine's names on :${servedPort} — the request claims host ${host || "(none)"}`,
+		);
 	}
 
 	if (!hasValidCookie(req as { headers: { cookie?: string } }, token)) {
@@ -111,7 +202,10 @@ export function checkMutationAuth(req: RequestLike, token: string, servedPort: n
 		let ok = false;
 		try {
 			const parsed = new URL(origin);
-			ok = parsed.protocol === "http:" && parsed.port === String(servedPort) && isLoopbackName(parsed.hostname);
+			ok =
+				parsed.protocol === "http:" &&
+				parsed.port === String(servedPort) &&
+				(posture === "loopback" ? isLoopbackName(parsed.hostname) : await isOwnHostname(parsed.hostname));
 		} catch {
 			ok = false;
 		}
@@ -127,6 +221,18 @@ export function checkMutationAuth(req: RequestLike, token: string, servedPort: n
 
 function localHostIntl(host: string, port: number): boolean {
 	return host === `127.0.0.1:${port}` || host === `localhost:${port}` || host === `[::1]:${port}`;
+}
+
+/** C.1: the Host header names this server — one of our names on the session port. */
+async function ownHostOnPort(host: string, port: number): Promise<boolean> {
+	if (!host) return false;
+	let parsed: URL;
+	try {
+		parsed = new URL(`http://${host}`);
+	} catch {
+		return false; // not a host header shape we serve
+	}
+	return parsed.port === String(port) && (await isOwnHostname(parsed.hostname));
 }
 
 function isLoopbackName(hostname: string): boolean {

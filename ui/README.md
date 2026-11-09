@@ -261,6 +261,13 @@ boundary, no import cycle. Without the UI package: it prints
 The server:
 
 - binds `127.0.0.1` only; default port ephemeral (`--port 0`), `--port n` to pin;
+- `--host <addr>` (or `KIT_UI_HOST`) opts into a LAN/Tailscale bind under the
+  same token model (Appendix C.1): the per-session token, one-time exchange,
+  cookie flags, and mutation triple are identical; only the Host/Origin gate
+  widens, to names that are this machine. No TLS anywhere — over Tailscale the
+  encrypted mesh carries it; over a raw LAN the traffic (handshake token
+  included) is PLAINTEXT and anyone with the URL acts as you. A wildcard
+  (`0.0.0.0`) prints the machine's first LAN address; loopback still reaches it;
 - prints (and opens, unless `--no-open`) `http://127.0.0.1:<port>/?token=<token>`;
 - the `?token` handshakes **once** for an `HttpOnly; SameSite=Strict` cookie,
   then `302 /` (the client also strips it from the address bar);
@@ -358,5 +365,7 @@ build`) and the ui sub-product (`test`, `typecheck`, `svelte-check` via
 `check`, `build`, and the faux e2e, which builds the kit first because it
 spawns the real `dist/cli.js`). Node 22 — both packages require ≥ 22.19.
 
-Node ≥ 22.19 (same as the kit). Everything is local-machine only — loopback,
-one user, no TLS — exactly as scoped in `ui/PRD.md` §12 for v1.
+Node ≥ 22.19 (same as the kit). Everything is single-user — loopback by
+default, opt-in LAN/Tailscale bind (same token model, no TLS — Tailscale's
+encrypted mesh is the supported remote shape; a raw LAN is plaintext and the
+startup banner says so), exactly as scoped in `ui/PRD.md` §12 + Appendix C.1.

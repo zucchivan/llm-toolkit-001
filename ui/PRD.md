@@ -71,7 +71,9 @@ Jobs, in priority order:
   `evals/recipes.toml` from the UI.
 - Creating, deleting, or reordering tasks; overriding the planner's graph.
 - Delivery override (`commit` / `pr`); delivery stays a config + CLI decision.
-- Multi-project, project switcher, remote/LAN/Tailscale, mobile.
+- Multi-project, project switcher, mobile.
+- TLS of any kind (the LAN/Tailscale opt-in below ships plaintext-only, by
+  design).
 - User accounts, multi-user, shared servers.
 - Live conversation token streaming or conversation search (the conversation
   list stays summaries; the drawer serves bounded read-only excerpts —
@@ -258,14 +260,21 @@ authoritative gate.
 - The verifier only receives a diff stat + changed-file list from the engine;
   the UI must not imply it saw the full patch.
 
-### 7.6 Local-only operation
+### 7.6 Local operation — loopback default, opt-in LAN/Tailscale (C.1)
 
-- Bind `127.0.0.1` only; no `0.0.0.0`, no LAN, no TLS in v1.
+- Bind `127.0.0.1` by default. `--host <addr>` (or `KIT_UI_HOST`) opts into a
+  non-loopback bind — a concrete interface address (LAN or Tailscale), a
+  machine name, or `0.0.0.0` for every interface. The opt-in keeps the ENTIRE
+  token model (Appendix C.1); there is still no TLS: over a Tailscale tailnet
+  the encrypted mesh carries the traffic, over a raw LAN the HTTP — handshake
+  token included — is PLAINTEXT and the startup banner says so.
 - Per-session random token; the opened URL carries it once and is exchanged
-  for an `HttpOnly; SameSite=Strict` cookie (Appendix C).
+  for an `HttpOnly; SameSite=Strict` cookie (Appendix C) — the flags never
+  change with the bind, and the cookie is never `Secure` (no TLS).
 - Default port: ephemeral (0), printed in the terminal; `--port` to pin.
-- Open the browser automatically unless `--no-open`; failure to open prints the
-  URL.
+- Open the browser automatically unless `--no-open`; failure to open prints
+  the URL. A wildcard bind prints the machine's first LAN address (never
+  `0.0.0.0`); loopback still reaches it.
 - No provider credentials reach the browser. The UI server inherits the
   environment it was started with (same as the CLI).
 
@@ -409,7 +418,9 @@ briefly on `LockBusyError`, then degrades.
 
 ### 11.2 HTTP API
 
-All routes are same-origin, loopback, cookie/token authenticated (Appendix C).
+All routes are same-origin + cookie/token authenticated (Appendix C); the
+bind is loopback by default, with the opt-in LAN/Tailscale posture in
+Appendix C.1. GETs need the session cookie from every peer in both postures.
 JSON errors: `{ error: string, detail?: string }` with the listed status codes.
 
 | method | path | purpose |
@@ -476,7 +487,11 @@ Rules:
 
 ## 12. Security
 
-- Loopback bind only; no remote access in v1.
+- Loopback bind by default; non-loopback binds are the explicit opt-in
+  (`--host` / `KIT_UI_HOST`) and keep the full token model (Appendix C.1).
+  No TLS anywhere: a raw LAN is plaintext — anyone who can reach the port and
+  learn the token acts as you — so Tailscale's encrypted mesh is the supported
+  remote shape and the startup banner states the posture in words.
 - Random 256-bit token per server start:
   - URL `?token=` is exchanged once for an `HttpOnly; SameSite=Strict` cookie,
     then stripped via `302` + `history.replaceState` on the client.
@@ -577,7 +592,11 @@ with a visible warning. Node >= 22.19, same as the kit.
   lock-busy 409, job spawn/exit/reattach/stale, verified attached stop
   (§7.2.1: identity match signals once; every failed check signals nothing),
   artifact path traversal,
-  SSE snapshot delivery and heartbeat.
+  SSE snapshot delivery and heartbeat,
+  opt-in LAN bind (Appendix C.1): default loopback unchanged; a wildcard bind
+  serves loopback too under the cookie; mutations still triple-checked on a
+  LAN bind (cookie + X-Kit-Token + this-machine Host/Origin); foreign
+  Host/Origin refused.
 - **UI tests:** task table sorting/filtering, plan selection, diff parser
   (hunks, binary, truncation), status strip states, phase switching,
   empty/error states, confirmation dialogs.
@@ -679,6 +698,7 @@ together with the milestone that consumes it.
 | Side-car drift / stale view | `at` timestamp, "last updated", degraded badge, health checks |
 | Huge diffs/logs block the UI | caps, lazy file rendering, truncation notices, virtualized log |
 | Localhost attack surface | loopback bind, per-session token/cookie, origin checks, hard-coded action allowlist |
+| A LAN bind widens the surface | opt-in `--host` only (the default stays loopback); the per-session token + cookie + same-origin triple is unchanged — only the hostname gate widens, to this machine's names; raw LAN is plaintext and says so, Tailscale is the encrypted path (C.1) |
 | Svelte 5 ecosystem churn | core Svelte + Vite only; no UI kit/router/state libs |
 | Scope creep into a chat client | the transcript drawer is read-only and bounded (A.5: newest ≤ 2,000 entries, per-entry caps, no pagination, no writing); live token streaming and conversation search stay deferred; the list stays summaries |
 | Diff semantics misunderstood | label "task diff (cumulative since baseline, N waves)"; per-wave isolated diffs deferred |
@@ -691,7 +711,9 @@ together with the milestone that consumes it.
 - Per-wave isolated diffs — shipped in ui 0.8.0 (Appendix A.7; kit 0.2.3).
 - Light theme.
 - Browser notifications (opt-in Notification API).
-- LAN/Tailscale access with the same token model.
+- LAN/Tailscale access with the same token model — shipped in ui 0.9.1
+  (Appendix C.1; opt-in `--host`/`KIT_UI_HOST`, default loopback unchanged,
+  no TLS; the token/cookie/same-origin model is identical on both binds).
 - Multi-project switcher.
 - macOS variant B for attached stop — the runner recording `{pid, argv,
   startedAt}` into `status.json` (the Linux `/proc` path ships in
@@ -720,6 +742,7 @@ together with the milestone that consumes it.
 | alerts | in-page + tab-title badge |
 | execution | vertical slices, walking skeleton first |
 | attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
+| LAN/Tailscale access | shipped as the opt-in bind (`--host <addr>` / `KIT_UI_HOST`, default `127.0.0.1` unchanged, Appendix C.1): the SAME per-session token/cookie/same-origin model serves non-loopback peers — only the Host/Origin hostname gate widens, to any name that is this machine (interfaces incl. Tailscale, or a name resolving to one); no TLS by design — Tailscale's encrypted mesh is the supported remote path, a raw LAN is plaintext and the docs + startup banner say so in words (ui 0.9.1; kit untouched) |
 | per-wave isolated diffs | shipped as Appendix A.7 (drafted alongside 0.7.1, implemented at the explicit go-ahead in the same wrap-up): wave start/end rows carry the wave's own git tree (optional additive `treeSha`; failed capture → row without the field, never a failed run; quarantine captures BEFORE the rollback), a tree-to-tree display wrapper with the A.2 exclusions/caps, readout spans echo start/end trees, and `GET /api/tasks/:id/diff?wave=N` + a wave selector in the drawer — the isolated view is labeled, the cumulative default stays, display diffs are never a rollback input (kit 0.2.3; readout.seam stays 1) |
 
 ## Appendix A — Core seam (required, additive)
@@ -886,6 +909,43 @@ drawer).
    in the terminal" message. Restarting the server invalidates all sessions.
 7. The token never appears in logs after the initial URL; the server redacts it
    from access logs.
+
+### C.1 — LAN/Tailscale posture (shipped: ui 0.9.1)
+
+The bind is `127.0.0.1` by default and steps 1–7 above are unchanged. The
+owner's LAN/Tailscale deferral ships as an OPT-IN bind switch — `--host <addr>`
+(or `KIT_UI_HOST`) — that serves the same control surface to non-loopback
+peers under the SAME token model. There is no second auth system and no TLS.
+
+- **What the opt-in keeps, verbatim:** steps 1–7 — the per-session random
+  256-bit token, the one-time `?token=` exchange, the
+  `HttpOnly; SameSite=Strict` per-session cookie (never `Secure`: there is no
+  TLS), the restart invalidates everything rule, and the token never logging.
+- **Peer control:** `/api` and SSE require the session cookie from EVERY peer
+  in both postures. The loopback-peer refusal (`403 this server is
+  loopback-only`) is the default posture's gate only; on an opt-in bind it
+  stands down because the bind itself was the opt-in.
+- **Mutations:** unchanged triple — session cookie (401 path) + `X-Kit-Token`
+  echo + same-origin referral. Only the Host/Origin HOSTNAME gate generalizes:
+  it accepts any `http:` hostname on the session port that names THIS machine —
+  a loopback or wildcard name, an IP literal of one of our interfaces
+  (`os.networkInterfaces()`, LAN and Tailscale addresses included), or a name
+  that resolves (`dns.lookup`, cached) to one — so a Tailscale MagicDNS name
+  works exactly like `127.0.0.1` does on the default bind. A foreign or
+  unresolvable Host/Origin is still refused with the plain reason.
+- **Threat posture, in stated words:** there is NO TLS. Over a Tailscale
+  tailnet the encrypted mesh carries the traffic and that is the supported
+  remote shape. Over a RAW LAN the HTTP — the handshake URL with its token
+  included — is PLAINTEXT: anyone who can reach the port and learn the token
+  can act as you. Treat the printed URL as a secret, keep it out of chat and
+  shell history, and prefer a tailnet (or an SSH tunnel) for anything beyond a
+  trusted LAN. The startup banner states this next to the URL.
+- **Surface notes:** one listener per process (no second port); a wildcard
+  bind prints the machine's first LAN address in the URL (never `0.0.0.0`),
+  and loopback still reaches it; the UI remains single-user — no accounts, no
+  sharing, no multi-user anything.
+- **Non-goals:** no TLS, no extra listener auth, no allowlist of LAN clients,
+  no hostname pinning config. The opt-in is the whole switch.
 
 ## Appendix D — File/ownership boundaries
 

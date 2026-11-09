@@ -4,6 +4,46 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.9.1 — §18 deferral #4: LAN/Tailscale access with the same token model (opt-in bind)
+
+The loopback default is untouched — this ships the owner's second §18 pick as
+an explicit opt-in. No kit change (the `llm-toolkit-001 ui` forwarder passes
+args through; `readout.seam` stays 1); no new deps; no TLS.
+
+- **`--host <addr>` (or `KIT_UI_HOST`)** — binds a non-loopback address
+  (concrete LAN/Tailscale address, machine name, or `0.0.0.0` for every
+  interface). Decided from the bind string, never the request: loopback names
+  (`127.0.0.1`, `::1`, `localhost`) keep today's posture byte-for-byte; any
+  other bind is the opt-in. An empty `--host`/`KIT_UI_HOST` is a usage error,
+  not a wildcard.
+- **The token model is identical on both binds** — per-session random 256-bit
+  token, one-time `?token=` exchange, `HttpOnly; SameSite=Strict` per-session
+  cookie (never `Secure`: no TLS), restart invalidates everything, the token
+  never logs. `/api` + SSE keep the cookie as the peer control for every peer
+  in both postures; the loopback-peer 403 is the default posture's gate only
+  and stands down on an opt-in bind.
+- **Mutations keep the exact triple** — cookie (401 path) + `X-Kit-Token` echo
+  + same-origin referral. Only the Host/Origin hostname gate generalizes
+  (Appendix C.1): any `http:` name on the session port that IS this machine —
+  loopback/wildcard names, interface IPs (`os.networkInterfaces()`, Tailscale
+  included), or names that resolve (`dns.lookup`, cached) to one — so a
+  MagicDNS name works like `127.0.0.1` does by default. Foreign/unresolvable
+  Host/Origin still refused with the plain reason.
+- **Threat posture in stated words** — there is NO TLS: over Tailscale the
+  encrypted mesh carries the traffic (the supported remote shape); over a raw
+  LAN the HTTP, handshake token included, is PLAINTEXT and anyone with the
+  URL acts as you. The startup banner says so next to the URL; the PRD's
+  §7.6/§12/§17/§18/§19 + Appendix C.1 and this README carry the same words.
+  A wildcard bind prints the machine's first LAN address (never `0.0.0.0`).
+- **Validation** — root `npm test` (49/49) + `npm run build`; ui `npm test`
+  (235 passed/4 skipped = the 224 baseline + 11 new bind/posture tests),
+  `typecheck`, `check` (0/0), `build`, `test:e2e` (4/4). New coverage:
+  `test/bind-server.test.ts` (default/explicit loopback contract; wildcard
+  bind serves loopback with the cookie, mutation triple intact on the LAN
+  posture, foreign Host refused end to end via raw `node:http` — fetch won't
+  send a manual Host) and the auth posture matrix (bindPostureFor,
+  isOwnHostname, and the six mutation-auth postures).
+
 ## 0.9.0 — §18 close-out #1: the read-only conversation transcript drawer is declared shipped
 
 The drawer's functionality landed back in 0.5.0/0.5.1 (M4-a: the summary
