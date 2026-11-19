@@ -29,7 +29,13 @@ panel payload), `.orch/pending-handoff.json` (queued user note), and
   optional `thinkingLevel`, `costPerMillionInput`, `costPerMillionOutput`
   (USD rate fallback for budget math when providers/catalog don't report cost)
 - `[budgets]` — `sessionUsd` (hard ceiling), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`
-- `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (scope check + guard)
+- `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (scope check + guard),
+  `skepticSecondPass` (default `true`, including when omitted): after primary
+  approval, a fresh read-only adversarial verifier must also approve. Explicit
+  `false` is the single-pass opt-out. The adversarial pass checks criteria,
+  regressions, edge cases, missing tests, scope, and security/data-loss risks;
+  malformed or inconclusive output becomes `needs_human`, never approval. Wave
+  log rows `verify:*` and `verify:skeptic:*` record each pass's verdict and usage.
 - `[delivery]` — `mode`: `none` (default) | `commit` | `pr` (pr additionally requires the run's `--deliver` flag)
 - `[paths]` — `prd` (default `docs/prd.md`), `specs`
 
@@ -54,7 +60,10 @@ Running `init` twice is safe and prints the second result.
 - RouterDoc schema changes land ADDITIVELY with a careful `version` bump and a
   `migrate` function when semantics change; readers treat absent fields as
   defaults (e.g. `convId` missing ⇒ open a new conversation for the task).
-- Wave-log rows are append-only JSON; old rows stay readable forever.
+- Wave-log rows are append-only JSON; old rows stay readable forever. The
+  default-on skeptic pass adds `verify:skeptic:<verdict>` rows without changing
+  the wave-log schema version; existing `verify:<verdict>` rows remain primary
+  verdicts, and summing verdict-row usage now accounts for both conversations.
 - Delivery modes matter for upgrade drills: `none` leaves waves in the working
   tree, so a kit update mid-project is a checkout switch, not a code migration.
 

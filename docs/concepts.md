@@ -9,7 +9,7 @@ durable harness.
 | --- | --- | --- | --- | --- |
 | planner | ONE per plan (`kit-plan-v1` request id) | `[read]` only | `roles.planner` | PRD → RouterDoc tasks (id/spec/dependsOn/acceptance/targetPaths) |
 | implementer | ONE per task (`task-<id>`, resumed across waves) | read, write, edit, bash | `roles.implementer` | one wave = one task; PROMPT.md discipline attached |
-| verifier | fresh per verdict | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human` |
+| verifier | fresh per pass; adversarial pass follows primary approval by default | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human` |
 
 Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
 
@@ -34,8 +34,18 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   `evals/recipes.toml` (argv-simple commands, timeout, optional stdout `match`
   regexes, `on` path fast-skip). Failures become compact feedback text and a
   `lastGateHash` for the breaker.
-- **verify** — one read-only verifier conversation per verdict, fed spec +
-  criteria + per-file diff summary vs the task baseline + gate results.
+- **verify** — a fresh read-only verifier conversation is fed spec + criteria +
+  per-file diff summary vs the task baseline + gate results. When that primary
+  pass approves, a SECOND fresh read-only conversation uses the same
+  `roles.verifier` model but a dedicated adversarial brief: refute approval by
+  checking every criterion, regressions, edge cases, missing tests, target-path
+  scope, and security/data-loss risks. This skeptic pass is DEFAULT ON when
+  `[gates] skepticSecondPass` is omitted; explicit `false` opts out. Both passes
+  must approve. Adversarial rejection becomes verifier feedback for the normal
+  wave retry path; malformed, incomplete, unverifiable, or `needs_human`
+  adversarial results fail closed to `needs_human`. Each pass appends a separate
+  wave-log verdict row (`verify:*` / `verify:skeptic:*`) with its own provider,
+  model, tokens, and USD usage.
 - **deliver** — off by default (`delivery.mode = "none"`): waves stay in the
   working tree, isolated by each task's baseline. `commit` mode commits once per
   approved task; `pr` mode branches, commits, `gh pr create --fill`, and returns

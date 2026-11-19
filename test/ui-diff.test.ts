@@ -39,6 +39,8 @@ const implWrites = (writes: { path: string; content: string }[], closing = "STAT
 
 const verifyApprove = () =>
 	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "ok" }), { stopReason: "stop" });
+const verifySkepticApprove = () =>
+	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" });
 
 const statsOf = async (root: string, name: string): Promise<DisplayDiffStats> => {
 	const stats = await readJson<DisplayDiffStats>(join(root, ".orch", "artifacts", name));
@@ -55,6 +57,7 @@ describe("A.2: done path writes patch + stats before delivery", () => {
 				{ path: "src/one.ts", content: "export const one = 1;\n" },
 			]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 
@@ -112,6 +115,7 @@ describe("A.2: done path writes patch + stats before delivery", () => {
 				{ path: "src/three.ts", content: "export const three = 3;\n" },
 			]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await writeGateFile(project.root);
@@ -203,6 +207,7 @@ describe("A.2: cap + truncation (display only, never a rollback input)", () => {
 			fauxAssistantMessage([fauxToolCall("bash", { command: `yes 'export const filler = XXXX;' | head -c ${Math.ceil(DISPLAY_PATCH_CAP_BYTES * 1.4)} > src/big.ts` })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 
@@ -235,6 +240,7 @@ describe("A.3: readout carries diff refs + the diff artifact kind", () => {
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await runWaves(kit, { approve: true, tasksFilter: [] });
@@ -265,6 +271,7 @@ describe("A.3: readout carries diff refs + the diff artifact kind", () => {
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await runWaves(kit, { approve: true, tasksFilter: [] });
@@ -288,6 +295,7 @@ describe("A.2 side-car: status.json tasks carry baselineTreeSha (live diff input
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await runWaves(kit, { approve: true, tasksFilter: [] });

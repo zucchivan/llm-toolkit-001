@@ -3,16 +3,18 @@
 A maintained TypeScript **agent implementation loop template**: point it at a PRD,
 review one plan, and let a budget-governed `pi-durable` agent harness turn the
 plan into merged code — implementer waves → deterministic gates → read-only
-verifier → done/quarantine, with a git-tracked paper trail at every step.
+verifier + default-on adversarial second pass → done/quarantine, with a
+git-tracked paper trail at every step.
 
 - Runtime: [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable) **1.5.0** (pinned exact) on Node ≥ 22.19 (Node 24 LTS preferred).
 - One provider/model per ROLE (planner / implementer / verifier) from project config — subscription-budgeted, sequential v1, no parallel agent fan-out.
 - Durable SQLite storage is **local-only and git-ignored**; the committed paper
   trail is markdown/JSONL side-cars: `router.md`, `.orch/wave-log.jsonl`, gate
   artifacts, verifier verdicts, run summaries.
-- Gates (recipes), a read-only verifier conversation, and a budget governor
-  (session USD ceiling, zero-progress/duplicate-failure breakers,
-  rate-limit durable sleep with exit 42) are built in.
+- Gates (recipes), a read-only verifier with a default-on adversarial second
+  pass, and a budget governor (session USD ceiling,
+  zero-progress/duplicate-failure breakers, rate-limit durable sleep with exit
+  42) are built in.
 
 ## 5-minute quickstart
 
@@ -23,6 +25,8 @@ npx llm-toolkit-001 init . --with-demo     # in the repo root of your project
 # 2. declare roles in .orch/config.toml
 #    planner/implementer on your main model, verifier on a cheaper one:
 #    provider+modelId per role; credentials come from env (ANTHROPIC_API_KEY etc.)
+#    approvals get a second adversarial verify call by default; opt out with
+#    [gates] skepticSecondPass = false
 
 # 3. write the PRD at docs/prd.md, then run one planning conversation
 llm-toolkit-001 plan --prd docs/prd.md     # writes RouterDoc + router.md, stops
@@ -65,7 +69,9 @@ KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve   # → ST
 Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 `---` separated chunks; a chunk is one model request's answer — plain text
 (final assistant turn), the planner's tasks JSON, a verifier verdict JSON, or
-`{"tool":"write","path":"src/x.ts","content":"…"}` for a tool round.
+`{"tool":"write","path":"src/x.ts","content":"…"}` for a tool round. Unless
+the demo config opts out, each approved task consumes two verifier chunks:
+primary approval followed by adversarial approval.
 
 ## Commands
 
@@ -119,13 +125,20 @@ PRD →[plan, one conversation, read-only]→ RouterDoc + router.md (planned)
       ▼ [run]
   per task (topological, priority, id tie-break):
     baseline tree capture → implementer wave (conversation per task)
-      → gates (scope check + recipes) → verifier (read-only, strict JSON verdict)
-      → approve ⇒ done, or feedback ⇒ next wave (context reset between waves)
+      → gates (scope check + recipes) → primary verifier (read-only, strict JSON)
+      → approving verdict ⇒ fresh adversarial verifier (default on; read-only)
+      → both approve ⇒ done, or feedback ⇒ next wave (context reset between waves)
       → exhausted/blocked ⇒ quarantine: patch saved, tree rolled back to baseline
   budgets/breakers: session USD ceiling, wave warn, zero-change quarantine,
   duplicate gate-failure hash, consecutive-error cap, rate-limit durable sleep.
+  malformed/inconclusive adversarial verdicts ⇒ needs_human (never approval)
 delivery: none (default) | commit | pr (needs --deliver)
 ```
+
+`[gates] skepticSecondPass` defaults to `true` when omitted. Set it to `false`
+for the explicit single-verifier opt-out. Each pass appends its own verdict,
+token, and USD usage row to `.orch/wave-log.jsonl` (`verify:*` and
+`verify:skeptic:*`).
 
 Docs: [`docs/concepts.md`](docs/concepts.md) (roles, stages, governor) ·
 [`docs/api-map.md`](docs/api-map.md) (pi-durable/pi-ai export map) ·

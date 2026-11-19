@@ -29,7 +29,7 @@ export interface Budgets {
 export interface GatesConfig {
 	timeoutSec: number;
 	enforceTargetPaths: boolean;
-	/** When true, an approving verifier must also survive a skeptic second pass. */
+	/** Default on: an approving verifier must also survive a skeptic second pass. */
 	skepticSecondPass: boolean;
 }
 
@@ -67,7 +67,7 @@ export const DEFAULT_CONFIG: KitConfig = {
 		verifier: { provider: "openrouter", modelId: "openai/gpt-5-nano" },
 	},
 	budgets: { sessionUsd: 10.0, waveUsdWarn: 2.0, maxConsecutiveErrors: 3, maxSleepCycles: 3 },
-	gates: { timeoutSec: 120, enforceTargetPaths: true, skepticSecondPass: false },
+	gates: { timeoutSec: 120, enforceTargetPaths: true, skepticSecondPass: true },
 	delivery: { mode: "none" },
 	paths: { prd: "docs/prd.md", specs: "specs/" },
 };

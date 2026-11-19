@@ -109,6 +109,7 @@ describe("terminal-stop semantics (drained queue with quarantined ≠ plain succ
 		fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" }),
 		fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
 		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "diff satisfies the criterion" }), { stopReason: "stop" }),
+		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
 	];
 
 	it("all tasks quarantined → run stops short: complete=false, ids surfaced, no router phase 'complete', wave-log row names them", async () => {

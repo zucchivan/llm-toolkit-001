@@ -71,6 +71,7 @@ const implWrites = (writes: { path: string; content: string }[], closing = "STAT
 
 const verifyApprove = (notes = "diff satisfies the criterion") =>
 	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes }), { stopReason: "stop" });
+const verifySkepticApprove = () => verifyApprove("adversarial pass: no refutation found");
 
 const LIST_TS = `export function parseList(input: string): string[] {
 	return input.split('/').filter(Boolean);
@@ -90,6 +91,7 @@ describe("wave-start flush (A.1)", () => {
 			fauxAssistantMessage([fauxToolCall("bash", { command: "sleep 1.4" })], { stopReason: "toolUse" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 
@@ -128,12 +130,14 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 			// t1 wave 1: works
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 			// t2 wave 1: BROKEN token → gate fails → retry
 			...implWrites([{ path: "src/list.ts", content: LIST_TS + "\nexport const BROKEN = true;\n" }]),
 			// t2 wave 2 (after feedback): fixed + a NEW file — a byte-identical rewrite
 			// of a baseline file would trip the zero-progress breaker, so add query.ts.
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }, { path: "src/query.ts", content: QUERY_TS }]),
 			verifyApprove("fixed on wave 2"),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await writeGateFile(project.root);
@@ -221,6 +225,7 @@ describe("resumability keeps working with the seam (pickNextTask on in_progress)
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		// Simulate the crash the seam can now create: in_progress mid-wave.
@@ -390,6 +395,7 @@ describe("conversation transcript excerpts (A.5)", () => {
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
@@ -548,6 +554,7 @@ describe("delivery truth (A.6): readout surfaces the mode + outcome rows, read-o
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
@@ -624,9 +631,11 @@ describe("per-wave isolated diffs (A.7): wave rows carry treeSha; trees diff tre
 			fauxAssistantMessage(JSON.stringify(PLANNER_TASKS), { stopReason: "stop" }),
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 			...implWrites([{ path: "src/list.ts", content: LIST_TS + "\nexport const BROKEN = true;\n" }]),
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }, { path: "src/query.ts", content: QUERY_TS }]),
 			verifyApprove("fixed on wave 2"),
+			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
 		await writeGateFile(project.root);

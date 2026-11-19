@@ -56,6 +56,7 @@ const PLANNER_TASKS = {
 const implWrites = (writes: { path: string; content: string }[], closing = "STATUS: COMPLETE") => writes.map((w) => fauxAssistantMessage([fauxToolCall("write", w)], { stopReason: "toolUse" })).concat([fauxAssistantMessage(closing, { stopReason: "stop" })]);
 const verifyApprove = (notes = "diff satisfies the criterion") =>
 	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes }), { stopReason: "stop" });
+const verifySkepticApprove = () => verifyApprove("adversarial pass: no refutation found");
 
 describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 	beforeEach(() => {
@@ -82,6 +83,7 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 			// task 1 (list-parse) wave 1
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 			// task 2 (list-query) wave 1: BROKEN write → gate fails → feedback
 			...implWrites([{ path: "src/list.ts", content: LIST_TS + "\nexport const BROKEN = true;\n" }]),
 			// task 2 wave 2 (after conversation.reset): fixed file + new query module
@@ -90,9 +92,11 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 				{ path: "src/query.ts", content: `export function queryList(items: string[], q: string): string[] {\n\tconst needle = q.toLowerCase();\n\treturn items.filter((item) => item.toLowerCase().includes(needle));\n}\n` },
 			]),
 			verifyApprove(),
+			verifySkepticApprove(),
 			// task 3 (cli-render) wave 1
 			...implWrites([{ path: "bin/render.js", content: BIN_JS }]),
 			verifyApprove(),
+			verifySkepticApprove(),
 		]);
 
 		// PLAN ---------------------------------------------------------------
@@ -142,6 +146,7 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		expect(rows.some((r) => r["verb"] === "planned")).toBe(true);
 		expect(rows.some((r) => r["kind"] === "gate" && r["verb"] === "fail")).toBe(true);
 		expect(rows.some((r) => r["kind"] === "verdict" && r["verdict"] === "approve")).toBe(true);
+		expect(rows.filter((r) => r["kind"] === "verdict" && r["verb"] === "verify:skeptic:approve").length).toBe(3);
 		expect(rows.filter((r) => r["kind"] === "task" && r["verb"] === "done").length).toBe(3);
 
 		const status = await readJson<{ tasks: { id: string; status: string }[] }>(join(project.root, ".orch", "status.json"));
@@ -173,6 +178,7 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1;\n" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
 			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "" }), { stopReason: "stop" }),
+			verifySkepticApprove(),
 		]);
 
 		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models });

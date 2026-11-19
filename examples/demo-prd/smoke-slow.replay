@@ -26,6 +26,12 @@ STATUS: COMPLETE
 ---
 {"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "diff matches the criterion"}
 ---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}
+---
 {"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "fixed on wave 2"}
 ---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}
+---
 {"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "present"}
+---
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}

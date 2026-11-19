@@ -112,6 +112,7 @@ describe("inspector: readout seam", () => {
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
 			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "" }), { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
 		]);
 
 		const kit = await openProjectHarness(project.root, "run", { modelsOverride: models });

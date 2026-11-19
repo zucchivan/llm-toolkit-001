@@ -2,6 +2,23 @@
 
 Manual semver discipline: keep `package.json` version and the newest section in sync.
 
+## Unreleased
+
+- **default-on adversarial verification**: `[gates] skepticSecondPass` now
+  defaults to `true` in both the loader and scaffold template; an explicit
+  `false` remains the opt-out. A primary approval opens a fresh read-only
+  conversation on the existing verifier role with a dedicated brief that tries
+  to refute approval across acceptance criteria, regressions, edge cases,
+  missing tests, target-path scope, and security/data-loss risks.
+- adversarial `reject` verdicts use the existing wave feedback/retry path;
+  malformed, incomplete, unverifiable, or `needs_human` second-pass responses
+  fail closed to `needs_human`. Both conversations append separate wave-log
+  rows (`verify:*` and `verify:skeptic:*`) with their actual verdict, model,
+  token, and USD usage.
+- demo replays and faux end-to-end fixtures now script both approvals; focused
+  tests cover omitted-config execution, explicit opt-out, rejection/retry,
+  malformed output, inconclusive approval, and per-pass usage accounting.
+
 ## 0.2.3 — 2026-11-08
 
 - **UI seam A.7 — per-wave isolated diffs (consumed by `ui/` 0.8.0, additive;

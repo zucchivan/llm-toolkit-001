@@ -9,9 +9,10 @@
 import { exec } from "../util/exec.ts";
 import { diffStatVsTree } from "../util/git.ts";
 import { ConversationKit } from "./conversations.ts";
-import type { LoopAndLock, ToolRegistration } from "./harness.ts";
+import type { LoopAndLock } from "./harness.ts";
 import { commitState } from "./state.ts";
 import type { GateResult } from "./gates.ts";
+import type { WaveRow } from "./infos.ts";
 
 export type Verdict = "approve" | "reject" | "needs_human";
 
@@ -36,6 +37,23 @@ approve = every criterion passes. reject = a criterion fails and is fixable by a
 must say exactly what to change. needs_human = you cannot judge from the diff/spec (ambiguous spec,
 design decision, credentials, flaky external). Never approve on partial evidence.`;
 
+export const SKEPTIC_ROLE_BRIEF = `You are the ADVERSARIAL VERIFIER of an implementation-loop kit. You are read-only: you will never edit files.
+Assume the primary verifier missed a subtle defect. Try to refute approval rather than repeating its reasoning.
+
+Independently check every acceptance criterion and look for regressions, edge cases, missing tests,
+changes outside the task's target paths, and security or data-loss risks. Read any files you need with
+the read tool. Then reply with ONE JSON object and nothing else:
+
+{
+  "verdict": "approve" | "reject" | "needs_human",
+  "criteria": [{ "id": "<criterion number, 1-based>", "status": "pass" | "fail" | "unverifiable" }],
+  "notes": "<= 300 chars; concrete blockers when rejecting"
+}
+
+approve only after independently confirming that every acceptance criterion passes and finding no
+refutation. reject a fixable defect and say exactly what to change. needs_human is mandatory when
+evidence is missing, ambiguous, or inconclusive. Incomplete or unverifiable criteria can never approve.`;
+
 export interface VerifyTask {
 	id: string;
 	title: string;
@@ -55,6 +73,7 @@ async function diffVsBaseline(root: string, baseline: string): Promise<{ stat: s
 export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: { skepticSecondPass?: boolean } = {}): Promise<VerifyResult> {
 	const diff = await diffVsBaseline(kit.loop.paths.root, task.baselineTreeSha);
 	const criteriaIds = task.acceptance.map((a, i) => `${i + 1}`);
+	const skepticSecondPass = options.skepticSecondPass ?? kit.loop.config.gates.skepticSecondPass;
 
 	const content = [
 		`TASK ${task.id}: ${task.title}`,
@@ -77,40 +96,56 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 		maxTurns: kit.loop.config.engine.maxTurns,
 	});
 	const outcome = await kitConv.submitAndAwait(conv, `verify-${task.id}-${Date.now()}`, content);
-	let parsed = parseVerdictStrict(outcome.answer ?? "");
+	const primary = parseVerdictStrict(outcome.answer ?? "");
+	let parsed = primary;
+	const rows: WaveRow[] = [];
+	const recordVerdict = (pass: "primary" | "skeptic", result: VerifyResult, usage: { usd: number; totalTokens: number }) => {
+		rows.push({
+			ts: Date.now(),
+			kind: "verdict",
+			task: task.id,
+			verb: pass === "primary" ? `verify:${result.verdict}` : `verify:skeptic:${result.verdict}`,
+			verdict: result.verdict,
+			detail: result.notes,
+			provider: role.provider,
+			modelId: role.modelId,
+			costUsd: usage.usd,
+			tokens: usage.totalTokens,
+		});
+	};
+	recordVerdict("primary", primary, outcome.usage);
 
-	// Optional "skeptic second pass" (off by default): both verifier rounds must
-	// agree on `approve`; any disagreement degrades to needs_human.
-	if (options.skepticSecondPass && parsed.verdict === "approve") {
+	// Default-on defense in depth: approval requires a second, fresh read-only
+	// conversation. Its own verdict and usage stay visible in the wave log.
+	if (skepticSecondPass && primary.verdict === "approve") {
 		const convTwo = await kitConv.createUnit({
-			instructions: VERIFY_ROLE_BRIEF,
+			instructions: SKEPTIC_ROLE_BRIEF,
 			guard: { role: "verifier", targetPaths: [] },
 			tools: "read",
 			model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
 			maxTurns: kit.loop.config.engine.maxTurns,
 		});
-		const outcomeTwo = await kitConv.submitAndAwait(convTwo, `verify-${task.id}-skeptic-${Date.now()}`, `${content}\n\nSKEPTIC PASS: assume the diff is subtly wrong and try to refute approval before concluding.`);
-		const parsedTwo = parseVerdictStrict(outcomeTwo.answer ?? "");
+		const outcomeTwo = await kitConv.submitAndAwait(convTwo, `verify-${task.id}-skeptic-${Date.now()}`, content);
+		let parsedTwo = parseVerdictStrict(outcomeTwo.answer ?? "");
+		if (parsedTwo.verdict === "approve" && !isConclusiveApproval(parsedTwo, criteriaIds)) {
+			parsedTwo = {
+				...parsedTwo,
+				verdict: "needs_human",
+				notes: "skeptic approval was inconclusive: every acceptance criterion must be explicitly marked pass",
+			};
+		}
+		recordVerdict("skeptic", parsedTwo, outcomeTwo.usage);
 		if (parsedTwo.verdict !== "approve") parsed = { ...parsedTwo, notes: `skeptic pass: ${parsedTwo.notes}`.slice(0, 300) };
 	}
 
-	await commitState(kit, {
-		rows: [
-			{
-				ts: Date.now(),
-				kind: "verdict",
-				task: task.id,
-				verb: `verify:${parsed.verdict}`,
-				verdict: parsed.verdict,
-				detail: parsed.notes,
-				provider: role.provider,
-				modelId: role.modelId,
-				costUsd: outcome.usage.usd,
-				tokens: outcome.usage.totalTokens,
-			},
-		],
-	});
+	await commitState(kit, { rows });
 	return parsed;
+}
+
+/** An adversarial approval is conclusive only with one explicit pass per criterion. */
+function isConclusiveApproval(result: VerifyResult, criteriaIds: readonly string[]): boolean {
+	return result.criteria.length === criteriaIds.length
+		&& criteriaIds.every((id) => result.criteria.some((criterion) => criterion.id === id && criterion.status === "pass"));
 }
 
 /** Defensive parse: fences stripped; malformed → needs_human (never approve). */
