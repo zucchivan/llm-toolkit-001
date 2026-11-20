@@ -225,7 +225,7 @@ function remediation(title: string, spec: string, acceptance: string[], targetPa
 	return { title, spec, acceptance, targetPaths };
 }
 
-function findScript(pkg: DiscoveredPackage, category: GateCategory): string | undefined {
+export function findScript(pkg: DiscoveredPackage, category: GateCategory): string | undefined {
 	const conventional = SCRIPT_NAMES[category].find((name) => typeof pkg.scripts[name] === "string"
 		&& !(category === "unit-test" && name === "test" && /playwright|cypress|test\/api|(?:^|\s)(?:e2e|integration)(?:\s|$)/.test(pkg.scripts[name]!)));
 	if (conventional) return conventional;
@@ -242,7 +242,7 @@ function scriptCommand(manager: ProjectDiscovery["packageManager"], script: stri
 	return manager === "npm" || manager === "bun" ? `${manager} run ${script}` : `${manager} ${script}`;
 }
 
-function categoryForRecipe(recipe: Recipe): GateCategory | undefined {
+export function categoryForRecipe(recipe: Recipe): GateCategory | undefined {
 	const value = `${recipe.name} ${recipe.cmd}`.toLowerCase();
 	if (/a11y|accessibility|axe|pa11y/.test(value)) return "accessibility";
 	if (/e2e|playwright|cypress/.test(value)) return "e2e";

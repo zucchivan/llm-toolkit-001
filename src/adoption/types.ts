@@ -1,4 +1,5 @@
 import type { Recipe } from "../engine/gates.ts";
+import type { JudgmentAnswer, JudgmentQuestion, JudgmentState, JudgmentTokenUsage } from "../judgment/types.ts";
 
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 export type SurfaceKind = "web" | "api" | "cli" | "publishable-package" | "migrations" | "e2e" | "accessibility";
@@ -128,4 +129,78 @@ export interface AdoptionResult {
 	wroteDecisions: boolean;
 	remediations: Remediation[];
 	messages: string[];
+}
+
+export interface ShadowThresholds {
+	noulYes: number;
+	noulNo: number;
+	choiceProbability: number;
+	choiceConfidence: number;
+}
+
+export type SemanticClassificationStatus = "classified" | "not-a-gate" | "unknown";
+export type SemanticMatch = "matches" | "does-not-match" | "unknown";
+export type ShadowQuality = "adequate" | "needs-review" | "unknown";
+
+export interface ScriptClassification {
+	kind: "script";
+	cwd: string;
+	name: string;
+	command: string;
+	category?: GateCategory;
+	status: SemanticClassificationStatus;
+	applicabilityAnswerId: string;
+	categoryAnswerId: string;
+}
+
+export interface RecipeClassification {
+	kind: "recipe";
+	cwd: string;
+	name: string;
+	command: string;
+	category?: GateCategory;
+	status: Exclude<SemanticClassificationStatus, "not-a-gate">;
+	categoryAnswerId: string;
+}
+
+export interface RecipeSurfaceMatch {
+	recipe: string;
+	findingId: string;
+	match: SemanticMatch;
+	answerId: string;
+}
+
+export interface RecipeQualityAssessment {
+	recipe: string;
+	quality: ShadowQuality;
+	answerIds: { repeatable: string; validationPurpose: string; evidenceSupported: string };
+}
+
+export type GateAssessmentStatus = "disabled" | "missing-credentials" | "no-questions" | "assessed" | "unavailable" | "stale";
+
+/** Successful assessments are persisted separately from adoption decisions. */
+export interface GateAssessment {
+	version: 1;
+	shadow: true;
+	status: GateAssessmentStatus;
+	policyVersion: string;
+	model: string;
+	evidenceFingerprint: string;
+	evidence: JudgmentState;
+	questions: Record<string, JudgmentQuestion>;
+	answers: Record<string, JudgmentAnswer>;
+	thresholds: ShadowThresholds;
+	usage: JudgmentTokenUsage;
+	assessedAt: string | null;
+	scriptClassifications: ScriptClassification[];
+	recipeClassifications: RecipeClassification[];
+	recipeMatches: RecipeSurfaceMatch[];
+	recipeQuality: RecipeQualityAssessment[];
+	error?: string;
+}
+
+export interface GateEvaluationResult {
+	/** The deterministic report is never altered by semantic answers. */
+	report: GapReport;
+	assessment: GateAssessment;
 }

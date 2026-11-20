@@ -5,6 +5,8 @@ import { analyzeGaps } from "./gaps.ts";
 import { discoverProject } from "./discovery.ts";
 import { refreshGates } from "./workflow.ts";
 import { probeGates } from "./probe.ts";
+import type { JudgmentClient } from "../judgment/types.ts";
+import type { GateAssessment } from "./types.ts";
 
 export interface GatesCliIo {
 	interactive: boolean;
@@ -13,7 +15,13 @@ export interface GatesCliIo {
 	ask?(question: string): Promise<string>;
 }
 
-export async function runGatesCommand(root: string, argv: string[], io: GatesCliIo): Promise<number> {
+export interface GatesCliDependencies {
+	judgmentClient?: JudgmentClient;
+	env?: NodeJS.ProcessEnv;
+	persistAssessment?: (root: string, assessment: GateAssessment) => Promise<void>;
+}
+
+export async function runGatesCommand(root: string, argv: string[], io: GatesCliIo, dependencies: GatesCliDependencies = {}): Promise<number> {
 	const subcommand = argv[0] ?? "list";
 	const rest = argv.slice(1);
 	try {
@@ -25,6 +33,25 @@ export async function runGatesCommand(root: string, argv: string[], io: GatesCli
 				const { formatGapReport, formatEvidence } = await import("./workflow.ts");
 				io.log(formatGapReport(report));
 				for (const finding of report.findings.filter((item) => item.status !== "covered" && item.status !== "not-applicable")) io.log(`\n${formatEvidence(finding)}`);
+			}
+			return 0;
+		}
+		if (subcommand === "evaluate") {
+			const { values } = parseArgs({ args: rest, options: { json: { type: "boolean", default: false } }, strict: true });
+			const { evaluateGates, formatGateAssessment, persistGateAssessment } = await import("./evaluate.ts");
+			const result = await evaluateGates(root, {
+				enabled: true,
+				client: dependencies.judgmentClient,
+				apiKey: (dependencies.env ?? process.env)["TYPESAFE_API_KEY"],
+			});
+			if (result.assessment.status === "assessed") {
+				await (dependencies.persistAssessment ?? persistGateAssessment)(root, result.assessment);
+			}
+			if (values.json) io.log(JSON.stringify(result, null, 2));
+			else {
+				const { formatGapReport } = await import("./workflow.ts");
+				io.log(formatGapReport(result.report));
+				io.log(`\n${formatGateAssessment(result.assessment)}`);
 			}
 			return 0;
 		}
@@ -75,7 +102,8 @@ export async function runGatesCli(root: string, argv: string[]): Promise<number>
 
 export function gatesHelp(): string {
 	return `usage:
-  gates list [--json]                    # read-only inventory + evidence-based gap report
+  gates list [--json]                    # deterministic, offline inventory + gap report
+  gates evaluate [--json]                # opt-in Jev shadow assessment; no execution/adoption
   gates refresh [--accept recommended]   # interactive choices; explicit non-interactive adoption
   gates refresh --skip-gates             # explicitly defer open findings; generate no recipes
   gates probe [--yes]                    # separately consented baseline execution`;

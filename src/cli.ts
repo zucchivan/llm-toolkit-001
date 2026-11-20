@@ -529,7 +529,8 @@ function fail(err: unknown, command: string): void {
 function HELP(): string {
 	return `usage:
   ${CLI_NAME} init . [--with-demo]        # scaffold a project (never clobbers your edits)
-  ${CLI_NAME} gates list [--json]          # inventory + cross-cutting coverage/gap evidence
+  ${CLI_NAME} gates list [--json]          # deterministic, offline inventory + gap evidence
+  ${CLI_NAME} gates evaluate [--json]      # opt-in Jev shadow assessment; no execution/adoption
   ${CLI_NAME} gates refresh [--accept recommended | --skip-gates]
                                           # approve generated gates; no execution
   ${CLI_NAME} gates probe [--yes]           # separately consented baseline probe
