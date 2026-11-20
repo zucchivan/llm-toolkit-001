@@ -6,3 +6,4 @@ dist/
 .orch/pending-handoff.json
 .orch/artifacts/
 .orch/config.toml
+repomix-output.xml
