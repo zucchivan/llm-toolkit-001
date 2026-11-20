@@ -7,12 +7,16 @@
  * `[read]`-only tool selection).
  */
 import { exec } from "../util/exec.ts";
-import { diffStatVsTree } from "../util/git.ts";
+import { diffStatVsTree, computeDisplayPatch } from "../util/git.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock } from "./harness.ts";
 import { commitState } from "./state.ts";
 import type { GateResult } from "./gates.ts";
 import type { WaveRow } from "./infos.ts";
+import {
+	assessVerifier, persistVerifierAssessment,
+	type AssessVerifierOptions, type VerifierObservation,
+} from "./verifier-assessment.ts";
 
 export type Verdict = "approve" | "reject" | "needs_human";
 
@@ -70,10 +74,17 @@ async function diffVsBaseline(root: string, baseline: string): Promise<{ stat: s
 	return { stat, files: (list.stdout || "").trim().split("\n").filter(Boolean) };
 }
 
-export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: { skepticSecondPass?: boolean } = {}): Promise<VerifyResult> {
+export interface VerifyOptions {
+	skepticSecondPass?: boolean;
+	/** Optional injection seam; config supplies the default opt-in and env supplies credentials. */
+	jevShadow?: Omit<AssessVerifierOptions, "enabled"> & { enabled?: boolean };
+}
+
+export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: VerifyOptions = {}): Promise<VerifyResult> {
 	const diff = await diffVsBaseline(kit.loop.paths.root, task.baselineTreeSha);
 	const criteriaIds = task.acceptance.map((a, i) => `${i + 1}`);
 	const skepticSecondPass = options.skepticSecondPass ?? kit.loop.config.gates.skepticSecondPass;
+	const jevShadowEnabled = options.jevShadow?.enabled ?? kit.loop.config.gates.jevVerifierShadow;
 
 	const content = [
 		`TASK ${task.id}: ${task.title}`,
@@ -98,6 +109,7 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 	const outcome = await kitConv.submitAndAwait(conv, `verify-${task.id}-${Date.now()}`, content);
 	const primary = parseVerdictStrict(outcome.answer ?? "");
 	let parsed = primary;
+	let skepticResult: VerifyResult | undefined;
 	const rows: WaveRow[] = [];
 	const recordVerdict = (pass: "primary" | "skeptic", result: VerifyResult, usage: { usd: number; totalTokens: number }) => {
 		rows.push({
@@ -134,12 +146,57 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 				notes: "skeptic approval was inconclusive: every acceptance criterion must be explicitly marked pass",
 			};
 		}
+		skepticResult = parsedTwo;
 		recordVerdict("skeptic", parsedTwo, outcomeTwo.usage);
 		if (parsedTwo.verdict !== "approve") parsed = { ...parsedTwo, notes: `skeptic pass: ${parsedTwo.notes}`.slice(0, 300) };
 	}
 
 	await commitState(kit, { rows });
+	if (jevShadowEnabled) {
+		// Even an unexpected shadow implementation/persistence fault cannot escape
+		// into wave control flow after the authoritative verdict has committed.
+		await runShadowAssessment(kit, task, diff, gateSummary, primary, skepticResult, options.jevShadow).catch(() => {});
+	}
 	return parsed;
+}
+
+/** Best-effort provenance after the real verdict commit; no result feeds control flow. */
+async function runShadowAssessment(
+	kit: LoopAndLock,
+	task: VerifyTask,
+	diff: { stat: string; files: string[] },
+	gateSummary: string,
+	primary: VerifyResult,
+	skeptic: VerifyResult | undefined,
+	options: VerifyOptions["jevShadow"],
+): Promise<void> {
+	let patch = { text: "", truncated: false, available: false };
+	try {
+		const display = await computeDisplayPatch(kit.loop.paths.root, task.baselineTreeSha);
+		patch = { text: display.text, truncated: display.truncated, available: display.ok };
+	} catch {
+		// Diff evidence degrades to the summary; the existing verdict is already durable.
+	}
+	const observation = (result: VerifyResult): VerifierObservation => ({
+		verdict: result.verdict, criteria: result.criteria, notes: result.notes,
+	});
+	const assessment = await assessVerifier({
+		task,
+		diff: {
+			stat: diff.stat, files: diff.files, patch: patch.text,
+			patchTruncated: patch.truncated, patchAvailable: patch.available,
+		},
+		gateSummary,
+		primary: observation(primary),
+		...(skeptic ? { skeptic: observation(skeptic) } : {}),
+	}, {
+		...options,
+		enabled: true,
+		apiKey: options?.apiKey ?? process.env["TYPESAFE_API_KEY"],
+	});
+	if (assessment.status === "assessed") {
+		await persistVerifierAssessment(kit.loop.paths.root, assessment).catch(() => {});
+	}
 }
 
 /** An adversarial approval is conclusive only with one explicit pass per criterion. */

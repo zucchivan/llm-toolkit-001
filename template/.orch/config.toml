@@ -40,6 +40,8 @@ maxSleepCycles = 3           # rate-limit sleep round-trips per task across rest
 timeoutSec = 120             # per recipe
 enforceTargetPaths = true    # scope check + beforeTool block writes outside targetPaths
 skepticSecondPass = true     # default-on adversarial round after approval; set false to opt out (one extra verify call)
+jevVerifierShadow = false    # opt-in Jev verdict provenance only; needs TYPESAFE_API_KEY; never changes verdicts, gates, tasks, or delivery
+jevFailureTriageShadow = false # opt-in Jev failure-triage provenance only; never changes feedback, retries, quarantine, tasks, or delivery
 
 [delivery]
 mode = "none"                # "none" | "commit" | "pr" (pr additionally needs the --deliver flag)

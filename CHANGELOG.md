@@ -4,6 +4,36 @@ Manual semver discipline: keep `package.json` version and the newest section in 
 
 ## Unreleased
 
+- **opt-in shadow Jev failure triage**: `[gates] jevFailureTriageShadow`
+  (default `false`) assesses existing deterministic gate failures and verifier
+  rejection/needs-human feedback after their authoritative commits. Independent
+  evidence, typed-category, implementation-feedback, and human-review questions
+  share one bounded, secret-filtered failure-evidence request; no patch text is
+  sent. Code owns conservative thresholds, categorization, and aggregation.
+- Completed triage persists separately in `.orch/failure-triage-assessment.json`
+  with model, evidence fingerprint, typed answers/probabilities, thresholds,
+  token usage, and task/wave/source metadata—never raw failure text, patches,
+  or credentials. Uncertain, conflicting, stale, missing-key, malformed, and
+  network-error outcomes remain unknown. The assessment cannot change existing
+  feedback, retries, quarantine, verdicts, task/adoption state, delivery, human
+  approvals, or command execution.
+
+- **opt-in shadow Jev verifier assessment**: `[gates] jevVerifierShadow`
+  (default `false`) adds a separate System One assessment alongside the existing
+  primary and skeptic verifiers. Three independent Noul questions per acceptance
+  criterion cover evidence sufficiency, satisfaction, and concrete violation
+  over one bounded, filtered task/diff/gate evidence state and one batched
+  request. Code applies conservative 0.85/0.15 thresholds and leaves uncertain
+  or conflicting conclusions `unknown`.
+- Successful assessments persist `.orch/verifier-assessment.json` with model,
+  evidence fingerprint, typed probabilities, thresholds, token usage, and
+  per-criterion aggregation. Raw diff text and `TYPESAFE_API_KEY` are never
+  persisted; changed evidence invalidates conclusions as stale. Missing keys,
+  malformed answers, and network errors fail soft without client construction
+  when no key exists, and no Jev outcome can change verdicts, gates, task state,
+  retries, quarantine, delivery, or wave-log transitions. The existing judgment
+  client/fake adapter provides injection; no commands are generated or executed.
+
 - **interactive existing-project adoption**: deterministic read-only discovery
   (`discoverProject`) inventories npm scripts/lockfiles/workspaces, common
   test/tool config, project surfaces, and conservative CI command evidence.

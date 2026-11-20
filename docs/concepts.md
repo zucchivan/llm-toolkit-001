@@ -57,7 +57,26 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   wave retry path; malformed, incomplete, unverifiable, or `needs_human`
   adversarial results fail closed to `needs_human`. Each pass appends a separate
   wave-log verdict row (`verify:*` / `verify:skeptic:*`) with its own provider,
-  model, tokens, and USD usage.
+  model, tokens, and USD usage. An explicit `[gates] jevVerifierShadow = true`
+  adds a separate, non-authoritative Jev System One assessment after those
+  verdict rows commit. Three batched Noul questions per criterion cover evidence
+  sufficiency, satisfaction, and concrete violation over filtered, bounded
+  task/diff/gate evidence. Code owns the 0.85/0.15 thresholds and aggregation;
+  insufficient, conflicting, malformed, stale, or unavailable judgments remain
+  `unknown`. Successful provenance goes only to
+  `.orch/verifier-assessment.json` (without raw diff text or
+  `TYPESAFE_API_KEY`), never to RouterDoc, gates, delivery, or wave control flow.
+- **failure triage (optional shadow)** — `[gates] jevFailureTriageShadow = true`
+  separately assesses existing deterministic gate failures and final verifier
+  `reject`/`needs_human` feedback after their authoritative state commits. One
+  batched request per failure event asks evidence/category/actionable/human-review
+  questions over bounded, secret-filtered task, changed-file, gate-output, and
+  verifier evidence (never patch text). Code applies conservative thresholds,
+  categorization, and aggregation. Completed provenance goes only to
+  `.orch/failure-triage-assessment.json`; raw failure text and credentials are
+  not stored. Uncertain, conflicting, stale, missing-key, malformed, and network
+  outcomes remain `unknown` and cannot change feedback, retries, quarantine,
+  task/adoption state, delivery, human approvals, or any command execution.
 - **deliver** — off by default (`delivery.mode = "none"`): waves stay in the
   working tree, isolated by each task's baseline. `commit` mode commits once per
   approved task; `pr` mode branches, commits, `gh pr create --fill`, and returns

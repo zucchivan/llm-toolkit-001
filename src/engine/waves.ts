@@ -19,11 +19,15 @@ import { renderRouterMd } from "./infos.ts";
 import type { GateOutcome } from "./gates.ts";
 import { runVerify, gateSummaryText } from "./verifier.ts";
 import type { VerifyResult } from "./verifier.ts";
+import {
+	assessFailureTriage, persistFailureTriageAssessment, type FailureTriageEvidence,
+} from "./failure-triage.ts";
 import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, waitOutSleep } from "./governor.ts";
 import { captureBaselineTree, restoreTree, saveDisplayPatch, changedFilesVsTree } from "../util/git.ts";
 import type { DisplayDiffStats } from "../util/git.ts";
 import { runDelivery } from "./delivery.ts";
 import type { ProgressEvent } from "./driver-events.ts";
+import type { JudgmentClient } from "../judgment/types.ts";
 
 export class DriverStateError extends Error {}
 
@@ -67,6 +71,8 @@ export interface RunOptions {
 	deliverExplicit?: boolean;
 	/** Task ids to run instead of the whole queue (empty = all). */
 	tasksFilter: string[];
+	/** Optional Jev injection for tests/embedders; disabled unless explicitly configured. */
+	judgmentClient?: JudgmentClient;
 }
 
 export type DriverExit = "complete" | "budget" | "sleeping" | "arrived-blocked" | "error";
@@ -196,6 +202,7 @@ export async function runWaves(
 			handoffNote: handoff?.note,
 			onEvent: emit,
 			deliverExplicit: options.deliverExplicit,
+			judgmentClient: options.judgmentClient,
 		});
 		if (outcome === "sleeping") {
 			summary.exit = "sleeping";
@@ -237,6 +244,7 @@ export interface TaskWavesOptions {
 	handoffNote?: string;
 	onEvent?: (e: ProgressEvent) => void;
 	deliverExplicit?: boolean;
+	judgmentClient?: JudgmentClient;
 }
 
 export interface TaskWavesResult {
@@ -370,6 +378,7 @@ export async function driveTaskWaves(
 			await commitState(kit, {
 				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gate.failHash.slice(0, 12) }],
 			});
+			await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "gate", gate }, opts.judgmentClient);
 			await quarantine(kit, current, wave, "duplicate failure: identical gate failure hash two waves running", baseline);
 			continue;
 		}
@@ -400,6 +409,7 @@ export async function driveTaskWaves(
 					? { statusPhase: { phase: "idle" as const, message: `${task.id} gates failed (wave ${wave}) — retry queued` } }
 					: {}),
 			});
+			await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "gate", gate }, opts.judgmentClient);
 			emit({
 				kind: "gate-result",
 				taskId: task.id,
@@ -420,7 +430,10 @@ export async function driveTaskWaves(
 			acceptance: current.acceptance,
 			baselineTreeSha: baseline,
 			targetPaths: current.targetPaths,
-		}, gateSummaryText(gate.results), { skepticSecondPass: kit.loop.config.gates.skepticSecondPass });
+		}, gateSummaryText(gate.results), {
+			skepticSecondPass: kit.loop.config.gates.skepticSecondPass,
+			jevShadow: { enabled: kit.loop.config.gates.jevVerifierShadow, client: opts.judgmentClient },
+		});
 
 		if (verdict.verdict === "approve") {
 			await commitState(kit, {
@@ -466,9 +479,48 @@ export async function driveTaskWaves(
 				? { statusPhase: { phase: "idle" as const, message: `${task.id} verifier rejected (wave ${wave}) — retry queued` } }
 				: {}),
 		});
+		await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "verifier", verifier: verdict }, opts.judgmentClient);
 		emit({ kind: "verifier-verdict", taskId: task.id, wave, verdict: verdict.verdict, message: verdict.notes || "(no notes)" });
 		if (canRetry) continue;
 		await quarantine(kit, current, wave, verdict.verdict === "needs_human" ? "verifier needs a human" : "verifier rejects exhausted the retry limit", baseline);
+	}
+}
+
+/** Best-effort provenance after failure feedback commits; no result feeds control flow. */
+async function runFailureTriageShadow(
+	kit: LoopAndLock,
+	task: RouterTask,
+	baselineTreeSha: string,
+	wave: number,
+	changedFiles: string[],
+	failure: { source: "gate"; gate: GateOutcome } | { source: "verifier"; verifier: VerifyResult },
+	client: JudgmentClient | undefined,
+): Promise<void> {
+	if (!kit.loop.config.gates.jevFailureTriageShadow) return;
+	try {
+		const evidence = {
+			task: {
+				id: task.id,
+				title: task.title,
+				spec: task.spec,
+				acceptance: task.acceptance,
+				baselineTreeSha,
+				targetPaths: task.targetPaths,
+			},
+			wave,
+			changedFiles,
+			...failure,
+		} as FailureTriageEvidence;
+		const assessment = await assessFailureTriage(evidence, {
+			enabled: true,
+			client,
+			apiKey: process.env["TYPESAFE_API_KEY"],
+		});
+		if (assessment.status === "assessed") {
+			await persistFailureTriageAssessment(kit.loop.paths.root, assessment);
+		}
+	} catch {
+		// The existing failure, feedback, retry, and quarantine outcomes stand.
 	}
 }
 

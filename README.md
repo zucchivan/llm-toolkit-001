@@ -428,6 +428,59 @@ for the explicit single-verifier opt-out. Each pass appends its own verdict,
 token, and USD usage row to `.orch/wave-log.jsonl` (`verify:*` and
 `verify:skeptic:*`).
 
+### Optional Jev shadow verifier assessment
+
+`[gates] jevVerifierShadow` defaults to `false`. Setting it to `true` opts both
+wave verification and one-off `verify --task <id>` into a separate TypeSafe
+System One assessment using `TYPESAFE_API_KEY` from the environment (never from
+config). With no key, no Jev client is constructed or called.
+
+The assessment filters and bounds the task, acceptance criteria, diff summary,
+changed-file list, a diff excerpt, deterministic gate summary, and existing
+verifier observations into one shared state. It asks three independent Noul
+questions per criterion—evidence sufficiency, satisfaction, and concrete
+violation—in one batched request. Code applies conservative 0.85/0.15 bands and
+requires sufficient evidence plus non-conflicting answers before reporting
+`supports-approval` or `supports-rejection`; uncertainty and conflicts stay
+`unknown`.
+
+Successful calls write `.orch/verifier-assessment.json` with model, evidence
+fingerprint, typed probabilities, thresholds, token usage, and per-criterion
+aggregation. Raw diff text and credentials are not persisted. Reading the file
+against a different evidence fingerprint marks every conclusion stale/unknown.
+Missing credentials, malformed answers, network errors, and low-confidence
+answers never change the primary/skeptic verdict, gate result, task transition,
+retry, quarantine, delivery, or wave-log schema. Jev generates no commands and
+executes nothing. Enabling the setting explicitly consents to sending the
+bounded evidence to TypeSafe; the existing primary/skeptic verifier path remains
+the only authority.
+
+### Optional Jev shadow failure triage
+
+`[gates] jevFailureTriageShadow` is a separate opt-in, also defaulting to
+`false`. It assesses only existing wave failures: each deterministic gate
+failure, and each final verifier `reject`/`needs_human` result. It runs after
+the existing failure feedback or quarantine decision has committed and never
+runs for zero-progress breaker events, successful gates, or approvals.
+
+One batched request asks four narrow questions per failure: evidence
+sufficiency, a typed cause category, whether explicit evidence supports
+implementation/check-configuration feedback, and whether it supports human
+review. Evidence is bounded and secret-filtered task metadata, changed-file
+names, failing gate output, and verifier observations; no patch text is sent.
+Code applies conservative 0.85/0.15 Noul and 0.85 Choice thresholds, rejects
+conflicting answers, and owns all aggregation. Enabling the setting consents to
+sending that filtered failure evidence to TypeSafe using `TYPESAFE_API_KEY`.
+
+Successful calls write `.orch/failure-triage-assessment.json`, separately from
+verifier provenance, with source, task/wave, model, evidence fingerprint, typed
+answers, thresholds, token usage, and advisory outcomes. Raw gate/verifier
+text, patches, and credentials are not persisted. Uncertainty, conflicts,
+stale evidence, missing credentials, malformed responses, and network errors
+remain `unknown`; only completed calls persist, and stale reads invalidate all
+conclusions. No outcome changes gate feedback, verifier routing, retry limits,
+quarantine, task/adoption state, delivery, human approvals, or commands.
+
 Docs: [`docs/concepts.md`](docs/concepts.md) (roles, stages, governor) ·
 [`docs/api-map.md`](docs/api-map.md) (pi-durable/pi-ai export map) ·
 [`docs/project-contract.md`](docs/project-contract.md) (what `init` writes, upgrades).
@@ -440,6 +493,7 @@ Docs: [`docs/concepts.md`](docs/concepts.md) (roles, stages, governor) ·
 | `@earendil-works/pi-ai` | 1.5.0 | provider/model access + faux provider for tests |
 | `@earendil-works/chord` | 1.5.0 | Context/context primitives under pi-durable |
 | `@earendil-works/pi-schema` | 1.5.0 | (transitive) tool argument schemas |
+| `@typesafe-ai/sdk` | 0.7.0 | Provider-neutral judgment seam's TypeSafe System One adapter for opt-in shadow assessments |
 | `smol-toml` | 1.9.1 | config + recipes parsing |
 | dev: `typescript@5.9.3`, `tsx@4.23.15`, `vitest@5.1.0`, `@types/node@26.6.6` | exact | build/dev/tests |
 

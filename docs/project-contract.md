@@ -22,6 +22,12 @@ evidence fingerprints, and N/A reasons; `.orch/gate-remediations.json` contains
 approved planning recommendations. They are deliberate project decisions, not
 runtime caches, and may be committed. Refresh never edits `docs/prd.md`.
 
+Opt-in Jev shadow verification writes separate `.orch/verifier-assessment.json`
+provenance after successful judgment calls. It contains model, evidence
+fingerprint, typed Noul probabilities, thresholds, usage, and code-owned
+aggregation, but no raw diff or credentials. A fingerprint mismatch makes its
+conclusions stale/unknown. It is never an adoption decision or verifier verdict.
+
 Side-cars at runtime (git-ignored, local-only): `.orch/durable.sqlite*` (durable
 storage, WAL), `.orch/lock` (PID lock), `.orch/status.json` (atomic status
 panel payload), `.orch/pending-handoff.json` (queued user note), and
@@ -47,12 +53,28 @@ panel payload), `.orch/pending-handoff.json` (queued user note), and
   regressions, edge cases, missing tests, scope, and security/data-loss risks;
   malformed or inconclusive output becomes `needs_human`, never approval. Wave
   log rows `verify:*` and `verify:skeptic:*` record each pass's verdict and usage.
+  `jevVerifierShadow` (default `false`) separately opts into a batched,
+  shadow-only Jev assessment over filtered task/diff/gate evidence. Successful
+  assessments persist `.orch/verifier-assessment.json`; uncertain, stale,
+  missing-key, malformed, and network-error outcomes remain unknown and cannot
+  alter verdicts, gates, task state, retries, quarantine, or delivery. Raw diff
+  evidence and credentials are not stored in the assessment.
+  `jevFailureTriageShadow` (default `false`) independently opts into batched,
+  shadow-only triage of existing gate failures and verifier rejection/needs-human
+  feedback after the authoritative failure commit. Successful assessments persist
+  `.orch/failure-triage-assessment.json` with typed provenance, not raw failure
+  text, patches, or credentials. All thresholds, categories, aggregation, and
+  effects remain in code; uncertain, conflicting, stale, missing-key, malformed,
+  and network-error outcomes remain unknown and cannot alter feedback routing,
+  retry limits, quarantine, task/adoption state, delivery, or approvals.
 - `[delivery]` — `mode`: `none` (default) | `commit` | `pr` (pr additionally requires the run's `--deliver` flag)
 - `[paths]` — `prd` (default `docs/prd.md`), `specs`
 
 NO SECRETS live in config.toml: providers read credentials from the
 environment, exactly as pi-ai expects (`ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `OPENROUTER_API_KEY`).
+`OPENAI_API_KEY`, `OPENROUTER_API_KEY`). The optional Jev shadows use
+`TYPESAFE_API_KEY` from the environment as well; no API key is a config field or
+assessment property.
 
 Idempotency: `init` writes a file only when it is absent or empty; when a
 user-edited file exists it is LEFT UNTOUCHED and reported under
