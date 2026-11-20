@@ -1,4 +1,4 @@
-# llm-toolkit-001 — durable agent implementation loop
+# llm-toolkit-001 — durable, gate-enforced autonomous coding loop
 
 A maintained TypeScript **agent implementation loop template**: point it at a PRD,
 review one plan, and let a budget-governed `pi-durable` agent harness turn the
