@@ -21,7 +21,18 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
 
 ## Stages
 
-- **plan** — one planner conversation parses the PRD into tasks; the engine
+- **adopt** (optional, before/between plans) — deterministic `discoverProject`
+  reads package scripts/lockfiles/workspaces, tool config, project surfaces, and
+  conservative literal CI evidence without executing them. `gates list` exposes
+  the factual human/generated/effective inventory and an evidence-based report.
+  `gates refresh` requires human selection and diff approval before writing
+  `evals/recipes.auto.toml`; human `evals/recipes.toml` always wins on duplicate
+  names. Missing implementations/unresolved commands become approved planning
+  remediations, not generated tests. `gates probe` is a separate execution
+  consent step and reports pre-existing failures. Remembered evidence
+  fingerprints suppress repeated nagging but reopen on meaningful changes.
+- **plan** — one planner conversation parses the PRD plus any explicitly
+  approved gate-gap remediations into tasks; the engine
   validates the DAG (unknown deps, cycles → plain-words errors), commits
   RouterDoc (`phase: "planned"`) + `router.md` mirror + wave-log row, and stops.
 - **wave** — the driver picks the next `todo` task whose `dependsOn` are all
@@ -30,9 +41,10 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   index), and submits one wave input (`requestId: "<task>-w<N>"`, idempotent).
 - **gate** — deterministic checks run as plain code phases (simpler diagnostics
   than an `afterRun` hook; both are viable, see api-map): scope check first
-  (diff-vs-baseline file set minus engine-owned paths), then recipes from
-  `evals/recipes.toml` (argv-simple commands, timeout, optional stdout `match`
-  regexes, `on` path fast-skip). Failures become compact feedback text and a
+  (diff-vs-baseline file set minus engine-owned paths), then effective recipes
+  from `evals/recipes.auto.toml` + human-overriding `evals/recipes.toml`
+  (argv-simple commands, timeout, optional stdout `match` regexes, `on` path
+  fast-skip, project-relative workspace `cwd`). Failures become compact feedback text and a
   `lastGateHash` for the breaker.
 - **verify** — a fresh read-only verifier conversation is fed spec + criteria +
   per-file diff summary vs the task baseline + gate results. When that primary

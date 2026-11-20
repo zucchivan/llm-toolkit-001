@@ -1,6 +1,11 @@
 # Deterministic gate recipes. Zero exit and every optional `match` regex on stdout ⇒ pass.
 # `on` = path prefixes/globs that skip the recipe when untouched by the wave.
 # Start with NO shell gates (scope check only) and add what your project needs.
+# `gates refresh` can discover existing checks and, only after human approval,
+# write evals/recipes.auto.toml. This human-owned file is never rewritten;
+# same-named recipes here override generated entries. `gates probe` is the
+# separate baseline-execution consent step.
+# Optional `cwd` is a project-relative directory, useful for npm workspaces.
 
 # [lint]
 # cmd = "npm run lint"
@@ -15,3 +20,7 @@
 # [unit-test]
 # cmd = "npm test -- --run"
 # on = ["src/", "test/"]
+
+# [workspace-unit-test]
+# cmd = "npm test"
+# cwd = "packages/web"

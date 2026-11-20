@@ -19,6 +19,8 @@ export interface Recipe {
 	match?: string[];
 	/** Fast-skip: run only when changed files match any of these prefixes/globs. */
 	on?: string[];
+	/** Project-relative working directory (used by workspace recipes). */
+	cwd?: string;
 }
 
 export interface GateFile {
@@ -26,21 +28,33 @@ export interface GateFile {
 }
 
 export function loadRecipes(paths: ProjectPaths): GateFile {
+	// Generated recipes are defaults. Reading human recipes second makes a
+	// same-named human entry the effective one without editing either file.
+	const byName = new Map<string, Recipe>();
+	for (const file of ["recipes.auto.toml", "recipes.toml"]) {
+		for (const recipe of loadRecipeFile(paths.root, file)) byName.set(recipe.name, recipe);
+	}
+	return { recipes: [...byName.values()] };
+}
+
+export function loadRecipeFile(root: string, file: string): Recipe[] {
 	try {
-		const raw = readFileSync(join(paths.root, "evals", "recipes.toml"), "utf8");
+		const raw = readFileSync(join(root, "evals", file), "utf8");
 		const parsed = toml.parse(raw) as unknown as Record<string, Record<string, unknown>>;
 		const recipes: Recipe[] = [];
 		for (const [name, block] of Object.entries(parsed)) {
 			const cmd = block["cmd"];
-			if (typeof cmd !== "string") throw new Error(`recipes.toml: [${name}] needs cmd = "…"`);
+			if (typeof cmd !== "string") throw new Error(`${file}: [${name}] needs cmd = "…"`);
 			const match = strList(block["match"]);
 			const on = strList(block["on"]);
-			recipes.push({ name, cmd, match: match.length ? match : undefined, on: on.length ? on : undefined });
+			const cwd = block["cwd"];
+			if (cwd !== undefined && (typeof cwd !== "string" || !cwd.trim())) throw new Error(`${file}: [${name}] cwd must be a project-relative path`);
+			recipes.push({ name, cmd, match: match.length ? match : undefined, on: on.length ? on : undefined, cwd: typeof cwd === "string" ? cwd : undefined });
 		}
-		return { recipes };
+		return recipes;
 	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "ENOENT") return { recipes: [] }; // empty gates = scope check only
-		throw new Error(`evals/recipes.toml is unreadable/invalid: ${(err as Error).message}`);
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return []; // empty gates = scope check only
+		throw new Error(`evals/${file} is unreadable/invalid: ${(err as Error).message}`);
 	}
 }
 
@@ -154,7 +168,8 @@ function targetPathsContain(rel: string, targetPaths: readonly string[]): boolea
 async function runRecipe(root: string, recipe: Recipe, timeoutMs: number): Promise<GateResult> {
 	const started = Date.now();
 	const argv = recipe.cmd.split(/\s+/); // recipes must stay argv-simple: no pipes, no && (docs)
-	const outcome = await exec([argv[0]!, ...argv.slice(1)], { cwd: root, timeoutMs });
+	const cwd = recipe.cwd === undefined ? root : safeRecipeCwd(root, recipe.cwd);
+	const outcome = await exec([argv[0]!, ...argv.slice(1)], { cwd, timeoutMs });
 	const tail = `${outcome.stdout}\n${outcome.stderr}`.trim();
 	const matched = !recipe.match?.length || recipe.match.some((m) => new RegExp(m).test(outcome.stdout));
 	const passed = outcome.code === 0 && matched; // spawn/timeout failures fail, never pass
@@ -169,6 +184,7 @@ async function runRecipe(root: string, recipe: Recipe, timeoutMs: number): Promi
 }
 
 import { createHash } from "node:crypto";
+import { safeRecipeCwd } from "../adoption/discovery.ts";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 

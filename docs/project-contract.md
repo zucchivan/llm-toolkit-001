@@ -8,12 +8,19 @@ What `<kit> init` writes in a target project, and how versions move.
 | --- | --- | --- |
 | `PROMPT.md` | per-wave discipline appended into each implementer wave input | template (user-editable) |
 | `evals/checklist.md` | human-editable acceptance-criteria template aligned with the RouterDoc schema | template (user-editable) |
-| `evals/recipes.toml` | gate recipes — COMMENTED defaults per language; empty = scope-check-only | template (user-editable; hot-read every gate run) |
+| `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes | template (user-editable; hot-read every gate run) |
+| `evals/recipes.auto.toml` | approved discovered gate recipes; supports project-relative `cwd` for workspaces | generated only by approved `gates refresh`; absent initially |
 | `router.md` | human-readable MIRROR of RouterDoc; engine rewrites it on every router commit | engine |
 | `.orch/config.toml` | annotated project config (roles, budgets, gates, delivery, paths) | config |
 | `.orch/kit-version` | provenance line: `kit=<kit> pi-durable=<pinned>` | engine |
 | `docs/prd.md` | placeholder when `--with-demo`, otherwise absent (user brings the PRD) | user |
 | `.gitignore` | appends `.orch/durable.sqlite*`, `.orch/lock`, `.orch/status.json`, `.orch/pending-handoff.json`, `.orch/artifacts/` (only missing lines) | appended |
+
+Adoption state is written only by approved `gates refresh`:
+`.orch/gate-decisions.json` remembers accepted/deferred/skipped/N/A findings,
+evidence fingerprints, and N/A reasons; `.orch/gate-remediations.json` contains
+approved planning recommendations. They are deliberate project decisions, not
+runtime caches, and may be committed. Refresh never edits `docs/prd.md`.
 
 Side-cars at runtime (git-ignored, local-only): `.orch/durable.sqlite*` (durable
 storage, WAL), `.orch/lock` (PID lock), `.orch/status.json` (atomic status
@@ -29,6 +36,10 @@ panel payload), `.orch/pending-handoff.json` (queued user note), and
   optional `thinkingLevel`, `costPerMillionInput`, `costPerMillionOutput`
   (USD rate fallback for budget math when providers/catalog don't report cost)
 - `[budgets]` — `sessionUsd` (hard ceiling), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`
+- gate recipes — `[name]` tables in `evals/recipes.toml` and approved
+  `evals/recipes.auto.toml`: argv-simple `cmd`, optional stdout `match`, path
+  fast-skip `on`, and optional project-relative `cwd`. Human duplicate names
+  override generated entries. Recipe cwd cannot be absolute or escape the root.
 - `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (scope check + guard),
   `skepticSecondPass` (default `true`, including when omitted): after primary
   approval, a fresh read-only adversarial verifier must also approve. Explicit
@@ -46,7 +57,28 @@ environment, exactly as pi-ai expects (`ANTHROPIC_API_KEY`,
 Idempotency: `init` writes a file only when it is absent or empty; when a
 user-edited file exists it is LEFT UNTOUCHED and reported under
 "kept existing (not clobbered)". `.gitignore` lines append only when missing.
-Running `init` twice is safe and prints the second result.
+Running `init` twice is safe and prints the second result. Init does not run
+discovery adoption or create `recipes.auto.toml`.
+
+## Project adoption contract
+
+1. `gates list` performs deterministic read-only discovery and prints a factual
+   inventory plus covered/missing/present-but-unwired/partial/N/A/unknown
+   findings with evidence. No discovered script or CI YAML is executed.
+2. Interactive `gates refresh` supports recommended selection (fast checks only),
+   individual selection, evidence inspection, defer/skip, and reasoned N/A.
+   Selection is followed by an explicit generated-file diff and write approval.
+3. Refresh writes only `evals/recipes.auto.toml` and the two adoption JSON files.
+   Missing implementations and unresolved commands become reviewed planner
+   input, never silently generated tests or blocking heuristic commands.
+4. `gates probe` separately confirms execution. Non-interactive probe needs
+   `--yes`; failures remain pre-existing baseline failures and change no
+   adoption state.
+5. Non-interactive refresh is read-only unless `--accept recommended` or
+   `--skip-gates` is explicit. New evidence fingerprints reopen remembered
+   findings; refresh additions/changes/removals require approval.
+6. On the next `plan`, approved remediations are additional planning
+   requirements. RouterDoc review and `run --approve` remain unchanged.
 
 ## Upgrade & migration notes
 

@@ -12,6 +12,8 @@ import { commitState, flushStatusSnapshot } from "./state.ts";
 import { shasum } from "../util/git.ts";
 import type { RouterTask, RouterDocValue } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
+import { readJson } from "../util/fsx.ts";
+import type { Remediation } from "../adoption/types.ts";
 
 export class PlanParseError extends Error {}
 
@@ -72,10 +74,12 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 		maxTurns: kitAndLock.loop.config.engine.maxTurns,
 	});
 
+	const remediations = await loadApprovedRemediations(kitAndLock.loop.paths.root);
+	const remediationBrief = formatRemediationBrief(remediations);
 	const outcome = await kit.submitAndAwait(
 		conv,
 		"kit-plan-v1",
-		`PRD (path ${prdPath}, this message is the whole document):\n\n${prdText}\n\nReply with the tasks JSON now.`,
+		`PRD (path ${prdPath}, this message is the whole document):\n\n${prdText}\n\n${remediationBrief}Reply with the tasks JSON now.`,
 	);
 	if (outcome.status !== "done" || !outcome.answer) {
 		throw new PlanParseError(
@@ -113,6 +117,18 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 export interface PlanOutcome {
 	tasks: RouterTask[];
 	conversationId: number;
+}
+
+export async function loadApprovedRemediations(root: string): Promise<Remediation[]> {
+	const stored = await readJson<{ version: number; remediations: Remediation[] }>(join(root, ".orch", "gate-remediations.json"));
+	return stored?.version === 1 && Array.isArray(stored.remediations) ? stored.remediations : [];
+}
+
+/** Approved gaps become planning input, never PRD mutations or model commands. */
+export function formatRemediationBrief(remediations: Remediation[]): string {
+	if (!remediations.length) return "";
+	const details = remediations.map((item) => JSON.stringify(item)).join("\n");
+	return `HUMAN-APPROVED GATE-GAP REMEDIATIONS (additional planning requirements, not implemented changes):\n${details}\nAdd reviewable RouterDoc tasks for these gaps where needed. Do not claim the checks already exist; the normal human plan approval still applies.\n\n`;
 }
 
 // ---------------------------------------------------------------------------

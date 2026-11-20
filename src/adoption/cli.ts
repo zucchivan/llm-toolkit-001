@@ -1,0 +1,82 @@
+/** Thin CLI adapter for the adoption modules; all policy lives behind their seams. */
+import { parseArgs } from "node:util";
+import { createInterface } from "node:readline/promises";
+import { analyzeGaps } from "./gaps.ts";
+import { discoverProject } from "./discovery.ts";
+import { refreshGates } from "./workflow.ts";
+import { probeGates } from "./probe.ts";
+
+export interface GatesCliIo {
+	interactive: boolean;
+	log(message: string): void;
+	error(message: string): void;
+	ask?(question: string): Promise<string>;
+}
+
+export async function runGatesCommand(root: string, argv: string[], io: GatesCliIo): Promise<number> {
+	const subcommand = argv[0] ?? "list";
+	const rest = argv.slice(1);
+	try {
+		if (subcommand === "list") {
+			const { values } = parseArgs({ args: rest, options: { json: { type: "boolean", default: false } }, strict: true });
+			const report = await analyzeGaps(root, await discoverProject(root));
+			if (values.json) io.log(JSON.stringify(report, null, 2));
+			else {
+				const { formatGapReport, formatEvidence } = await import("./workflow.ts");
+				io.log(formatGapReport(report));
+				for (const finding of report.findings.filter((item) => item.status !== "covered" && item.status !== "not-applicable")) io.log(`\n${formatEvidence(finding)}`);
+			}
+			return 0;
+		}
+		if (subcommand === "refresh") {
+			const { values } = parseArgs({
+				args: rest,
+				options: { accept: { type: "string" }, "skip-gates": { type: "boolean", default: false } }, strict: true,
+			});
+			if (values.accept !== undefined && values.accept !== "recommended") throw new Error("--accept supports only the explicit value: recommended");
+			if (values.accept && values["skip-gates"]) throw new Error("choose either --accept recommended or --skip-gates, not both");
+			const result = await refreshGates(root, {
+				interactive: io.interactive, prompt: io.ask ? { ask: io.ask } : undefined,
+				output: { log: io.log }, acceptRecommended: values.accept === "recommended", skipGates: values["skip-gates"] === true,
+			});
+			void result;
+			return 0;
+		}
+		if (subcommand === "probe") {
+			const { values } = parseArgs({ args: rest, options: { yes: { type: "boolean", default: false } }, strict: true });
+			const result = await probeGates(root, {
+				interactive: io.interactive, prompt: io.ask ? { ask: io.ask } : undefined,
+				confirmed: values.yes === true, output: { log: io.log },
+			});
+			return result.consented && !result.allPassed ? 1 : 0;
+		}
+		io.error(gatesHelp());
+		return 1;
+	} catch (err) {
+		io.error(`gates ${subcommand} failed: ${(err as Error).message}`);
+		return 1;
+	}
+}
+
+/** Real TTY adapter. Tests use runGatesCommand with a scripted io.ask instead. */
+export async function runGatesCli(root: string, argv: string[]): Promise<number> {
+	const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+	if (!interactive) return runGatesCommand(root, argv, { interactive, log: console.log, error: console.error });
+	const rl = createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		return await runGatesCommand(root, argv, {
+			interactive, log: console.log, error: console.error,
+			ask: async (question) => await rl.question(question),
+		});
+	} finally {
+		rl.close();
+	}
+}
+
+export function gatesHelp(): string {
+	return `usage:
+  gates list [--json]                    # read-only inventory + evidence-based gap report
+  gates refresh [--accept recommended]   # interactive choices; explicit non-interactive adoption
+  gates refresh --skip-gates             # explicitly defer open findings; generate no recipes
+  gates probe [--yes]                    # separately consented baseline execution`;
+}

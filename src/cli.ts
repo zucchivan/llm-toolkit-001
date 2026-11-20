@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * llm-toolkit-001 — durable agent implementation loop CLI.
- * Commands: init · plan · run · status · verify · export · handoff.
+ * Commands: init · gates · plan · run · status · verify · export · handoff.
  * Arg parsing: node:util parseArgs — no heavy framework.
  * Process exit codes: 0 done/complete · 1 error (incl. lock busy) ·
  * 42 "sleeping until provider reset" (rerun `run` to resume).
@@ -26,6 +26,7 @@ import { renderStatusPanel } from "./views/status.ts";
 import { writeExports } from "./views/export.ts";
 import { runVerify } from "./engine/verifier.ts";
 import { readJson, atomicWriteJson } from "./util/fsx.ts";
+import { runGatesCli } from "./adoption/cli.ts";
 
 const CLI_NAME = pjson.name ?? "llm-toolkit-001";
 const we = console;
@@ -46,6 +47,9 @@ function main(): void {
 	switch (command) {
 		case "init":
 			void cmdInit(rest);
+			break;
+		case "gates":
+			void cmdGates(rest);
 			break;
 		case "plan":
 			void cmdPlan(rest);
@@ -94,10 +98,19 @@ async function cmdInit(argv: string[]): Promise<void> {
 		we.log(`  written: ${report.written.length ? report.written.join(", ") : "(nothing missing)"}`);
 		if (report.skipped.length) we.log(`  ${c.yellow}kept existing (not clobbered):${RESET} ${report.skipped.join(", ")}`);
 		if (report.appended.length) we.log(`  gitignore: ${report.appended.length} lines appended`);
-		we.log(`\nnext: write ${c.cyan}docs/prd.md${RESET}, then ${c.cyan}${CLI_NAME} plan${RESET}`);
+		we.log(`\nnext (existing projects): ${c.cyan}${CLI_NAME} gates list${RESET}, then optionally ${c.cyan}${CLI_NAME} gates refresh${RESET}`);
+		we.log(`then: write ${c.cyan}docs/prd.md${RESET}, then ${c.cyan}${CLI_NAME} plan${RESET}`);
 	} catch (err) {
 		fail(err, "init");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// gates — read-only discovery, approved adoption, separately consented probe
+// ---------------------------------------------------------------------------
+
+async function cmdGates(argv: string[]): Promise<void> {
+	process.exitCode = await runGatesCli(resolve(procCwd()), argv);
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +529,10 @@ function fail(err: unknown, command: string): void {
 function HELP(): string {
 	return `usage:
   ${CLI_NAME} init . [--with-demo]        # scaffold a project (never clobbers your edits)
+  ${CLI_NAME} gates list [--json]          # inventory + cross-cutting coverage/gap evidence
+  ${CLI_NAME} gates refresh [--accept recommended | --skip-gates]
+                                          # approve generated gates; no execution
+  ${CLI_NAME} gates probe [--yes]           # separately consented baseline probe
   ${CLI_NAME} plan [--prd path]           # PRD → RouterDoc + router.md; stops for human approval
   ${CLI_NAME} run [--approve] [--tasks id] [--deliver]
                                           # the cycle; exit 0 done · 42 sleeping · 1 error/busy

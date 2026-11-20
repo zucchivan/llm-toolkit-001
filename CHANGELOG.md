@@ -4,6 +4,26 @@ Manual semver discipline: keep `package.json` version and the newest section in 
 
 ## Unreleased
 
+- **interactive existing-project adoption**: deterministic read-only discovery
+  (`discoverProject`) inventories npm scripts/lockfiles/workspaces, common
+  test/tool config, project surfaces, and conservative CI command evidence.
+  `gates list` reports factual human/generated/effective gates plus evidence and
+  covered/missing/present-but-unwired/partial/N/A/unknown cross-cutting gaps.
+- `gates refresh` adds recommended/individual/evidence/defer/reasoned-N/A flows,
+  remembered evidence fingerprints, and approval previews for generated recipe
+  additions/changes/removals. It writes `evals/recipes.auto.toml` only after
+  approval, preserves human `evals/recipes.toml` (duplicate names override),
+  supports workspace recipe `cwd`, and never executes the adopted checks.
+- Missing implementations and unresolved commands can become explicitly
+  approved `.orch/gate-remediations.json` planning input; the PRD is not edited,
+  tests/dependencies are not generated, and normal RouterDoc approval remains.
+  E2E/accessibility are surface-sensitive and excluded from fast recommended
+  selection; libraries without browser journeys are not offered E2E.
+- `gates probe` separately consents baseline execution (`--yes` when
+  non-interactive) and reports pre-existing failures without changing adoption.
+  Bare non-interactive refresh writes nothing; only explicit
+  `--accept recommended` or `--skip-gates` records an adoption decision.
+
 - **default-on adversarial verification**: `[gates] skepticSecondPass` now
   defaults to `true` in both the loader and scaffold template; an explicit
   `false` remains the opt-out. A primary approval opens a fresh read-only

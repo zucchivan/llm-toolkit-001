@@ -78,7 +78,10 @@ primary approval followed by adversarial approval.
 | Command | What it does |
 | --- | --- |
 | `init . [--with-demo]` | scaffold §5 files; idempotent; prints what it skipped |
-| `plan [--prd path]` | PRD → RouterDoc + router.md; STOP for human approval |
+| `gates list [--json]` | read-only project discovery, factual gate inventory, and evidence-based gaps |
+| `gates refresh [--accept recommended \| --skip-gates]` | interactively select/defer findings, preview generated diffs, approve writes; never probes |
+| `gates probe [--yes]` | separately consented baseline recipe execution; reports pre-existing failures |
+| `plan [--prd path]` | PRD + approved gap remediations → RouterDoc + router.md; STOP for human approval |
 | `run [--approve] [--tasks id…] [--deliver]` | the sequential wave cycle (resumable) |
 | `status [--follow]` | task graph + budgets from `.orch/status.json` (when a run is locked) or storage |
 | `inspect [--json] [--health] [section…]` | full visibility snapshot: tasks, usage splits, wave timeline, conversations, artifacts, health; degrades to side-cars while a run holds the lock |
@@ -88,6 +91,291 @@ primary approval followed by adversarial approval.
 | `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
 Exit codes: `0` done · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` error or lock busy.
+
+## Adopting an existing project
+
+`init` deliberately starts with scope checking only. Adoption is a separate,
+evidence-first flow:
+
+```text
+discover → inventory existing gates → analyze cross-cutting gaps
+  → inspect evidence and recommendations → explicit human selection
+  → approve generated-file diff → optionally approve a separate baseline probe
+```
+
+Start with:
+
+```bash
+llm-toolkit-001 init .
+llm-toolkit-001 gates list
+```
+
+Discovery is deterministic and read-only. It reads root/workspace
+`package.json` scripts, npm workspaces, npm/pnpm/yarn/bun lockfiles, common test
+and tool config, test/migration/API file names, and literal single-line
+package-manager commands in common CI files. It does **not** execute package
+scripts, CI YAML, shell text, or an LLM. `gates list --json` exposes the same
+inventory, findings, evidence, and recommendations for automation.
+
+The report uses six states: **covered** (an effective recipe covers the
+surface), **missing** (a surface exists but no implementation/command was
+found), **present-but-unwired** (a script or literal CI command exists but no
+gate invokes it), **partial** (for example, root tests are wired but a workspace
+is not), **not-applicable** (the surface does not exist), and **unknown**
+(test/tool evidence exists but the command cannot be resolved conservatively).
+A heuristic gap is never a blocking gate until a human adopts it.
+
+### Example: accept the recommended fast checks
+
+Suppose `package.json` has `test`, `lint`, and `build` scripts and no recipes.
+
+- **Detection evidence:** `gates list` names `package.json`, each script's exact
+  value, and the package-manager lockfile used to choose `npm`/`pnpm`/etc.
+- **Why it matters:** these existing repeatable checks catch regressions before
+  model verification; adoption wires commands you already own rather than
+  inventing a new test policy.
+- **Available choices:** choose `a` to accept recommended fast deterministic
+  recipes and approved planning remediations; `c` for individual decisions; `i`
+  for evidence; `s` to defer; or `n` to record a reasoned not-applicable
+  decision. Slow E2E/accessibility checks are not included in `a`.
+- **Write/execution effects:** after the diff, `y` writes only
+  `evals/recipes.auto.toml`, `.orch/gate-decisions.json`, and
+  `.orch/gate-remediations.json`. It does not run the scripts, install
+  dependencies, generate tests, or edit `docs/prd.md`.
+
+```bash
+llm-toolkit-001 gates refresh
+# Selection [a/c/i/s/n]: a
+# inspect the + additions / ~ changes / - removals
+# Approve these writes? [y/N] y
+```
+
+The equivalent scripted decision is `gates refresh --accept recommended`; that
+flag is both explicit selection and generation approval. It still does not
+probe or execute the new recipes.
+
+### Example: choose individually and inspect evidence
+
+For a workspace with root `npm test` and `packages/web`'s own test script:
+
+- **Detection evidence:** the finding `unit-test:packages/web` cites
+  `packages/web/package.json`; its **partial** state distinguishes it from the
+  already covered root. The recommendation is `npm test` with
+  `cwd = "packages/web"`.
+- **Why it matters:** a root gate does not prove that a package's own test
+  command runs in its package context.
+- **Available choices:** select `i`, then a finding number/id, to inspect without
+  deciding. Select `c`, then use `a` (accept), `e` (show evidence again), `s`
+  (decide later), or `n` (not applicable; a reason is mandatory) per finding.
+- **Write/execution effects:** accepting proposes a generated workspace recipe;
+  deferring/N/A records only a decision. Nothing executes during selection or
+  generation. Workspace recipes execute relative to the project root plus
+  `cwd`; absolute paths and parent-directory escapes are rejected.
+
+```text
+Selection [a/c/i/s/n]: i
+Finding number or id: unit-test:packages/web
+Selection [a/c/i/s/n]: c
+unit-test:packages/web: [a]ccept · [e]vidence · [s]later · [n]ot applicable: a
+Approve these writes? [y/N] y
+```
+
+### Example: a web app has no E2E journeys
+
+- **Detection evidence:** an app-style `dev`/`start` script (for example Vite or
+  Next) establishes a web surface. No E2E script, Playwright/Cypress config, or
+  E2E files were found, so the state is **missing**, not merely unwired.
+- **Why it matters:** critical browser journeys can catch integration failures
+  that unit tests miss. The evidence does not justify inventing journeys or
+  assuming every library needs a browser.
+- **Available choices:** accept queues a planning remediation; defer leaves it
+  unimplemented; N/A records why browser journeys do not apply. E2E is excluded
+  from accept-recommended, so use individual selection to opt in.
+- **Write/execution effects:** approval records the remediation in
+  `.orch/gate-remediations.json`. The next `plan` includes it as an additional
+  requirement for normal RouterDoc review. It does not edit the PRD, generate
+  tests, add dependencies, or create an executable E2E recipe.
+
+A plain library—even one with a React dependency and no app-style browser
+script—is **not-applicable** for E2E. No E2E recommendation is made.
+
+### Example: E2E exists but is not wired
+
+- **Detection evidence:** `package.json` contains `test:e2e` (or E2E config/files
+  exist), while neither human nor generated effective recipes cover E2E. A
+  script yields **present-but-unwired**; files/config without a resolvable script
+  yield **unknown**.
+- **Why it matters:** an existing suite provides no wave protection if no gate
+  invokes it; an unresolved suite needs a human to identify its command.
+- **Available choices:** individually accept an exact existing `test:e2e`
+  command, defer it, or mark it N/A with a reason. For unknown commands, accept
+  the planning remediation rather than a guessed command.
+- **Write/execution effects:** accepting a resolved command writes its recipe
+  only after diff approval. E2E remains slow/opt-in and is not run until
+  `gates probe` consent or a later wave. No browser is launched by discovery.
+
+### Example: unresolved test commands
+
+- **Detection evidence:** `vitest.config.ts`, Jest config, or test files exist,
+  but no supported test script exists. The unit-test state is **unknown** and
+  the evidence lists those files.
+- **Why it matters:** config alone does not establish a safe, repeatable command;
+  guessing can run the wrong suite or hang.
+- **Available choices:** accept a remediation to resolve/add the command through
+  the normal planner and plan review, defer, or record N/A with a reason.
+- **Write/execution effects:** no test command is synthesized and no test is
+  generated. Only the approved decision/remediation JSON is written; a later
+  reviewed plan can add the actual command and gate.
+
+### Cross-cutting gap examples
+
+Each scenario below appears in `gates list` with its evidence and why text. In
+`gates refresh`, every one supports accept (when a safe recommendation exists),
+individual selection, evidence inspection, defer, and reasoned N/A. Recipe
+acceptance writes only after generation approval; remediations go only to the
+next reviewed plan. None of these analyses executes the underlying command.
+
+#### API integration gap
+
+- **Detection evidence:** a server framework/API script or API route files
+  establish the surface. `test:integration` without a corresponding gate is
+  **present-but-unwired**; routes with no integration command are **missing**.
+- **Why it matters:** route, serialization, and service-boundary contracts need
+  integration coverage beyond isolated units.
+- **Available choices:** wire the exact integration script individually or via
+  recommended selection; accept a planning remediation if missing; defer/N/A.
+- **Write/execution effects:** a resolved script becomes a generated recipe after
+  approval. A missing suite becomes planning input only. No API or database is
+  contacted during refresh.
+
+#### Migration validation
+
+- **Detection evidence:** SQL/TS/JS files under conventional migration paths.
+  An existing `migrate:validate`/`db:validate`-style script is unwired when no
+  migration gate covers it; files without a script are missing.
+- **Why it matters:** invalid or non-reproducible schema changes can pass code
+  tests yet fail during deployment.
+- **Available choices:** approve the existing validation script, queue reviewed
+  remediation work, defer, or N/A with the project's migration policy.
+- **Write/execution effects:** only the generated command/decision or remediation
+  is written. Refresh never runs migrations and never connects to a database.
+
+#### Package/CLI smoke checks
+
+- **Detection evidence:** a non-private package or `bin` entries in
+  `package.json`. With no package smoke script, the safe npm recommendation is
+  `npm pack --dry-run --ignore-scripts`; an existing package/CLI smoke script is
+  wired verbatim through its package manager.
+- **Why it matters:** publish contents and CLI packaging can be broken even when
+  source tests pass.
+- **Available choices:** accept the dry-run/script, defer, or N/A. Workspaces get
+  a package-relative `cwd` and a distinct generated recipe name.
+- **Write/execution effects:** generation writes the recipe only. The dry-run
+  uses no install and ignores package scripts, but—like every gate—it executes
+  only after probe consent or during a wave.
+
+#### CI drift
+
+- **Detection evidence:** literal single-line `run: npm test`, `npm run build`,
+  etc. in `.github/workflows/*.yml|yaml` or `.gitlab-ci.yml`. Multi-line YAML,
+  expressions, arbitrary shell, install commands, and other CI operations are
+  not promoted. A literal check absent from effective recipes is
+  **present-but-unwired**.
+- **Why it matters:** different local and CI check sets produce contradictory
+  results and late failures.
+- **Available choices:** accept the exact safe package-manager command, defer, or
+  N/A. Existing equivalent effective commands count as covered.
+- **Write/execution effects:** approval writes a CI-parity recipe; CI files are
+  never edited and CI YAML is never executed by discovery.
+
+#### Accessibility where applicable
+
+- **Detection evidence:** a web surface, accessibility tests/config, or an
+  `a11y`/accessibility script. Existing tooling without a gate is unwired; a web
+  surface without it is missing; non-web projects are N/A.
+- **Why it matters:** browser functional journeys do not necessarily detect
+  keyboard, semantics, or accessibility regressions.
+- **Available choices:** opt into a resolved check individually (it is excluded
+  from fast recommended selection), accept reviewed remediation work, defer, or
+  N/A with a reason.
+- **Write/execution effects:** no accessibility scanner is installed or run.
+  Approval writes only the selected generated recipe or planning remediation.
+
+### Generation approval and human configuration
+
+- **Detection evidence:** the final refresh view lists exact recipe names,
+  commands, `cwd`, and any remediation specs derived from the inspected findings.
+- **Why it matters:** selecting a recommendation and changing the gate contract
+  are separate decisions; the diff prevents silent additions or removals.
+- **Available choices:** `y` approves the displayed writes; anything else aborts
+  the whole adoption transaction. `--accept recommended` is the explicit
+  non-interactive approval for the recommended subset.
+- **Write/execution effects:** approved entries go to
+  `evals/recipes.auto.toml`; human-owned `evals/recipes.toml` is byte-preserved.
+  Both are loaded, and a same-named human recipe overrides the generated one.
+  Declining writes nothing and runs nothing. Recipes remain argv-simple: no
+  shell, pipes, `&&`, arbitrary YAML execution, or dependency installation.
+
+### Baseline probing is a separate confirmation
+
+- **Detection evidence:** probe lists every effective recipe, its source, exact
+  command, and `cwd` before execution.
+- **Why it matters:** a newly wired command may already fail; knowing the
+  baseline prevents adoption from being mistaken for the cause.
+- **Available choices:** answer `y` to execute sequentially, or decline. In a
+  non-interactive shell, `gates probe --yes` is required; without it, probe exits
+  without running commands.
+- **Write/execution effects:** consent executes the commands with the normal
+  timeout and no shell. Probe writes no adoption config. It prints PASS/FAIL and
+  labels failures as **pre-existing baseline failures**; it does not weaken,
+  remove, or mark a failing gate as passed.
+
+```bash
+llm-toolkit-001 gates probe       # TTY: review commands, then separately confirm
+llm-toolkit-001 gates probe --yes # explicit scripted execution consent
+```
+
+### Refresh additions, changes, and removals
+
+- **Detection evidence:** later discovery compares current scripts/surfaces and
+  evidence fingerprints with the remembered decisions and generated file.
+- **Why it matters:** a renamed script can make an old generated recipe stale;
+  deletions need the same human control as additions.
+- **Available choices:** review each reopened finding, then approve or decline
+  the displayed `+` additions, `~` before→after changes, and `-` removals.
+  Defer keeps a stale generated command in place rather than silently removing
+  it; N/A can approve its removal with a reason.
+- **Write/execution effects:** only approval rewrites the generated file and
+  decisions. Human recipes are untouched; refresh still executes no recipes.
+
+### Remembered decisions and new evidence
+
+- **Detection evidence:** `.orch/gate-decisions.json` stores finding id,
+  accepted/deferred/skipped/N/A decision, evidence fingerprint, selected recipe
+  or remediation, and the required N/A reason.
+- **Why it matters:** deferring an intentional gap should not produce repeated
+  nagging, while a new script, surface, or changed command should reopen it.
+- **Available choices:** unchanged decisions require no prompt. A meaningful
+  evidence change marks the finding **reopened** and offers the full choice set
+  again.
+- **Write/execution effects:** quiet refreshes write nothing. A reopened decision
+  changes files only after the normal generation approval; no evidence change
+  directly triggers execution.
+
+### Non-interactive safety
+
+- **Detection evidence:** `gates list` and bare `gates refresh` still produce the
+  factual inventory/report when no TTY is available.
+- **Why it matters:** automation must not turn heuristics into blocking gates or
+  execute project commands accidentally.
+- **Available choices:** bare refresh makes no adoption changes. Use exactly
+  `--accept recommended` to approve the fast recommended subset, or
+  `--skip-gates` to record explicit skip decisions without generating recipes.
+  Probe independently requires `--yes`.
+- **Write/execution effects:** `--accept recommended` writes the generated file,
+  decisions, and approved remediations but executes nothing. `--skip-gates`
+  writes only decisions/remediation state (no new recipes). Bare refresh and
+  list write nothing; probe without `--yes` executes nothing.
 
 ## Web UI (sub-product)
 
