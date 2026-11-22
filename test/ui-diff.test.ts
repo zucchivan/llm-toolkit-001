@@ -38,9 +38,9 @@ const implWrites = (writes: { path: string; content: string }[], closing = "STAT
 	writes.map((w) => fauxAssistantMessage([fauxToolCall("write", w)], { stopReason: "toolUse" })).concat([fauxAssistantMessage(closing, { stopReason: "stop" })]);
 
 const verifyApprove = () =>
-	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "ok" }), { stopReason: "stop" });
+	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "ok" }), { stopReason: "stop" });
 const verifySkepticApprove = () =>
-	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" });
+	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" });
 
 const statsOf = async (root: string, name: string): Promise<DisplayDiffStats> => {
 	const stats = await readJson<DisplayDiffStats>(join(root, ".orch", "artifacts", name));
@@ -61,7 +61,7 @@ describe("A.2: done path writes patch + stats before delivery", () => {
 		], models.faux);
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const patchPath = join(project.root, ".orch", "artifacts", "task-t1.patch");
@@ -120,7 +120,7 @@ describe("A.2: done path writes patch + stats before delivery", () => {
 		await accomplish(kit);
 		await writeGateFile(project.root);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const state = await readSessionState(kit.loop.harness);
@@ -167,7 +167,7 @@ describe("A.2: quarantine keeps its patch and gains a stats side-car; rollback h
 		await writeGateFile(project.root);
 		await accomplish(reopen);
 
-		const summary = await runWaves(reopen, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(reopen, { tasksFilter: [] });
 		expect(summary.complete).toBe(false);
 
 		const state = await readSessionState(reopen.loop.harness);
@@ -211,7 +211,7 @@ describe("A.2: cap + truncation (display only, never a rollback input)", () => {
 		], models.faux);
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 		const state = await readSessionState(kit.loop.harness);
 		expect(state.router.tasks[0]!.status).toBe("done"); // the run outcome is untouched by the cap
@@ -243,7 +243,7 @@ describe("A.3: readout carries diff refs + the diff artifact kind", () => {
 			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
-		await runWaves(kit, { approve: true, tasksFilter: [] });
+		await runWaves(kit, { tasksFilter: [] });
 
 		const read = await readout(kit.loop.paths, { loop: kit });
 		expect(read.seam).toBe(1);
@@ -274,7 +274,7 @@ describe("A.3: readout carries diff refs + the diff artifact kind", () => {
 			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
-		await runWaves(kit, { approve: true, tasksFilter: [] });
+		await runWaves(kit, { tasksFilter: [] });
 		await kit.loop.close();
 		kit.lock.release();
 
@@ -298,7 +298,7 @@ describe("A.2 side-car: status.json tasks carry baselineTreeSha (live diff input
 			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
-		await runWaves(kit, { approve: true, tasksFilter: [] });
+		await runWaves(kit, { tasksFilter: [] });
 
 		const payload = await readJson<{ tasks: { id: string; baselineTreeSha?: string }[] }>(join(project.root, ".orch", "status.json"));
 		const entry = payload?.tasks.find((t) => t.id === "t1");

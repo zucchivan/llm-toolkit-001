@@ -8,13 +8,13 @@ What `<kit> init` writes in a target project, and how versions move.
 | --- | --- | --- |
 | `PROMPT.md` | per-wave discipline appended into each implementer wave input | template (user-editable) |
 | `evals/checklist.md` | human-editable acceptance-criteria template aligned with the RouterDoc schema | template (user-editable) |
-| `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes | template (user-editable; hot-read every gate run) |
+| `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes; one command form per recipe (`cmd` legacy simple, or literal `argv` tokens) | template (user-editable; hot-read every gate run) |
 | `evals/recipes.auto.toml` | approved discovered gate recipes; supports project-relative `cwd` for workspaces | generated only by approved `gates refresh`; absent initially |
 | `router.md` | human-readable MIRROR of RouterDoc; engine rewrites it on router commits; review it, but revise the PRD and replan instead of editing it as input | engine |
 | `.orch/config.toml` | annotated project config (roles, budgets, gates, delivery, paths) | config |
-| `.orch/kit-version` | provenance line: `kit=<kit> pi-durable=<pinned>` | engine |
+| `.orch/kit-version` | provenance line: `kit=<kit> pi-durable=<pinned>`; `<kit>` is the package version (see below) | engine |
 | `docs/prd.md` | placeholder when `--with-demo`, otherwise absent (user brings the PRD) | user |
-| `.gitignore` | appends `.orch/durable.sqlite*`, `.orch/lock`, `.orch/status.json`, `.orch/pending-handoff.json`, `.orch/artifacts/` (only missing lines) | appended |
+| `.gitignore` | appends ONE bounded, idempotent `llm-toolkit-001` hygiene block — `/.orch/*`, `!/.orch/config.toml`, `!/.orch/gate-decisions.json`, `!/.orch/gate-remediations.json`, `/router.md` — preserving existing comments/custom patterns (never removed) | appended |
 
 Adoption state is written only by approved `gates refresh`:
 `.orch/gate-decisions.json` remembers accepted/deferred/skipped/N/A findings,
@@ -28,13 +28,10 @@ fingerprint, typed Noul probabilities, thresholds, usage, and code-owned
 aggregation, but no raw diff or credentials. A fingerprint mismatch makes its
 conclusions stale/unknown. It is never an adoption decision or verifier verdict.
 
-Private runtime paths ignored by the init template: `.orch/durable.sqlite*`
-(durable storage, WAL), `.orch/lock` (PID lock), `.orch/status.json` (atomic
-status panel payload), `.orch/pending-handoff.json` (queued user note), and
-`.orch/artifacts/*` (gate logs, quarantine patches, exports). These artifacts
-are best-effort local evidence, not guaranteed commits or effect receipts.
-`.orch/wave-log.jsonl` is a separately rewritten mirror; the current init
-ignore list does not add a rule for it.
+Private runtime paths are ignored by the init template through one bounded
+block (`/.orch/*` plus the reviewable exceptions and `/router.md` above).
+These artifacts are best-effort local evidence, not guaranteed commits or
+effect receipts.
 
 ## config.toml fields (role identities required; other settings defaulted)
 
@@ -48,16 +45,35 @@ ignore list does not add a rule for it.
   providers/catalogs do not report cost.
 - `[budgets]` — `sessionUsd` (observed/estimated spend stop, not a hard provider-bill cap), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`. An admitted in-flight request can exceed the ceiling.
 - gate recipes — `[name]` tables in `evals/recipes.toml` and approved
-  `evals/recipes.auto.toml`: argv-simple `cmd`, optional stdout `match`, path
-  fast-skip `on`, and optional project-relative `cwd`. Human duplicate names
-  override generated entries. Recipe cwd cannot be absolute or escape the root.
-- `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (working-tree scope check + write/edit guard; neither is OS containment and bash/recipes still execute on the host),
-  `skepticSecondPass` (default `true`, including when omitted): after primary
-  approval, a fresh read-only adversarial verifier must also approve. Explicit
-  `false` is the single-pass opt-out. The adversarial pass checks criteria,
-  regressions, edge cases, missing tests, scope, and security/data-loss risks;
-  malformed or inconclusive output becomes `needs_human`, never approval. Wave
-  log rows `verify:*` and `verify:skeptic:*` record each pass's verdict and usage.
+  `evals/recipes.auto.toml`: EXACTLY ONE command form each — legacy `cmd`
+  (trimmed and split on whitespace only; shell quoting/pipes/redirections/
+  expansions are refused with a pointer at argv) or literal `argv` tokens
+  (spaces, empty values and metacharacters are data). Optional stdout `match`
+  regexes (ALL must match; compiled before any recipe runs; never stderr),
+  path fast-skip `on`, and optional project-relative `cwd` (real-path
+  contained: symlink escapes refuse). Human duplicate names override
+  generated entries. Wave gates and `gates probe` share one no-shell runner
+  and its deadline rules; stdout past the 256 KiB capture cap with `match`
+  present fails `output_capped`. Invalid input fails before any command
+  starts; failures become compact feedback text and a `lastGateHash` for the
+  breaker. Recipe cwd cannot be absolute or escape the root.
+- `[gates]` — `timeoutSec` (per recipe; also the `gates probe` deadline), `enforceTargetPaths` (working-tree scope check + write/edit guard; neither is OS containment and bash/recipes still execute on the host),
+  `skepticSecondPass` (default `true`, including when omitted): after a conclusive,
+  evidence-backed primary approval, a fresh read-only adversarial verifier must
+  also approve. Explicit `false` is the single-pass opt-out. The adversarial pass
+  checks criteria, regressions, edge cases, missing tests, scope, and
+  security/data-loss risks; malformed or inconclusive output becomes
+  `needs_human`, never approval. Approval is enforced SYMMETRICALLY (M0-P11):
+  every pass must mark each reviewed criterion pass and cite valid evidence
+  against the checked tree — an executed, non-scope, non-skipped passing gate, or
+  a line in a regular text blob of that tree; scope alone proves nothing. Wave
+  log rows `verify:*` and `verify:skeptic:*` record each pass's verdict and
+  usage, and each pass commits a `loop.receipts` pass receipt (criteria, checked
+  tree, gate id, policy) BEFORE the next pass is dispatched; the wave's gate
+  outcome commits a gate receipt binding the checked tree and every check
+  outcome (including skips and failures). The one-off `verify --task` diagnostic
+  records no wave-keyed pass receipts, and without gate receipts a gate
+  reference is never evidence there.
   `jevVerifierShadow` (default `false`) separately opts into a batched,
   shadow-only Jev assessment over filtered task/diff/gate evidence. Successful
   assessments persist `.orch/verifier-assessment.json`; uncertain, stale,
@@ -83,8 +99,8 @@ assessment property.
 
 Idempotency: `init` writes a file only when it is absent or empty; when a
 user-edited file exists it is LEFT UNTOUCHED and reported under
-"kept existing (not clobbered)". `.gitignore` lines append only when missing.
-Running `init` twice is safe and prints the second result. Init does not run
+"kept existing (not clobbered)". The `.gitignore` hygiene block appends only
+when its marker is missing; running `init` twice appends it once. Init does not run
 discovery adoption or create `recipes.auto.toml`.
 
 ## Project adoption contract
@@ -107,17 +123,111 @@ discovery adoption or create `recipes.auto.toml`.
 6. On the next `plan`, approved remediations are additional planning
    requirements. Review the durable RouterDoc through its `router.md` mirror;
    to change the graph, revise the PRD/remediations and replan rather than
-   treating mirror edits as input. `run --approve` approves RouterDoc state.
+   treating mirror edits as input. A grant approves RouterDoc state for the
+   plan's durable `planRevision`, which `plan` prints and the mirror shows:
+   `run --approve --revision <uuid>` (there is no hidden default revision),
+   with repeated `--tasks <id>` for an explicit subset or none for every
+   task, stored explicitly. Approval binds to the reviewed mirror bytes — a
+   missing or edited mirror refuses the grant (replan to refresh) — and a
+   bare `run` resumes exactly the stored grant, never importing edits.
+
+## Plan identity (review ID ≠ schema version)
+
+Every successful `plan` mints a fresh identity for the reviewed graph:
+`planRevision` (a new UUIDv4 per plan, even for identical replans),
+`definitionSha256` (canonical SHA256 over the immutable task definitions —
+recursively sorted keys, order-preserving arrays, UTF-8 JSON; status,
+counters, and receipts are not part of it), `baseCommit`/`baseBranch` (git
+HEAD and its branch at planning; `baseCommit` is `null` before the first
+commit, and uncommitted operator edits are excluded from the reviewed base),
+normalized project-relative `prdPath` + `prdSha256`, and `controlsSha256`
+over the approved controls (gate-gap remediations, `PROMPT.md`,
+`evals/checklist.md`, human and approved generated recipes). `controlsSha256`
+is ABSENT when no control input exists at all — distinct from a digest over
+empty controls, and absent remediations hash differently from an approved
+empty list.
+
+The `planRevision` is a REVIEW identity, not a schema version: the durable
+document payload versions (`loop.router`/`loop.run` at version 2) describe
+storage shape, and bumping them is a migration concern, not a new plan.
+Grants are the ADR 01 triple (`approvedPlanRevision` + `approvedSelected` +
+`humanApprovedAt`); a stamp missing any leg — including a migrated v1
+timestamp or a pre-grant v2 revision+time pair — authorizes no run, and a
+successful replan clears the whole triple atomically while archiving the
+replaced plan's identity references (references only, never receipts;
+legacy v1 plans had no identity, so replacing one archives nothing).
+
+A mutating `run` refuses — before any wave or model dispatch — and never
+broadens a refused grant:
+
+- an unmigrated legacy plan (a task graph with no `planRevision`), even with
+  a well-formed `--approve --revision` — the documented v1 upgrade is:
+  reconcile any operator edits manually, commit the intended base, `plan`
+  again (this archives the old plan, where one existed, and clears old
+  approvals), review `router.md`, then `run --approve --revision <uuid>`;
+- a new grant (`--approve`) without an explicit `--revision`, or with one
+  that does not name the CURRENT `planRevision` (an old revision refuses,
+  the grant untouched);
+- a granted subset with unknown ids, duplicate `--tasks` entries, or an
+  unsatisfied dependency outside the selection (named culprit; dependencies
+  are never auto-included);
+- a new grant while `router.md` is missing or differs from the canonical
+  durable render — replan to refresh the mirror;
+- a bare run whose stored grant is missing, incomplete, or does not name
+  the current `planRevision` — rerun with `run --approve --revision <uuid>`
+  after reviewing `router.md`;
+- an explicitly supplied `--tasks` set (without `--approve`) that does not
+  equal the stored grant exactly.
+
+`run` exit codes: `0` only for whole-plan fulfillment (`STATUS: COMPLETE`;
+the ONLY outcome that flips the router phase to complete, recorded once) or
+selection-complete (the granted subset is fulfilled; the remaining plan
+work is named and the phase stays open) · `2` policy stop — a quarantined
+granted task stops the selection on its first quarantine, an unsatisfiable
+selection stops with ids, or the budget ceiling hit · `42` sleeping · `1`
+invalid input/lock/hard error · `130` SIGINT.
+
+Failed plan parsing or identity-input failures (git, paths, controls) leave
+the previous plan, run status, and mirrors byte-identical.
+
+## Read-only observation
+
+`status`, `inspect`, `export`, and the web UI's reads are observers. They
+acquire `.orch/lock` and open durable storage through the harness's `readOnly`
+option: no scheduling, no admission or recovery writes, no task progress, zero
+model/tool dispatches (an observer builds no providers at all), and any commit
+with writes rejects with the SDK's `ReadOnlySession`. A project that has never
+run has no `.orch/durable.sqlite`; observation refuses to create one and
+reports empty/absent evidence from the side-cars instead (`status` renders an
+empty panel). While another process owns the lock, the same commands degrade
+to side-car-only reads. The pinned SDK seam itself is documented and
+mechanically enforced per `docs/api-map.md` (M0-P02).
 
 ## Upgrade & migration notes
 
 - The kit is versioned semver; `.orch/kit-version` records which pairs
-  (kit, pi-durable) created the project.
+  (kit, pi-durable) created the project. The kit version IS the package
+  version: `src/config.ts` reads `package.json` once, and the init marker, the
+  CLI version header, and every readout identity draw from that single source,
+  so they always agree. `RunStatusDoc.kitVersion` values recorded by older kits
+  are historical state and are never rewritten.
 - pi-durable upgrades: `docs/api-map.md` is the contract map — the engine only
   touches the exports listed there. `assertPinnedPiDurable()` compares the
   INSTALLED `@earendil-works/pi-durable/package.json` version and the
   `[engine] piDurable` config value against the built-in `PD_VERSION` pin and
   refuses to run on mismatch with a pointer at this doc.
+- Document payload migrations (M0-P04): `RouterDoc` and `RunStatusDoc` moved
+  from payload version 1 to 2 through the pinned `defineDoc`
+  `migrate(value, fromVersion)` — pure functions that keep every historical
+  row readable (`migrateRouterDoc`, `migrateRunStatusDoc` in
+  `docs/api-map.md`) and invent nothing: no plan identity for legacy plans,
+  no receipts, no rewritten spend or kit identity. Records migrate lazily on
+  read and persist at version 2 with the next mutating commit; a mutating run
+  on an unmigrated non-empty plan refuses (see Plan identity above). Before
+  upgrading a real project, stop all kit processes and copy the closed
+  storage (`.orch/durable.sqlite*`) together with the retained Git objects and
+  `.orch` evidence; never delete. Downgrading after v2 writes requires
+  restoring that backup, not running an older writer.
 - RouterDoc schema changes land ADDITIVELY with a careful `version` bump and a
   `migrate` function when semantics change; readers treat absent fields as
   defaults (e.g. `convId` missing ⇒ open a new conversation for the task).
@@ -128,25 +238,66 @@ discovery adoption or create `recipes.auto.toml`.
 - Delivery modes matter for upgrade drills: `none` leaves waves in the working
   tree, so a kit update mid-project is a checkout switch, not a code migration.
 
+## Repository hygiene — three ownership classes (ADR 04)
+
+Every path the kit touches belongs to exactly one class, independent of
+authorship. `init` encodes the defaults as ONE bounded, idempotent,
+LF-delimited block in the project's root `.gitignore` (existing comments and
+custom patterns are preserved, never removed):
+
+```gitignore
+/.orch/*
+!/.orch/config.toml
+!/.orch/gate-decisions.json
+!/.orch/gate-remediations.json
+/router.md
+```
+
+- **Reviewable** — project code, PRD, `PROMPT.md`, human and approved generated
+  recipes, checklist, plus the three kit controls `.orch/config.toml`,
+  `.orch/gate-decisions.json`, `.orch/gate-remediations.json`. Not ignored;
+  committable. The kit NEVER auto-stages them: committing controls is an
+  explicit operator decision.
+- **Optional local paper trail** — `router.md`, `.orch/wave-log.jsonl`,
+  `.orch/kit-version`. Ignored by default; after review the human may
+  explicitly retain any of them (`git add -f router.md .orch/wave-log.jsonl
+  .orch/kit-version`). Neither file is guaranteed committed evidence, and
+  mirror content alone does not certify rollback, delivery, or any external effect.
+- **Private** — all other `.orch/**` data: SQLite/WAL/SHM, lock, notes,
+  projections, workspaces, assessments, telemetry, exports, UI jobs. Ignored by
+  default and never published by kit action.
+
+`init` reports — and never repairs — two conflict shapes: a pre-existing
+`.gitignore` pattern that excludes the `.orch/` directory itself (Git cannot
+re-include files under an excluded directory, so the reviewable exceptions
+cannot take effect until the operator adjusts that rule), and a private file
+the repository already tracks (ignore rules do not apply to tracked files).
+The kit never modifies the git index or history to enforce hygiene: no forced
+`git rm --cached`, no history cleanup, no retention daemon. To stop tracking a
+private file, run `git rm --cached -- <path>` yourself after saving anything
+you need; a tracked paper-trail file is legal manual retention and is not
+warned about.
+
 ## Runtime layout in the project
 
 ```
 .orch/
-├── config.toml          # project config (above)
-├── kit-version          # provenance marker
-├── lock                 # PID lock (single storage owner)
-├── durable.sqlite*      # pi-durable storage (WAL; local-only)
-├── status.json          # atomic status payload (status --follow reads this)
-├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (local paper trail; no init ignore rule)
-├── pending-handoff.json # queued handoff note (handoff command)
-└── artifacts/           # gate logs, quarantine patches, exports
+├── config.toml          # project config (reviewable: committable, never auto-staged)
+├── kit-version          # provenance marker (paper trail; ignored by default)
+├── lock                 # PID lock (private; single storage owner)
+├── durable.sqlite*      # pi-durable storage (private; WAL; local-only)
+├── status.json          # atomic status payload (private; status --follow reads this)
+├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (paper trail; ignored by default)
+├── pending-handoff.json # queued handoff note (private; handoff command)
+└── artifacts/           # gate logs, quarantine patches, exports (private)
 
-router.md                # RouterDoc mirror (review/local paper trail; not plan input)
-PROMPT.md, evals/, docs/prd.md
+router.md                # RouterDoc mirror (paper trail; not plan input; ignored by default)
+PROMPT.md, evals/, docs/prd.md   # reviewable project bytes
 ```
 
 > Note on `.orch/wave-log.jsonl`: it mirrors durable storage and is rewritten
-> after state commits. The current init template does not ignore it; operators
-> choose whether to retain or commit that local paper trail. Neither this file
-> nor `router.md` is guaranteed committed evidence, and mirror content alone
-> does not certify rollback, delivery, or another external effect.
+> after state commits. It is an optional local paper-trail file: the init
+> hygiene block ignores it by default, and operators choose whether to retain
+> or commit it (explicitly, with `git add -f`). Neither this file nor
+> `router.md` is guaranteed committed evidence, and mirror content alone does
+> not certify rollback, delivery, or another external effect.

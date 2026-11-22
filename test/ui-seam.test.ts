@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openProjectHarness, projectPaths, type StatusPayloads } from "../src/engine/harness.ts";
 import { readSessionState, commitState, flushStatusSnapshot } from "../src/engine/state.ts";
-import { runWaves, pickNextTask } from "../src/engine/waves.ts";
+import { runWaves, pickNextTask, approveGrant } from "../src/engine/waves.ts";
 import { runPlan, loadPrd, PlanParseError } from "../src/engine/planner.ts";
 import { readout, conversationEntries, CONV_ENTRY_SCAN_CAP } from "../src/engine/inspector.ts";
 import type { WaveRow } from "../src/engine/infos.ts";
@@ -70,7 +70,7 @@ const implWrites = (writes: { path: string; content: string }[], closing = "STAT
 	writes.map((w) => fauxAssistantMessage([fauxToolCall("write", w)], { stopReason: "toolUse" })).concat([fauxAssistantMessage(closing, { stopReason: "stop" })]);
 
 const verifyApprove = (notes = "diff satisfies the criterion") =>
-	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes }), { stopReason: "stop" });
+	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes }), { stopReason: "stop" });
 const verifySkepticApprove = () => verifyApprove("adversarial pass: no refutation found");
 
 const LIST_TS = `export function parseList(input: string): string[] {
@@ -95,7 +95,7 @@ describe("wave-start flush (A.1)", () => {
 		], models.faux);
 		await accomplish(kit);
 
-		const runPromise = runWaves(kit, { approve: true, tasksFilter: [] }).catch((err) => ({ threw: err }));
+		const runPromise = runWaves(kit, { tasksFilter: [] }).catch((err) => ({ threw: err }));
 		const payload = await waitForStatus(project.root, (p) => p.phase === "wave-running");
 		expect(payload.task).toMatchObject({ id: "t1", wave: 1, status: "running" });
 		expect(typeof payload.task?.startedAt).toBe("number");
@@ -142,7 +142,7 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 		await accomplish(kit);
 		await writeGateFile(project.root);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const rows = await waveLogRows(project.root);
@@ -196,11 +196,15 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 		]);
 		await writeGateFile(project.root);
 		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models });
-		await runPlan(kit, "docs/prd.md", await loadPrd(kit));
-		await commitState(kit, { runStatus: (d) => { d.humanApprovedAt = Date.now(); } });
+		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+		await approveGrant(kit, { planRevision: planOutcome.planRevision });
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		// M0-P05: a quarantined granted task stops the selection — policy stop,
+		// never a drained-queue success.
+		expect(summary.exit).toBe("blocked");
 		expect(summary.complete).toBe(false);
+		expect(summary.quarantined).toEqual(["t1"]);
 		const rows = await waveLogRows(project.root);
 		const w1 = rows.filter((r) => r.task === "t1" && r.wave === 1).map((r) => r.verb);
 		expect(w1[0]).toBe("start");
@@ -211,7 +215,7 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 		expect(state.router.tasks[0]!.status).toBe("quarantined");
 		const payload = await statusJson(project.root);
 		expect(payload?.phase).toBe("idle");
-		// the drained queue carries the stop-short message (pre-existing vocabulary)
+		// the stop carries the quarantined id in the side-car message
 		expect(payload?.message).toContain("1 task(s) quarantined: t1");
 		await kit.loop.close();
 		kit.lock.release();
@@ -236,7 +240,7 @@ describe("resumability keeps working with the seam (pickNextTask on in_progress)
 		});
 		expect(pickNextTask((await readSessionState(kit.loop.harness)).router.tasks)?.id).toBe("t1");
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 		const state = await readSessionState(kit.loop.harness);
 		expect(state.router.tasks[0]!.status).toBe("done");
@@ -289,7 +293,7 @@ describe("status.json governor extras (A.1)", () => {
 		], models.faux);
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.exit).toBe("sleeping");
 
 		const payload = await statusJson(project.root);
@@ -398,7 +402,7 @@ describe("conversation transcript excerpts (A.5)", () => {
 			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const read = await readout(kit.loop.paths, { loop: kit });
@@ -557,7 +561,7 @@ describe("delivery truth (A.6): readout surfaces the mode + outcome rows, read-o
 			verifySkepticApprove(),
 		], models.faux);
 		await accomplish(kit);
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const read = await readout(kit.loop.paths, { loop: kit });
@@ -640,7 +644,7 @@ describe("per-wave isolated diffs (A.7): wave rows carry treeSha; trees diff tre
 		await accomplish(kit);
 		await writeGateFile(project.root);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 		const rows = await waveLogRows(project.root);
 		const treeSha = /^[0-9a-f]{40}$/;

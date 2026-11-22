@@ -35,7 +35,7 @@ describe("beforeTool role boundaries (harness-enforced)", () => {
 		], models.faux);
 		await accomplish(kit);
 		await writeGateFile(project.root); // the BLOCKED wave leaves a scope violation → gate fail → quarantine
-		await runWaves(kit, { approve: true, tasksFilter: [] });
+		await runWaves(kit, { tasksFilter: [] });
 		await kit.loop.close();
 		kit.lock.release();
 		const fsx = await import("node:fs/promises");
@@ -54,8 +54,10 @@ describe("breakers (§4.5)", () => {
 
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
-		expect(summary.exit).toBe("complete");
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		// M0-P05: the quarantine stops the selection — policy stop, not a success.
+		expect(summary.exit).toBe("blocked");
+		expect(summary.quarantined).toEqual(["t1"]);
 		const state = await readSessionState(kit.loop.harness);
 		const t1 = state.router.tasks[0]!;
 		expect(t1.status).toBe("quarantined");
@@ -80,8 +82,9 @@ describe("breakers (§4.5)", () => {
 		// gate recipe guaranteed to fail while BROKEN exists
 		await writeGateFile(project.root);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
-		expect(summary.exit).toBe("complete");
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		expect(summary.exit).toBe("blocked");
+		expect(summary.quarantined).toEqual(["t1"]);
 		const state = await readSessionState(kit.loop.harness);
 		const t1 = state.router.tasks.find((t) => t.id === "t1")!;
 		expect(t1.status).toBe("quarantined");
@@ -96,59 +99,60 @@ describe("breakers (§4.5)", () => {
 			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "x", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
 		], models.faux);
 		await accomplish(kit);
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.exit).toBe("budget");
 	});
 });
 
-describe("terminal-stop semantics (drained queue with quarantined ≠ plain success)", () => {
+describe("terminal-stop semantics (M0-P05: a quarantined member is a policy stop, never 0/complete)", () => {
 	const eventsOf = (events: ProgressEvent[], kind: ProgressEvent["kind"]) => events.filter((e) => e.kind === kind);
 	const statusJson = async (root: string) => (await readJson(join(root, ".orch", "status.json"))) as unknown as StatusPayloads;
 	// implementer writes a real file then COMPLETES; verifier approves
 	const donePlaylist = (path: string, content: string) => [
 		fauxAssistantMessage([fauxToolCall("write", { path, content })], { stopReason: "toolUse" }),
 		fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
-		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "diff satisfies the criterion" }), { stopReason: "stop" }),
-		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
+		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "diff satisfies the criterion" }), { stopReason: "stop" }),
+		fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
 	];
 
-	it("all tasks quarantined → run stops short: complete=false, ids surfaced, no router phase 'complete', wave-log row names them", async () => {
+	it("first quarantine stops the selection: exit 'blocked' with the id, later tasks never start, phase stays open", async () => {
 		const { project, kit, models } = await bakeProject({ buildFauxModels });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [
 				{ id: "t1", title: "x", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 2 },
 				{ id: "t2", title: "y", spec: "DO-NOTHING", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 },
 			] }), { stopReason: "stop" }),
-			// both implementers produce zero file changes → immediate quarantine
-			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
+			// the first implementer produces zero file changes → immediate quarantine
 			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
 		], models.faux);
 		await accomplish(kit);
 
 		const events: ProgressEvent[] = [];
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] }, (e) => events.push(e));
-		// Exit vocabulary is unchanged by design (the quarantine-free drain keeps
-		// exit "complete"); the stop-short truth rides complete=false + the ids.
-		expect(summary.exit).toBe("complete");
+		const summary = await runWaves(kit, { tasksFilter: [] }, (e) => events.push(e));
+		// §3 transition 5: stop the selection on its FIRST quarantine — policy
+		// stop (CLI exit 2) with ids, never 0/complete.
+		expect(summary.exit).toBe("blocked");
 		expect(summary.complete).toBe(false);
-		expect([...summary.quarantined].sort()).toEqual(["t1", "t2"]);
-		// the terminal event names the quarantined ids (not a plain success)
+		expect(summary.quarantined).toEqual(["t1"]);
+		expect(summary.blockedIds).toEqual(["t1"]);
+		// the terminal event names the quarantined id (not a plain success)
 		const stops = eventsOf(events, "quarantine-stop");
 		expect(stops).toHaveLength(1);
-		expect(stops[0]).toMatchObject({ quarantined: expect.arrayContaining(["t1", "t2"]) });
+		expect(stops[0]).toMatchObject({ quarantined: ["t1"] });
 		expect(eventsOf(events, "complete")).toHaveLength(0);
-		// router phase does NOT advance to "complete" (mirrors arrived-blocked)
+		expect(eventsOf(events, "selection-complete")).toHaveLength(0);
+		// t2 was never started: the selection stopped at the first quarantine
 		const state = await readSessionState(kit.loop.harness);
-		expect(state.router.phase).toBe("running");
-		expect(state.router.tasks.map((t) => t.status)).toEqual(["quarantined", "quarantined"]);
-		// the final wave-log row names the ids in the existing row style
+		expect(state.router.phase).toBe("running"); // not "complete"
+		expect(state.router.tasks.map((t) => t.status)).toEqual(["quarantined", "todo"]);
+		// the stop row names the ids (stopped, never "complete")
 		const lastRow = state.rows[state.rows.length - 1]!;
-		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "complete" });
-		expect(lastRow.detail).toContain("queue empty; quarantined: t1, t2");
+		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "stopped" });
+		expect(lastRow.detail).toContain("quarantined: t1");
 		// status.json surfaces the truth via statusPhase
 		const payload = await statusJson(project.root);
 		expect(payload.phase).toBe("idle");
-		expect(payload.message).toContain("2 task(s) quarantined: t1, t2");
+		expect(payload.message).toContain("1 task(s) quarantined: t1");
 		// CLI-withheld exit code contract: not "sleeping" (which maps to 42)
 		expect(summary.exit).not.toBe("sleeping");
 		await kit.loop.close();
@@ -168,23 +172,26 @@ describe("terminal-stop semantics (drained queue with quarantined ≠ plain succ
 		], models.faux);
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
-		expect(summary.exit).toBe("complete");
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		expect(summary.exit).toBe("blocked");
 		expect(summary.complete).toBe(false);
 		expect(summary.quarantined).toEqual(["t2"]);
+		expect(summary.blockedIds).toEqual(["t2"]);
+		expect(summary.remainingPlanIds).toEqual(["t2"]);
 		const state = await readSessionState(kit.loop.harness);
 		expect(state.router.phase).toBe("running"); // not "complete"
 		expect(state.router.tasks.find((t) => t.id === "t1")?.status).toBe("done");
 		expect(state.router.tasks.find((t) => t.id === "t2")?.status).toBe("quarantined");
 		const lastRow = state.rows[state.rows.length - 1]!;
-		expect(lastRow.detail).toContain("queue empty; quarantined: t2");
+		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "stopped" });
+		expect(lastRow.detail).toContain("quarantined: t2");
 		const payload = await statusJson(project.root);
 		expect(payload.message).toContain("1 task(s) quarantined: t2");
 		await kit.loop.close();
 		kit.lock.release();
 	});
 
-	it("todo blocked by a quarantined dependency → still arrived-blocked (unchanged)", async () => {
+	it("quarantined dependency blocks its dependents: the run stops, and a reopen still refuses with ids (never a silent success)", async () => {
 		const { project, kit, models } = await bakeProject({ buildFauxModels });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [
@@ -193,21 +200,32 @@ describe("terminal-stop semantics (drained queue with quarantined ≠ plain succ
 			] }), { stopReason: "stop" }),
 			fauxAssistantMessage("STATUS: COMPLETE (no changes)", { stopReason: "stop" }),
 		], models.faux);
-		await accomplish(kit);
+		const revision = await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
-		expect(summary.exit).toBe("arrived-blocked");
-		expect(summary.complete).toBe(false);
-		expect(summary.quarantined).toEqual([]); // arrived-blocked path untouched by the fix
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		expect(summary.exit).toBe("blocked");
+		expect(summary.quarantined).toEqual(["t1"]);
 		const state = await readSessionState(kit.loop.harness);
 		expect(state.router.phase).toBe("running");
 		expect(state.router.tasks.find((t) => t.id === "t2")?.status).toBe("todo");
-		void project;
 		await kit.loop.close();
 		kit.lock.release();
+		void project;
+
+		// Reopen: the grant survives; the quarantined dependency still blocks —
+		// the resumed run stops with the same ids and no additional work.
+		const reopened = buildFauxModels([]);
+		const kit2 = await openProjectHarness(project.root, "run", { modelsOverride: reopened.models });
+		const summary2 = await runWaves(kit2, { tasksFilter: [] });
+		expect(summary2.exit).toBe("blocked");
+		expect(summary2.quarantined).toEqual(["t1"]);
+		expect(summary2.blockedIds).toEqual(["t1", "t2"]);
+		expect(summary2.grant.planRevision).toBe(revision);
+		await kit2.loop.close();
+		kit2.lock.release();
 	});
 
-	it("all tasks done and none quarantined → still the plain complete", async () => {
+	it("all tasks done and none quarantined → the whole-plan complete, recorded once", async () => {
 		const { project, kit, models } = await bakeProject({ buildFauxModels });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify({ tasks: [
@@ -218,8 +236,8 @@ describe("terminal-stop semantics (drained queue with quarantined ≠ plain succ
 		await accomplish(kit);
 
 		const events: ProgressEvent[] = [];
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] }, (e) => events.push(e));
-		expect(summary.exit).toBe("complete");
+		const summary = await runWaves(kit, { tasksFilter: [] }, (e) => events.push(e));
+		expect(summary.exit).toBe("plan-complete");
 		expect(summary.complete).toBe(true);
 		expect(summary.quarantined).toEqual([]);
 		expect(eventsOf(events, "complete")).toHaveLength(1);
@@ -227,7 +245,7 @@ describe("terminal-stop semantics (drained queue with quarantined ≠ plain succ
 		const state = await readSessionState(kit.loop.harness);
 		expect(state.router.phase).toBe("complete");
 		const lastRow = state.rows[state.rows.length - 1]!;
-		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "complete", detail: "queue empty" });
+		expect(lastRow).toMatchObject({ kind: "wave", task: "session", verb: "complete", detail: "whole plan fulfilled: every task done" });
 		void project;
 		await kit.loop.close();
 		kit.lock.release();
@@ -243,7 +261,7 @@ describe("rate-limit durable sleep (exit 42 path)", () => {
 			fauxAssistantMessage("provider overloaded", { stopReason: "error", errorMessage: "429 rate_limit resets in 90m" }),
 		], models.faux);
 		await accomplish(kit);
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		if (summary.exit !== "sleeping") {
 			const stateDump = await readSessionState(kit.loop.harness);
 			console.error("rows:", stateDump.rows.map((r) => `${r.kind}:${r.task} ${r.verb} ${r.detail ?? ""}`));
@@ -266,6 +284,8 @@ describe("verifier verdict parsing", () => {
 		expect(parseVerdictStrict("```json\n{\"verdict\":\"reject\",\"criteria\":[],\"notes\":\"wrong file\"}\n```")).toMatchObject({ verdict: "reject" });
 		expect(parseVerdictStrict("nothing useful here")).toMatchObject({ verdict: "needs_human" });
 		expect(parseVerdictStrict('{"verdict":"AGREE"}')).toMatchObject({ verdict: "needs_human" });
+		// M0-P11: prose around the JSON object is rejected (never extracted).
+		expect(parseVerdictStrict(`Sure: ${'{"verdict":"approve","criteria":[],"notes":"x"}'}`).verdict).toBe("needs_human");
 	});
 
 	it("runVerify produces a wave-log verdict row on needs_human fallback", async () => {

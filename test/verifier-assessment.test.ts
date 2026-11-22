@@ -66,7 +66,10 @@ const verdict = (value: "approve" | "reject" | "needs_human", notes = value, cri
 	fauxAssistantMessage(JSON.stringify({
 		verdict: value,
 		criteria: Array.from({ length: criteriaCount }, (_, index) => ({
-			id: `${index + 1}`, status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable",
+			id: `${index + 1}`,
+			status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable",
+			// M0-P11: approving passes cite valid evidence (a fixture file line on the checked tree)
+			...(value === "approve" ? { evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] } : {}),
 		})),
 		notes,
 	}), { stopReason: "stop" });
@@ -223,7 +226,7 @@ describe("verifier integration remains authoritative", () => {
 		], models.faux);
 		await accomplish(kit);
 		const client = semanticClient("rejection");
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(true);
 		expect(client.requests).toHaveLength(1);
 		const state = await readSessionState(kit.loop.harness);

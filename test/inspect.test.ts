@@ -111,13 +111,13 @@ describe("inspector: readout seam", () => {
 		faux.setResponses([
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			...implWrites([{ path: "src/one.ts", content: "export const one = 1;\n" }]),
-			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "" }), { stopReason: "stop" }),
-			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "" }), { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] }], notes: "adversarial pass: no refutation found" }), { stopReason: "stop" }),
 		]);
 
 		const kit = await openProjectHarness(project.root, "run", { modelsOverride: models });
-		await runPlan(kit, "docs/prd.md", await loadPrd(kit));
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+		const summary = await runWaves(kit, { approve: { planRevision: planOutcome.planRevision }, tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 
 		const read = await readout(kit.loop.paths, { loop: kit });

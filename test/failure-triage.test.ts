@@ -83,7 +83,11 @@ const implWrite = (content: string) => [
 ];
 const verdict = (value: "approve" | "reject" | "needs_human", notes: string) => fauxAssistantMessage(JSON.stringify({
 	verdict: value,
-	criteria: [{ id: "1", status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable" }],
+	criteria: [{
+		id: "1",
+		status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable",
+		...(value === "approve" ? { evidence: [{ kind: "line", path: "src/index.ts", line: 1 }] } : {}),
+	}],
 	notes,
 }), { stopReason: "stop" });
 const planResponse = () => fauxAssistantMessage(JSON.stringify({ tasks: [{
@@ -216,7 +220,7 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await writeGateFile(project.root);
 		const client = new FakeJudgmentClient();
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(false);
 		expect(summary.quarantined).toEqual([TASK.id]);
 		expect(client.requests).toHaveLength(0);
@@ -239,7 +243,7 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await writeGateFile(project.root);
 		const client = semanticClient("human");
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(true);
 		expect(client.requests).toHaveLength(1);
 		const state = await readSessionState(kit.loop.harness);
@@ -268,7 +272,7 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await writeGateFile(project.root);
 		const client = new FakeJudgmentClient(async () => { throw new Error("offline"); });
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(false);
 		expect(summary.quarantined).toEqual([TASK.id]);
 		expect(client.requests).toHaveLength(2);
@@ -294,7 +298,7 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await accomplish(kit);
 		const client = semanticClient("human");
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(true);
 		expect(client.requests).toHaveLength(1);
 		const task = (await readSessionState(kit.loop.harness)).router.tasks[0]!;
@@ -318,7 +322,7 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await accomplish(kit);
 		const client = semanticClient("implementation");
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [], judgmentClient: client });
+		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
 		expect(summary.complete).toBe(false);
 		expect(summary.quarantined).toEqual([TASK.id]);
 		expect(client.requests).toHaveLength(1);

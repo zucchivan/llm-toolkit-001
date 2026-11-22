@@ -17,10 +17,14 @@ const TASK: VerifyTask = {
 	targetPaths: ["src/"],
 };
 
-const verdict = (value: "approve" | "reject" | "needs_human", notes: string) =>
+const verdict = (value: "approve" | "reject" | "needs_human", notes: string, evidencePath = "src/index.ts") =>
 	fauxAssistantMessage(JSON.stringify({
 		verdict: value,
-		criteria: [{ id: "1", status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable" }],
+		criteria: [{
+			id: "1",
+			status: value === "approve" ? "pass" : value === "reject" ? "fail" : "unverifiable",
+			...(value === "approve" ? { evidence: [{ kind: "line", path: evidencePath, line: 1 }] } : {}),
+		}],
 		notes,
 	}), { stopReason: "stop" });
 
@@ -114,15 +118,15 @@ describe("default-on adversarial verifier", () => {
 				priority: 1,
 			}] }), { stopReason: "stop" }),
 			...implWrite("export const one = 0;\n"),
-			verdict("approve", "primary missed the defect"),
+			verdict("approve", "primary missed the defect", "src/one.ts"),
 			verdict("reject", "export one, not zero"),
 			...implWrite("export const one = 1;\n"),
-			verdict("approve", "fixed"),
-			verdict("approve", "no remaining refutation"),
+			verdict("approve", "fixed", "src/one.ts"),
+			verdict("approve", "no remaining refutation", "src/one.ts"),
 		], models.faux);
 		await accomplish(kit);
 
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
 		expect(models.faux.getPendingResponseCount()).toBe(0);
 		const state = await readSessionState(kit.loop.harness);
@@ -173,6 +177,74 @@ describe("default-on adversarial verifier", () => {
 		const rows = state.rows.filter((row) => row.kind === "verdict");
 		expect(rows.map((row) => row.verb)).toEqual(["verify:approve", "verify:skeptic:needs_human"]);
 		expect(rows[1]?.verdict).toBe("needs_human");
+
+		await kit.loop.close();
+		kit.lock.release();
+	});
+});
+
+describe("symmetric criterion evidence (M0-P11)", () => {
+	it("an approving primary without criterion evidence is refused and the skeptic is never dispatched", async () => {
+		const { kit, models } = await bakeProject({ buildFauxModels });
+		models.faux.setResponses([
+			// approve with a complete ID set but NO evidence references
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "looks done" }), { stopReason: "stop" }),
+			verdict("approve", "skeptic never runs after an invalid primary"),
+		]);
+
+		const result = await runVerify(kit, TASK, "scope: pass");
+		expect(result.verdict).toBe("needs_human");
+		expect(result.notes).toContain("approval refused:");
+		expect(result.notes).toContain("criterion 1");
+		expect(models.faux.state.callCount).toBe(1); // no skeptic after an invalid primary
+		const state = await readSessionState(kit.loop.harness);
+		const rows = state.rows.filter((row) => row.kind === "verdict");
+		expect(rows.map((row) => row.verb)).toEqual(["verify:needs_human"]);
+		expect(rows[0]?.verdict).toBe("needs_human");
+
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("skepticSecondPass = false still enforces primary completeness", async () => {
+		const { kit, models } = await bakeProject({
+			buildFauxModels,
+			configToml: demoConfigToml().replace(
+				"enforceTargetPaths = true",
+				"enforceTargetPaths = true\nskepticSecondPass = false",
+			),
+		});
+		expect(kit.loop.config.gates.skepticSecondPass).toBe(false);
+		models.faux.setResponses([
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "single pass" }), { stopReason: "stop" }),
+		]);
+
+		const result = await runVerify(kit, TASK, "scope: pass");
+		expect(result.verdict).toBe("needs_human");
+		expect(result.notes).toContain("approval refused:");
+		expect(models.faux.state.callCount).toBe(1);
+
+		await kit.loop.close();
+		kit.lock.release();
+	});
+
+	it("each pass is committed before the next pass is dispatched: the primary receipt survives a skeptic failure", async () => {
+		const { kit, models } = await bakeProject({ buildFauxModels });
+		models.faux.setResponses([
+			verdict("approve", "primary approval"),
+			// the skeptic submission dies with a provider error
+			fauxAssistantMessage("provider overloaded", { stopReason: "error", errorMessage: "429 rate_limit resets in 90m" }),
+		]);
+
+		const result = await runVerify(kit, TASK, "scope: pass");
+		expect(result.verdict).toBe("needs_human");
+		const state = await readSessionState(kit.loop.harness);
+		const rows = state.rows.filter((row) => row.kind === "verdict");
+		// The primary pass (approve) was durably committed BEFORE the skeptic was
+		// dispatched — its row survives the skeptic's provider failure.
+		expect(rows.map((row) => row.verb)).toEqual(["verify:approve", "verify:skeptic:needs_human"]);
+		// the one-off diagnostic path records no wave-keyed pass receipts
+		expect(rows.every((row) => row.receipt === undefined)).toBe(true);
 
 		await kit.loop.close();
 		kit.lock.release();

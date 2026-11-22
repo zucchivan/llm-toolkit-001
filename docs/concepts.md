@@ -9,7 +9,7 @@ durable harness.
 | --- | --- | --- | --- | --- |
 | planner | ONE per plan (`kit-plan-v1` request id) | `[read]` only | `roles.planner` | PRD → RouterDoc tasks (id/spec/dependsOn/acceptance/targetPaths) |
 | implementer | ONE per task (`task-<id>`, resumed across waves) | read, write, edit, bash | `roles.implementer` | one wave = one task; PROMPT.md discipline attached |
-| verifier | fresh per pass; adversarial pass follows primary approval by default | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human` |
+| verifier | fresh per pass; adversarial pass follows a conclusive, evidence-backed primary approval by default | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human`; approval requires per-criterion evidence on the checked tree (M0-P11) |
 
 The implementer's final `STATUS: COMPLETE` / `STATUS: BLOCKED` line is only a
 nonbinding report to the driver/operator. It is not criterion evidence and does
@@ -48,38 +48,95 @@ safe to run.
   `evals/recipes.auto.toml`; human `evals/recipes.toml` always wins on duplicate
   names. Missing implementations/unresolved commands become approved planning
   remediations, not generated tests. `gates probe` is a separate execution
-  consent step and reports pre-existing failures. Remembered evidence
+  consent step and reports pre-existing failures; it runs the same no-shell
+  runner as wave gates with the same `[gates] timeoutSec` deadline, so wave
+  and probe observe identical literal argv tokens and match results. Invalid
+  recipes (both command forms, shell syntax in `cmd`, invalid `match` regex,
+  escaping cwd) refuse before any command starts. Remembered evidence
   fingerprints suppress repeated nagging but reopen on meaningful changes.
 - **plan** — one planner conversation parses the PRD plus any explicitly
-  approved gate-gap remediations into tasks; the engine
-  validates the DAG (unknown deps, cycles → plain-words errors), commits
-  RouterDoc (`phase: "planned"`) + `router.md` mirror + wave-log row, and stops.
-  The mirror is not editable plan input: revise the PRD and rerun `plan` to
-  replace the graph; `run --approve` acts on durable RouterDoc state.
-- **wave** — the driver picks the next `todo` task whose `dependsOn` are all
-  `done` (topological; priority then id), captures the git working tree as
-  `baselineTreeSha` (temp-index snapshot in `.orch/`, never touching the user's
-  index), and submits one wave input (`requestId: "<task>-w<N>"`, idempotent).
+  approved gate-gap remediations into tasks; the engine validates the graph
+  strictly (empty plan, unsafe ids after normalization, colliding normalized
+  ids, duplicate/unknown/cyclic deps, and missing or invalid `targetPaths`
+  all reject with plain-words errors BEFORE any state is replaced — `[]` is
+  the explicit "unrestricted admissible paths" marker, so a missing field is
+  an error, not a silent default), then commits RouterDoc
+  (`phase: "planned"`) with a FRESH plan identity + `router.md` mirror +
+  wave-log row, and stops. The identity (`planRevision`) is a review id — a
+  new UUID per plan, even for identical replans — not the storage schema
+  version, and the CLI and the mirror both echo it. A replan archives the
+  replaced plan's identity reference and invalidates prior grants in the
+  same commit, so the second plan lacks the first grant. The mirror is not
+  editable plan input: revise the PRD and rerun `plan` to replace the graph;
+  a grant acts on durable RouterDoc state for the current revision.
+  A stored plan from before identity existed (v1 payload) stays readable but
+  is never executed — the documented upgrade is to replan, review, and
+  approve.
+- **grant** — the human approval of one reviewed plan revision (ADR 01):
+  `{planRevision, selected, humanApprovedAt}` committed atomically with the
+  phase flip to running and the review wave-log row. A new grant requires
+  `run --approve --revision <uuid>` (no hidden default revision) and is
+  refused while `router.md` is missing or differs from the canonical durable
+  render — the approval binds to the reviewed bytes, never to hand-edited
+  mirror text. Omitting `--tasks` grants every task id, stored EXPLICITLY
+  (the full list is not a wildcard); repeated `--tasks <id>` grants exactly
+  that subset, whose dependencies must be done or inside the selection —
+  they are never auto-included. A bare `run` resumes the stored grant
+  exactly (mirror edits are never imported); an explicitly supplied set
+  without `--approve` must equal the grant. Only a changed grant (a new
+  approval) admits different work.
+- **base** — the reviewed starting point of a plan: the git HEAD commit (and
+  its branch) captured at planning. Uncommitted operator edits (staged,
+  unstaged, untracked) are EXCLUDED from that base — they are operator
+  working files, never plan input, and before the first commit the base is
+  recorded as absent rather than guessed.
+- **wave** — the driver picks the next GRANTED `todo` task whose `dependsOn`
+  are all `done` (dependency lookup sees every plan task; candidates come
+  only from the grant; topological, priority then id), captures the git
+  working tree as `baselineTreeSha` (temp-index snapshot in `.orch/`, never
+  touching the user's index), and submits one wave input
+  (`requestId: "<task>-w<N>"`, idempotent). The driver re-reads latest
+  durable state before each selection and after completion. A satisfied
+  subset reports selection-complete while the plan keeps its remaining work;
+  only whole-plan fulfillment flips the router phase to complete (recorded
+  once). A quarantined granted task stops the selection immediately as a
+  policy stop (CLI exit 2 with ids), never a drained-queue success.
 - **gate** — deterministic checks run as plain code phases (simpler diagnostics
   than an `afterRun` hook; both are viable, see api-map): scope check first
   (diff-vs-baseline file set minus engine-owned paths), then effective recipes
   from `evals/recipes.auto.toml` + human-overriding `evals/recipes.toml`
-  (argv-simple commands, timeout, optional stdout `match` regexes, `on` path
-  fast-skip, project-relative workspace `cwd`). Failures become compact feedback text and a
+  (one command form per recipe — legacy whitespace-split `cmd` with shell
+  syntax refused, or literal `argv` tokens; ALL stdout `match` regexes must
+  match, empty list vacuously true; `on` path fast-skip; project-relative
+  real-path-contained workspace `cwd`). stdout past the 256 KiB capture cap
+  with `match` present fails `output_capped` instead of matching on a tail;
+  match evaluation runs in a bounded worker under the recipe's remaining
+  deadline. Failures become compact feedback text and a
   `lastGateHash` for the breaker. These checks run directly on the host working
   tree and provide no sandbox or containment boundary.
 - **verify** — a fresh read-only verifier conversation is fed spec + criteria +
-  per-file diff summary vs the task baseline + gate results. When that primary
-  pass approves, a SECOND fresh read-only conversation uses the same
-  `roles.verifier` model but a dedicated adversarial brief: refute approval by
-  checking every criterion, regressions, edge cases, missing tests, target-path
-  scope, and security/data-loss risks. This skeptic pass is DEFAULT ON when
-  `[gates] skepticSecondPass` is omitted; explicit `false` opts out. Both passes
-  must approve. Adversarial rejection becomes verifier feedback for the normal
-  wave retry path; malformed, incomplete, unverifiable, or `needs_human`
-  adversarial results fail closed to `needs_human`. Each pass appends a separate
-  wave-log verdict row (`verify:*` / `verify:skeptic:*`) with its own provider,
-  model, tokens, and USD usage. An explicit `[gates] jevVerifierShadow = true`
+  per-file diff summary vs the task baseline + the checked tree, the gate
+  receipt id and the non-skipped gate outcomes. When that primary pass approves
+  with valid criterion evidence, a SECOND fresh read-only conversation uses the
+  same `roles.verifier` model but a dedicated adversarial brief: refute approval
+  by checking every criterion, regressions, edge cases, missing tests,
+  target-path scope, and security/data-loss risks. This skeptic pass is DEFAULT
+  ON when `[gates] skepticSecondPass` is omitted; explicit `false` opts out.
+  Both passes must approve, and approval is enforced SYMMETRICALLY (M0-P11):
+  every reviewed criterion must be marked pass and cite valid evidence against
+  the checked tree — an executed, non-scope, non-skipped passing gate, or a line
+  in a regular text blob of that tree. Missing, malformed, duplicated, or
+  unknown criterion ids, missing proof, malformed JSON, prose around the JSON,
+  or an inconclusive answer refuse the approval as `needs_human`; a well-formed
+  explicit `reject` stays reject. No skeptic runs after an invalid or
+  nonapproving primary. Adversarial rejection becomes verifier feedback for the
+  normal wave retry path. Each pass commits its own verdict row
+  (`verify:*` / `verify:skeptic:*`) with its provider, model, tokens and USD
+  usage — and its `loop.receipts` pass receipt (criteria, effective verdict,
+  checked tree, gate id, policy) — BEFORE the next pass is dispatched. The
+  one-off `verify --task` diagnostic owns its operation key: it records no
+  wave-keyed pass receipts, and with no gate receipts a gate reference can
+  never be evidence there. An explicit `[gates] jevVerifierShadow = true`
   adds a separate, non-authoritative Jev System One assessment after those
   verdict rows commit. Three batched Noul questions per criterion cover evidence
   sufficiency, satisfaction, and concrete violation over filtered, bounded
@@ -186,3 +243,31 @@ side-car, and the local paper trail is `router.md` + `.orch/wave-log.jsonl`
 (+ gate artifacts). Storage stays the durable truth; side-cars are best-effort
 mirrors re-rendered after state commits, not guaranteed committed evidence or
 proof of an external effect such as rollback or delivery.
+
+## Repository hygiene — three ownership classes
+
+ADR 04 assigns every project path one ownership class, independent of
+authorship (see `docs/project-contract.md` for the exact file lists):
+
+- **reviewable** — project code, PRD, `PROMPT.md`, recipes, checklist, and the
+  three kit controls (`.orch/config.toml`, `.orch/gate-decisions.json`,
+  `.orch/gate-remediations.json`). Committable; never auto-staged by the kit.
+- **optional local paper trail** — `router.md`, `.orch/wave-log.jsonl`,
+  `.orch/kit-version`. Ignored by default: `init` writes one bounded
+  `.gitignore` block (`/.orch/*` with the three reviewable negations and
+  `/router.md`), so `git add -A` never sweeps the trail or private state into
+  a commit. After review the human may explicitly retain any trail file with
+  `git add -f <path>` — a tracked trail file is legal manual retention, not a
+  hygiene violation.
+- **private** — all other `.orch/**` runtime state (SQLite/WAL/SHM, lock,
+  notes, projections, workspaces, assessments, telemetry, exports, UI jobs).
+  Ignored by default; never published by kit action.
+
+Hygiene conflicts are reported, never repaired: a pre-existing `.gitignore`
+pattern that excludes the `.orch/` directory itself defeats the reviewable
+exceptions (Git cannot re-include files under an excluded directory), and a
+private file that is ALREADY TRACKED stays tracked because ignore rules do not
+apply to tracked files. The kit never modifies the git index or history — no
+forced `git rm --cached`, no history cleanup. Remediation is manual: adjust
+the parent-excluding pattern, or run `git rm --cached -- <path>` yourself after
+saving anything you need.

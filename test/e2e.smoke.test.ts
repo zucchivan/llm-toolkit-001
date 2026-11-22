@@ -2,47 +2,52 @@
  * e2e.smoke (§7): fixture PRD (examples/demo-prd) → REAL plan → run --approve
  * with scripted faux outputs, verifying RouterDoc transitions, router.md sync,
  * .orch/status.json updates, and .orch/wave-log.jsonl rows. Task 2 fails its
- * gate on wave 1, undergoes conversation.reset(), and passes on wave 2.
+ * gate on wave 1 (the fixture's BEHAVIORAL gate-query rejects the scripted
+ * case-sensitive queryList), undergoes conversation.reset(), and passes on
+ * wave 2 — the completed program then satisfies the §0 invocation.
  */
 import { describe, expect, it, beforeEach } from "vitest";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { initProject } from "../src/init.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
-import { readSessionState, commitState } from "../src/engine/state.ts";
+import { readSessionState } from "../src/engine/state.ts";
 import { loadPrd, runPlan, parsePlannerJson, normalizeTasks, parseVerdictStrict, ensureAcyclic } from "../src/engine/planner.ts";
 import { runWaves } from "../src/engine/waves.ts";
+import { ReceiptsDoc } from "../src/engine/receipts.ts";
+import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
-import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
+import { prepareDemoProject, writeConfig, demoConfigToml, gitInit, installDemoGates } from "./demo-project.ts";
 import { readJson, atomicWriteJson } from "../src/util/fsx.ts";
+import { exec } from "../src/util/exec.ts";
 
+// The product sources the wave driver's gates actually execute — the parser
+// strips ONE leading dash per token (kept, not dropped) and renderList joins.
 const LIST_TS = `export function parseList(input: string): string[] {
-	return input.split("/").flatMap((part) => part.split(",")).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith("-"));
+	return input.split("/").flatMap((part) => part.split(",")).map((s) => s.trim()).filter((s) => s.length > 0).map((s) => s.startsWith("-") ? s.slice(1) : s);
 }
 export function renderList(items: string[]): string {
 	return items.join(" ");
 }
 `;
-const QUERY_TS = `type $Unused = never;
-export function queryList(items: string[], q: string): string[] {
+// Task 2 wave 1 ships a CASE-SENSITIVE filter: gate-query rejects it on
+// behavior; wave 2 repairs it (the retry is proven by behavior, not by a
+// grep-able token). The executed gate imports the module — the scripted
+// sources must be valid TypeScript for node's type-stripping (same bytes as
+// the shipped replay).
+const WRONG_QUERY_TS = `export function queryList(items: string[], q: string): string[] {
+	return items.filter((item) => item.includes(q));
+}
+`;
+const QUERY_TS = `export function queryList(items: string[], q: string): string[] {
 	const needle = q.toLowerCase();
 	return items.filter((item) => item.toLowerCase().includes(needle));
 }
-void $.typeof;
 `;
 
 const BIN_JS = `#!/usr/bin/env node
 import { parseList, renderList } from "../src/list.ts";
 console.log(renderList(parseList(process.argv[2] ?? "")));
-`;
-
-const GATE_JS = `// gate script: fail while any src file contains the BROKEN token
-const fs = require("node:fs");
-const files = fs.readdirSync("src", { withFileTypes: true }).flatMap((e) => e.isFile() && e.name.endsWith(".ts") ? [fs.readFileSync("src/" + e.name, "utf8")] : []);
-if (files.some((text) => text.includes("BROKEN"))) {
-	console.error("src contains the BROKEN token");
-	process.exit(1);
-}
 `;
 
 const PLANNER_TASKS = {
@@ -54,49 +59,49 @@ const PLANNER_TASKS = {
 };
 
 const implWrites = (writes: { path: string; content: string }[], closing = "STATUS: COMPLETE") => writes.map((w) => fauxAssistantMessage([fauxToolCall("write", w)], { stopReason: "toolUse" })).concat([fauxAssistantMessage(closing, { stopReason: "stop" })]);
-const verifyApprove = (notes = "diff satisfies the criterion") =>
-	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes }), { stopReason: "stop" });
-const verifySkepticApprove = () => verifyApprove("adversarial pass: no refutation found");
+// M0-P11: approvals cite EXECUTED, non-skipped, non-scope passing demo gates
+// against the checked tree (gate-list runs every wave; gate-query on src/query.ts
+// or bin/; gate-cli on bin/). Scope alone is never criterion evidence.
+const gateApprove = (gateId: string, notes = "diff satisfies the criterion") =>
+	fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "gate", id: gateId }] }], notes }), { stopReason: "stop" });
+const verifyApprove = (gateId = "gate-list", notes = "diff satisfies the criterion") => gateApprove(gateId, notes);
+const verifySkepticApprove = (gateId = "gate-list") => gateApprove(gateId, "adversarial pass: no refutation found");
 
 describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 	beforeEach(() => {
 		process.env["NO_COLOR"] = "1";
 	});
 
-	it("plan → 3 tasks (2 with a failing first wave) → complete, with mirrors + status + wave log", async () => {
+	it("plan → 3 tasks (task 2's first wave fails the behavioral gate) → complete, with mirrors + status + wave log", async () => {
 		const project = await prepareDemoProject();
+		// Demo setup: the fixture's ONE recipe file + the reviewed gate bytes →
+		// evals/, committed before planning (initProject skips the existing file).
+		await installDemoGates(project.root);
 		await writeConfig(project.root, demoConfigToml());
 		await gitInit(project.root);
-		await mkdir(join(project.root, "bin"), { recursive: true });
-		await writeFile(join(project.root, "eval-gate.cjs"), GATE_JS, "utf8");
-		await writeFile(
-			join(project.root, "evals", "recipes.toml"),
-			`[no-broken-token]\ncmd = "node eval-gate.cjs"\n`,
-			"utf8",
-		);
 		await initProject(project.root);
 
 		const { models, faux } = buildFauxModels([]);
 		faux.appendResponses([
 			// PLAN
 			fauxAssistantMessage(JSON.stringify(PLANNER_TASKS), { stopReason: "stop" }),
-			// task 1 (list-parse) wave 1
+			// task 1 (list-parse) wave 1: the fixture's gate-list executes the
+			// parser + renderer (gate-query/gate-cli skip via `on` — task 2's and
+			// task 3's files are not touched yet).
 			...implWrites([{ path: "src/list.ts", content: LIST_TS }]),
-			verifyApprove(),
-			verifySkepticApprove(),
-			// task 2 (list-query) wave 1: BROKEN write → gate fails → feedback
-			...implWrites([{ path: "src/list.ts", content: LIST_TS + "\nexport const BROKEN = true;\n" }]),
-			// task 2 wave 2 (after conversation.reset): fixed file + new query module
-			...implWrites([
-				{ path: "src/list.ts", content: LIST_TS },
-				{ path: "src/query.ts", content: `export function queryList(items: string[], q: string): string[] {\n\tconst needle = q.toLowerCase();\n\treturn items.filter((item) => item.toLowerCase().includes(needle));\n}\n` },
-			]),
-			verifyApprove(),
-			verifySkepticApprove(),
+			verifyApprove("gate-list"),
+			verifySkepticApprove("gate-list"),
+			// task 2 (list-query) wave 1: the CASE-SENSITIVE query → gate-query
+			// fails on behavior → feedback (no verifier call on a failed gate).
+			...implWrites([{ path: "src/query.ts", content: WRONG_QUERY_TS }]),
+			// task 2 wave 2 (after conversation.reset): the repaired filter
+			...implWrites([{ path: "src/query.ts", content: QUERY_TS }]),
+			verifyApprove("gate-query", "wave 2 repaired the case-insensitive filter"),
+			verifySkepticApprove("gate-query"),
 			// task 3 (cli-render) wave 1
 			...implWrites([{ path: "bin/render.js", content: BIN_JS }]),
-			verifyApprove(),
-			verifySkepticApprove(),
+			verifyApprove("gate-cli"),
+			verifySkepticApprove("gate-cli"),
 		]);
 
 		// PLAN ---------------------------------------------------------------
@@ -111,14 +116,11 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		expect(routerMd).toContain("list-parse");
 		expect(routerMd).toContain("STATUS: PLANNED");
 
-		// APPROVE + RUN ------------------------------------------------------
+		// APPROVE + RUN (M0-P05: the revision-qualified grant goes through the
+		// driver's actual approval path — no bare-timestamp stamp) --------------
 		const kit = await openProjectHarness(project.root, "run", { modelsOverride: models });
-		await commitState(kit, {
-			runStatus: (d) => {
-				d.humanApprovedAt = Date.now();
-			},
-		});
-		const summary = await runWaves(kit, { approve: true, tasksFilter: [] });
+		const summary = await runWaves(kit, { approve: { planRevision: planOutcome.planRevision }, tasksFilter: [] });
+		expect(summary.exit).toBe("plan-complete");
 		expect(summary.complete).toBe(true);
 
 		// RouterDoc transitions ----------------------------------------------
@@ -149,6 +151,17 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		expect(rows.filter((r) => r["kind"] === "verdict" && r["verb"] === "verify:skeptic:approve").length).toBe(3);
 		expect(rows.filter((r) => r["kind"] === "task" && r["verb"] === "done").length).toBe(3);
 
+		// M0-P11 receipts: 4 gate receipts (list-query's FAILED wave-1 gates are
+		// recorded too) + 6 pass receipts (primary + skeptic), each pass bound to
+		// its wave's gate receipt and checked tree.
+		const receipts = (await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))!;
+		const gateEvents = receipts.events.filter((e) => e.kind === "gate");
+		const passEvents = receipts.events.filter((e) => e.kind === "pass");
+		expect(gateEvents).toHaveLength(4);
+		expect(passEvents).toHaveLength(6);
+		expect(passEvents.every((e) => e.kind === "pass" && e.value.review.verdict === "approve" && e.value.gateId.length > 0 && /^[0-9a-f]{40}$/.test(e.value.tree))).toBe(true);
+		expect(passEvents.every((e) => e.kind === "gate" || gateEvents.some((g) => g.kind === "gate" && g.value.id === e.value.gateId))).toBe(true);
+
 		const status = await readJson<{ tasks: { id: string; status: string }[] }>(join(project.root, ".orch", "status.json"));
 		expect(status?.tasks.filter((t) => t.status === "done").length).toBe(3);
 
@@ -156,7 +169,13 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		expect(await readFile(join(project.root, "src", "list.ts"), "utf8")).toContain("parseList");
 		expect(await readFile(join(project.root, "src", "query.ts"), "utf8")).toContain("queryList");
 		expect(await readFile(join(project.root, "bin", "render.js"), "utf8")).toContain("renderList");
-		expect((await readFile(join(project.root, "src", "list.ts"), "utf8")).includes("BROKEN")).toBe(false);
+		// the wave-1 defect was BEHAVIORAL: the repaired query is case-insensitive
+		expect(await readFile(join(project.root, "src", "query.ts"), "utf8")).toContain("toLowerCase()");
+
+		// §0 outcome test (M0-P08): the completed program, invoked independently.
+		const render = await exec(["node", "bin/render.js", "/a/-b"], { cwd: project.root, timeoutMs: 15_000 });
+		expect(render.code).toBe(0);
+		expect(render.stdout).toBe("a b\n");
 
 		await kit.loop.close();
 		kit.lock.release();
@@ -172,23 +191,24 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		await initProject(project.root);
 
 		const { models, faux } = buildFauxModels([]);
-		// planner | impl write | impl answer | 1 verifier approve
+		// planner | impl write | impl answer | 1 verifier approve (cites the executed
+		// never-fails gate against the checked tree) + skeptic approve
 		faux.setResponses([
 			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "one", spec: "write src/one.ts", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1;\n" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
-			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass" }], notes: "" }), { stopReason: "stop" }),
-			verifySkepticApprove(),
+			gateApprove("never-fails", "executed gate proves the criterion"),
+			verifySkepticApprove("never-fails"),
 		]);
 
 		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models });
 		const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
-		await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
 
 		// Queue the note exactly like the `handoff` CLI does (atomic side-car).
 		await atomicWriteJson(kit.loop.paths.pendingHandoff, { ts: Date.now(), notes: ["keep tree clean"] });
 
-		await runWaves(kit, { approve: true, tasksFilter: [] });
+		await runWaves(kit, { approve: { planRevision: planOutcome.planRevision }, tasksFilter: [] });
 		const dumped = await readSessionState(kit.loop.harness);
 		expect(dumped.rows.some((r) => r.kind === "handoff" && r.verb === "handoff-ingested" && (r.detail ?? "").includes("keep tree clean"))).toBe(true);
 		// The handoff file is removed after ingestion (single process lock respected).
