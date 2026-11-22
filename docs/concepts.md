@@ -11,6 +11,20 @@ durable harness.
 | implementer | ONE per task (`task-<id>`, resumed across waves) | read, write, edit, bash | `roles.implementer` | one wave = one task; PROMPT.md discipline attached |
 | verifier | fresh per pass; adversarial pass follows primary approval by default | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human` |
 
+The implementer's final `STATUS: COMPLETE` / `STATUS: BLOCKED` line is only a
+nonbinding report to the driver/operator. It is not criterion evidence and does
+not itself change the task status.
+
+## Four domain distinctions
+
+- **Task** — a planned unit of work with its reviewed definition and dependencies.
+- **Wave** — one numbered implementation attempt at a task; a retry is another
+  wave, not a new task.
+- **Gate** — a deterministic check run against the current baseline working-tree
+  candidate (immutable candidate trees are proposed later, not current behavior).
+- **Verdict** — a read-only review judgment about specified criteria. A verdict
+  is distinct from both an implementer's status report and a gate result.
+
 Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
 
 - implementer: `write`/`edit` against `.orch/**`, `evals/**`, `router.md`,
@@ -18,6 +32,11 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   the durable `loop.guard` doc) anything outside those paths is BLOCKED.
 - planner/verifier: any non-read tool is BLOCKED (belt & suspenders over the
   `[read]`-only tool selection).
+
+These guards are tool-policy checks, not security containment. Implementer bash
+commands and gate/probe recipes execute project code on the host with the CLI's
+permissions; no shell-free spawn or target-path check makes an untrusted project
+safe to run.
 
 ## Stages
 
@@ -35,6 +54,8 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   approved gate-gap remediations into tasks; the engine
   validates the DAG (unknown deps, cycles → plain-words errors), commits
   RouterDoc (`phase: "planned"`) + `router.md` mirror + wave-log row, and stops.
+  The mirror is not editable plan input: revise the PRD and rerun `plan` to
+  replace the graph; `run --approve` acts on durable RouterDoc state.
 - **wave** — the driver picks the next `todo` task whose `dependsOn` are all
   `done` (topological; priority then id), captures the git working tree as
   `baselineTreeSha` (temp-index snapshot in `.orch/`, never touching the user's
@@ -45,7 +66,8 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   from `evals/recipes.auto.toml` + human-overriding `evals/recipes.toml`
   (argv-simple commands, timeout, optional stdout `match` regexes, `on` path
   fast-skip, project-relative workspace `cwd`). Failures become compact feedback text and a
-  `lastGateHash` for the breaker.
+  `lastGateHash` for the breaker. These checks run directly on the host working
+  tree and provide no sandbox or containment boundary.
 - **verify** — a fresh read-only verifier conversation is fed spec + criteria +
   per-file diff summary vs the task baseline + gate results. When that primary
   pass approves, a SECOND fresh read-only conversation uses the same
@@ -77,19 +99,22 @@ Boundary hook (`kit-boundaries` extension, installed once, enforced everywhere):
   not stored. Uncertain, conflicting, stale, missing-key, malformed, and network
   outcomes remain `unknown` and cannot change feedback, retries, quarantine,
   task/adoption state, delivery, human approvals, or any command execution.
-- **deliver** — off by default (`delivery.mode = "none"`): waves stay in the
-  working tree, isolated by each task's baseline. `commit` mode commits once per
-  approved task; `pr` mode branches, commits, `gh pr create --fill`, and returns
-  to the previous branch (requires `--deliver`).
+- **deliver** — off by default (`delivery.mode = "none"`): approved waves stay
+  in the operator's working tree, with diffs measured from each task's baseline.
+  `commit` mode attempts one commit per approved task on the checked-out branch. `pr` mode
+  optionally branches, commits, pushes, and calls `gh pr create --fill` when the
+  run also has `--deliver`; it never merges the pull request.
 
 ## The governor (budgets + breakers)
 
 All decisions append to `.orch/wave-log.jsonl` with a `reason`.
 
-- **Session ceiling** (`budgets.sessionUsd`): cumulative spend from
+- **Session ceiling** (`budgets.sessionUsd`): cumulative estimated spend from
   `harness.usage()` — provider/catalog `Usage.cost.total` when reported, else
-  `tokens × roles.*.costPerMillion*` rates. On breach the loop ends gracefully
-  (`resumable`; CLI prints the resume hint).
+  `tokens × roles.*.costPerMillion*` rates. On an observed breach the loop ends
+  gracefully (`resumable`; CLI prints the resume hint). This is not a hard bill
+  cap: pricing can be incomplete, and one admitted in-flight request can overrun
+  the ceiling.
 - **Wave warn** (`budgets.waveUsdWarn`): warn row when one wave's estimated
   spend crosses the threshold.
 - **Zero-progress breaker**: a wave that produces no file changes outside
@@ -107,11 +132,13 @@ All decisions append to `.orch/wave-log.jsonl` with a `reason`.
 
 ## Quarantine + rollback
 
-When a task is quarantined, the wave's diff against `baselineTreeSha` is saved
-to `.orch/artifacts/quarantined-<task>-w<N>.patch`, then `git read-tree` +
-`checkout-index` + `git clean -fd -e .orch` restore the working tree exactly to
-the baseline (engine runtime under `.orch/` is preserved). Subsequent
-independent tasks run against a clean tree.
+When a task is quarantined, the engine attempts to save the wave's diff against
+`baselineTreeSha` to `.orch/artifacts/quarantined-<task>-w<N>.patch`, then
+attempts `git read-tree` + `checkout-index` + `git clean -fd -e .orch` to restore
+the working tree toward the baseline while preserving `.orch/`. Capture and
+restore failures are currently best-effort and can be swallowed. Consequently,
+a `quarantined` status, wave-log row, or patch does not prove complete rollback,
+and subsequent tasks must not be described as guaranteed to see a clean tree.
 
 ## Visibility
 
@@ -155,6 +182,7 @@ conversation's `pi.usage` doc — that is where per-task USD joins come from.
 
 pi-durable's SQLite is local-only and single-owner (§ one-process rule), so
 `status --follow` in another process reads the ATOMIC `.orch/status.json`
-side-car, and the git-tracked paper trail is `router.md` + `.orch/wave-log.jsonl`
+side-car, and the local paper trail is `router.md` + `.orch/wave-log.jsonl`
 (+ gate artifacts). Storage stays the durable truth; side-cars are best-effort
-mirrors re-rendered after every state commit.
+mirrors re-rendered after state commits, not guaranteed committed evidence or
+proof of an external effect such as rollback or delivery.

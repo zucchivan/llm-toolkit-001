@@ -3,9 +3,11 @@
 Exact exports of `@earendil-works/pi-durable@1.5.0` /
 `@earendil-works/pi-ai@1.5.0` this kit uses, per engine module. Pinned versions:
 recorded at build time 2026-11-05 (`npm dist-tags latest`; `durable_readme.md`
-in the research bundle describes the same release). Everything pi-durable flows
-through `src/engine/kit.ts` (and `harness.ts`, which does the wiring) — no other
-module imports the packages.
+in the research bundle describes the same release). All pi-durable/pi-ai access
+is intended to flow through `src/engine/kit.ts`. At baseline this seam is not
+yet mechanically closed: `harness.ts`, `infos.ts`, `faux-replay.ts`, and some
+tests still contain direct imports. Treat the list below as the intended wiring
+map, not a shipped import invariant; M0-P02 owns that repair.
 
 ## src/engine/kit.ts — the import seam
 
@@ -76,7 +78,9 @@ module imports the packages.
 - every doc value is a JSON-strict `type` literal (pi-durable `JsonObject`
   constraint); `checkpointWhen: () => true` (tiny docs)
 - mirrors: `router.md` (renderRouterMd) + `.orch/wave-log.jsonl` (JSONL),
-  written atomically AFTER each commit resolves — never inside it
+  written atomically AFTER each commit resolves — never inside it. `router.md`
+  is review output, not editable plan input; durable RouterDoc remains the
+  source used by `run --approve`. These mirrors are not guaranteed commits.
 
 ## src/engine/tasks.ts
 
@@ -103,7 +107,8 @@ module imports the packages.
 
 - recipes `.orch`-adjacent: `evals/recipes.toml` (smol-toml) — argv-simple
   commands via `util/exec.ts` (spawn, no shell, per-recipe timeout, streams
-  captured to `.orch/artifacts/gate-*.log`)
+  captured to `.orch/artifacts/gate-*.log`). No-shell spawning and scope/tool
+  guards are not containment: recipes and project code execute on the host
 - scope list from `util/git.ts` `treeChanges()` (deterministic: temp-index
   baseline tree vs `git hash-object` of the worktree) — no `git add -N`
   (index stays clean); engine-owned paths exempt
@@ -116,8 +121,10 @@ module imports the packages.
 
 ## src/engine/governor.ts
 
-- budget math over `harness.usage(Session)` — pi-ai `Usage` shapes; cost
-  fallback via `roles.*.costPerMillionInput/Output`
+- budget math over `harness.usage(Session)` — pi-ai `Usage` shapes; estimated
+  cost fallback via `roles.*.costPerMillionInput/Output`. Stops are based on
+  recorded/estimated spend, not a hard provider-bill guarantee; an admitted
+  in-flight request can exceed the ceiling
 - rate-limit detection (`looksLikeRateLimit`) + reset parsing
   (`parseResetDelay`, e.g. "resets in 30m", "retry after", 429 reset fields);
   sleep via `tasks.ts` `kit.sleep`
@@ -127,9 +134,11 @@ module imports the packages.
 
 ## src/engine/delivery.ts
 
-- `git add -A` + `git commit -m "<project>: <task> (wave <n>)"`, or branch +
-  `gh pr create --fill` + return to the previous branch — requires the
-  `--deliver` flag for `mode = "pr"`
+- `none` leaves changes in the operator's working tree. `commit` uses
+  `git add -A` + `git commit -m "<project>: <task> (wave <n>)"` on the
+  checked-out branch. `pr` optionally branches, commits, pushes, and calls
+  `gh pr create --fill` before returning to the previous branch; it requires
+  `--deliver` and never merges the PR
 
 ## src/views/*.ts + src/cli.ts
 

@@ -53,6 +53,18 @@ SIGKILL never happen; Linux-only v1 (the machine needs `/proc`; macOS
 variant B stays deferred in §18). No core seam change (`lockedByPid` was
 already there; `readout.seam` stays 1), no new deps.
 
+### Current limits and reserved A.8 design
+
+Appendix A.8 in `ui/PRD.md` is **approved design scope, not shipped behavior**.
+The current UI sends no plan revision, can interpret stopped-short exit 0 as
+completion, derives rollback/delivery labels from existing rows, and computes
+live diffs from the working copy. Cache metrics are not present. The reserved
+activations are M0-P04/P05/P06 for revision-bound confirmation and exit 2,
+M0-P11–P15 for receipts and checkpoint diffs, M2-P03/P04 for cache metrics,
+and M4-P04 for trusted installed-CLI resolution. Live-plan facts, `seam: 2`,
+and packaging/package-only consumption remain reserved for the separate
+M4-P01 amendment; none is implemented by this documentation change.
+
 What M1 adds on top of the M0 read (see the M0 list in the 0.1.0 CHANGELOG
 entry for the status strip / task table / event log / degradation basics):
 
@@ -91,10 +103,11 @@ entry for the status strip / task table / event log / degradation basics):
 
 What M2 adds on top of M1 control (kit seam genome A.2/A.3 → root 0.2.2):
 
-- **Per-task diffs** — every `done` task has `task-<id>.patch` +
-  `task-<id>.json` (files, statuses, +/- counts, bytes, truncated); every
-  `quarantined` task keeps its wave patch and gains the side-car. The patch
-  is cumulative since the task baseline and never a rollback input; engine
+- **Per-task diffs** — the engine attempts `task-<id>.patch` +
+  `task-<id>.json` (files, statuses, +/- counts, bytes, truncated) for `done`
+  tasks and a wave patch plus side-car for `quarantined` tasks. Capture can
+  fail or truncate, so an artifact is not guaranteed. The patch is cumulative
+  since the task baseline and never a rollback input; engine
   paths (`.orch/**`, `router.md`, `PROMPT.md`) and anything past 5 MiB are
   excluded/capped by the engine itself.
 - **Diff drawer** — file list (status chip + `+N −M I`) + unified hunks with
@@ -134,7 +147,9 @@ What M3 adds around that core (§16 M3 polish):
   report, drawer) has a plain-words empty state; the diff drawer explains its
   404/409/unreadable outcomes kindly; a quarantined task with no live wave
   raises a rollback-fact banner; a `#/diff/<task>` deep link to a task the
-  readout has never had draws an explanation instead of nothing.
+  readout has never had draws an explanation instead of nothing. The current
+  rollback-fact banner repeats the engine's quarantine claim; it is not proof
+  that baseline restoration succeeded (A.8/M0-P15 reserves receipt-based truth).
 - **Task-table sort (§15.1)** — one toggle: plan order (stable while the run
   progresses) or failing-first by status (quarantined → in progress → todo →
   done, stable within a status). Row filtering shipped in 0.5.3 (M4-c, below).
@@ -196,6 +211,8 @@ What M3 adds around that core (§16 M3 polish):
   UI toggle would either be a config editor (M5) or silently change what a
   human would have typed for the same run, so none exists; the deferral is
   stated in the report itself, the PRD (Appendix A.6), and the CHANGELOG.
+  These are reported operation rows, not verified publication/merge receipts;
+  PR creation never merges the PR.
 
 ### Event-log window + task-table filter (0.5.3, M4-c — §13, §7.1)
 
@@ -305,7 +322,9 @@ conversation — every model request is answered from `smoke.replay`, so you can
 click through Plan → review cards → Approve & run → diffs → completion report
 with zero provider credentials. What to expect: task `list-query` fails its
 gate on wave 1 (the driver resets the conversation) and wave 2 fixes it →
-`STATUS: COMPLETE`. The startup banner says all of this next to the URL, prints
+`STATUS: COMPLETE`. That final implementer line is a nonbinding report, not by
+itself acceptance evidence or proof that the generated CLI behaves correctly.
+The startup banner says all of this next to the URL, prints
 the baked project path (left in place for post-mortem — delete it any time),
 and an already-set `KIT_FAUX_SCRIPT` is honored, so `KIT_FAUX_SCRIPT=…/smoke-slow.replay
 npm --prefix ui run demo` rides the slow arc. `--demo` is incompatible with

@@ -28,13 +28,14 @@ activity:
   snapshot.
 - After a wave, knowing *what the agent changed* means reconstructing a diff
   from the task baseline or reading gate output.
-- A quarantined task rolls the tree back; the evidence is a patch file and a
-  wave-log row.
+- A quarantined task attempts a baseline restore; the display evidence is a
+  patch file and a wave-log row. At baseline, capture/restore errors can be
+  swallowed, so neither artifact proves that rollback completed.
 - Watching a run means babysitting a terminal, and switching context to check
   cost or the current task.
 
-The CLI does all of this correctly; it just does not present it as one
-operation surface.
+The CLI owns these operations, but the current evidence and recovery claims
+have the limitations above; the UI must not present them as stronger guarantees.
 
 ## 3. Users and jobs
 
@@ -95,8 +96,10 @@ Jobs, in priority order:
    pretending.
 4. **Density over decoration.** This is an operator console. Tables,
    monospace, status glyphs + labels, restrained color.
-5. **Diffs are evidence.** Every completed or quarantined task has a durable,
-   viewable diff; the in-flight wave has a clearly-marked live preview.
+5. **Diffs are display evidence.** Completed or quarantined tasks can have a
+   viewable diff, but capture is best-effort and artifacts may be absent or
+   truncated. A display patch is not an acceptance certificate or rollback
+   receipt; the in-flight wave has a clearly-marked working-copy preview.
 6. **Nothing surprising.** No auto-approve, no auto-run, no hidden writes, no
    destructive action without a confirmation.
 
@@ -229,11 +232,15 @@ authoritative gate.
 
 ### 7.4 Diffs
 
-- **Per task (durable):** when a task reaches `done` or `quarantined`, the
-  engine persists a patch of the working tree vs the task's `baselineTreeSha`
-  plus a stats side-car (Appendix A.2).
+- **Per task (display artifact):** when a task reaches `done` or `quarantined`,
+  the engine attempts to persist a patch of the working tree vs the task's
+  `baselineTreeSha` plus a stats side-car (Appendix A.2). Capture failure or
+  truncation is possible; the artifact is not a durable effect receipt.
 - **Quarantine:** the existing `quarantined-<task>-w<N>.patch` is shown in the
-  same viewer with a "rolled back" badge.
+  same viewer with a "rolled back" badge. **Current limitation:** that badge
+  follows the quarantine projection, not a verified restore; the baseline
+  engine can swallow restore failures. A.8 reserves receipt-based replacement
+  for M0-P15 rather than claiming the badge is authoritative today.
 - **Live (in-flight):** while a wave is running, the UI can request a diff of
   the current tree vs the task baseline. It is marked "live preview — may be
   incomplete" and is never persisted.
@@ -317,8 +324,10 @@ authoritative gate.
 
 ### 8.4 Quarantine
 
-- Task turns red with a "quarantined" badge; the drawer explains the cause,
-  shows the patch, the baseline sha, and the rollback fact.
+- Task turns red with a "quarantined" badge; the drawer explains the cause and
+  shows any captured patch and baseline sha. The current "rollback fact" is an
+  unverified engine claim, not proof of restoration (A.8/M0-P15 reserves the
+  receipt-based replacement).
 - Dependent tasks blocked by it are marked as blocked-by-dependency.
 - Available next actions: Handoff, Verify, Export; there is no "retry
   quarantined" in the loop, and the UI must not invent one.
@@ -637,7 +646,8 @@ Pass criteria:
 3. Wave 1 fails its gate; feedback and the failed gate log are visible; wave 2
    starts and fixes it; the run completes.
 4. The completed task's diff drawer shows the expected files and hunks; a
-   quarantine (if exercised in a variant) shows its patch + rollback.
+   quarantine (if exercised in a variant) shows its available patch and the
+   current rollback claim, which is not an independently verified restore.
 5. Budget spent, waves, and health match `inspect --json`.
 6. Closing the browser does not kill the run; reopening the UI reattaches and
    shows the correct final state.
@@ -806,7 +816,9 @@ semantics, config, docs, or CLI output for users who never open the UI.
 - On `done`: write `.orch/artifacts/task-<id>.patch` and
   `.orch/artifacts/task-<id>.json` before delivery (the task's final tree).
 - On quarantine: keep the existing `quarantined-<task>-w<N>.patch`; write the
-  stats side-car for it. The rollback behavior is unchanged.
+  stats side-car for it. The rollback behavior is unchanged: baseline restore
+  is attempted through `restoreTree`, but capture/restore failures are
+  best-effort and a patch/quarantine row is not proof of successful rollback.
 - Live diff endpoint: compute vs the task baseline on demand with the same
   exclusions/caps; do not persist; return `409` when the task is not the
   current in-flight task.
@@ -841,6 +853,9 @@ semantics, config, docs, or CLI output for users who never open the UI.
 ### A.6 Delivery truth (additive, read-only)
 - `KitReadout` gains an additive `delivery` section: `mode` — the configured `delivery.mode` (§4.6: `none | commit | pr`) — and `rows` — the wave log's kind `"delivery"` rows echoed as plain JSON-able shapes (`ts`, `task`, `verb`, `wave?`, `detail?`). Both modes serve it: storage reads the mode from the open config; side-car mode best-effort re-reads `.orch/config.toml` (a static file, not the owned storage) and omits `mode` when the config itself is unreadable, while the outcome rows still come from the wave log.
 - Read-only, and deliberately WITHOUT a UI mutation: per §5 delivery stays a config + CLI decision. The CLI's only delivery paths are the config's `delivery.mode` and the `--deliver` run qualifier the `pr` mode requires (a per-run override of what a human typed, not a safe toggle) — exposing either as an action would be the §5 non-goal and a §7.2 action-table change. No config write, no new CLI flag/command, no behavior change when the UI is absent. Delivery/config editing stays deferred to M5 (§18). Seam version stays `readout.seam = 1` (A.6 is additive surface, not a new seam version).
+- Current rows describe the engine's reported delivery operation; they are not
+  independently verified publication receipts. PR creation is optional and
+  never merges the PR. A.8 reserves receipt-based badges for M0-P15.
 
 ### A.7 — Per-wave isolated diffs (additive; shipped — kit 0.2.3 + ui 0.8.0)
 
@@ -890,6 +905,33 @@ drawer).
 - **Non-goals:** no per-wave rollback or wave-level approve/regate, no
   wave-log format version bump, no delivery change (D3/D5 hold), no CLI
   output change, no new UI deps.
+
+### A.8 — Revision-bound control and observed outcomes (approved design scope; not shipped)
+
+This amendment reserves design scope only. **None of these fields, CLI flags,
+exit codes, receipts, views, metrics, or launcher rules is implemented by this
+PRD edit.** Until the named activation packets land, current behavior remains
+as documented above: approval has no revision identity, run exit 0 can include
+stopped-short work, badges/diffs use projections and the working copy, cache
+metrics are absent, and the launcher uses its existing resolution chain.
+
+| Reserved design item | Required behavior and activation |
+| --- | --- |
+| Revision echo and exact confirmation | M0-P04 adds a fresh `planRevision` to CLI/mirror output; M0-P05 makes new grants revision-qualified with an exact task set; M0-P06 snapshots the displayed `{planRevision, selected}` tuple when the dialog opens and confirms exactly that tuple. Empty selection or absent identity rejects/disables rather than becoming run-all. |
+| Policy-stop exit 2 | M0-P05 introduces CLI exit 2 for policy stops and distinguishes whole-plan from selection completion; M0-P06 maps it in jobs/UI. Exit 0 alone must not be presented as whole-plan success. |
+| Receipt-based badges | M0-P11–M0-P14 establish the review/integration/recovery/publication evidence, and M0-P15 activates separate review, checks, workspace-recovery, and publication labels. Quarantined must not imply discarded/rolled back; review approval must not imply delivered. |
+| Checkpoint diff, not working-copy diff | M0-P14 freezes and addresses candidate checkpoints; M0-P15 switches the live view to the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists. Later operator-checkout edits are not task changes. |
+| Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
+| Trusted launcher resolution | M4-P04 resolves the trusted installed CLI through package metadata rather than a target project's `.bin` or sibling source checkout. This reservation does not itself authorize package exports or a new launcher. |
+
+**Reserved for a separate M4 amendment:** live-plan/sequence side-car facts,
+`seam: 2` and nullable read DTOs, the packaged read-only entry point, and
+package-only UI consumption require M4-P01's explicit Appendix A amendment and
+subsequent activation packets. A.8 does not approve those wire/package changes.
+
+A.8 also does not authorize revision grants, receipt generation, workspace
+isolation, sandboxing, a UI state writer, automatic merge, or any implementation
+before its owning packet.
 
 ## Appendix B — Detached job runner
 

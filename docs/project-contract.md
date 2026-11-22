@@ -10,7 +10,7 @@ What `<kit> init` writes in a target project, and how versions move.
 | `evals/checklist.md` | human-editable acceptance-criteria template aligned with the RouterDoc schema | template (user-editable) |
 | `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes | template (user-editable; hot-read every gate run) |
 | `evals/recipes.auto.toml` | approved discovered gate recipes; supports project-relative `cwd` for workspaces | generated only by approved `gates refresh`; absent initially |
-| `router.md` | human-readable MIRROR of RouterDoc; engine rewrites it on every router commit | engine |
+| `router.md` | human-readable MIRROR of RouterDoc; engine rewrites it on router commits; review it, but revise the PRD and replan instead of editing it as input | engine |
 | `.orch/config.toml` | annotated project config (roles, budgets, gates, delivery, paths) | config |
 | `.orch/kit-version` | provenance line: `kit=<kit> pi-durable=<pinned>` | engine |
 | `docs/prd.md` | placeholder when `--with-demo`, otherwise absent (user brings the PRD) | user |
@@ -28,25 +28,30 @@ fingerprint, typed Noul probabilities, thresholds, usage, and code-owned
 aggregation, but no raw diff or credentials. A fingerprint mismatch makes its
 conclusions stale/unknown. It is never an adoption decision or verifier verdict.
 
-Side-cars at runtime (git-ignored, local-only): `.orch/durable.sqlite*` (durable
-storage, WAL), `.orch/lock` (PID lock), `.orch/status.json` (atomic status
-panel payload), `.orch/pending-handoff.json` (queued user note), and
-`.orch/artifacts/*` (gate logs, quarantine patches, exports).
+Private runtime paths ignored by the init template: `.orch/durable.sqlite*`
+(durable storage, WAL), `.orch/lock` (PID lock), `.orch/status.json` (atomic
+status panel payload), `.orch/pending-handoff.json` (queued user note), and
+`.orch/artifacts/*` (gate logs, quarantine patches, exports). These artifacts
+are best-effort local evidence, not guaranteed commits or effect receipts.
+`.orch/wave-log.jsonl` is a separately rewritten mirror; the current init
+ignore list does not add a rule for it.
 
-## config.toml fields (all defaulted, all commented in the template)
+## config.toml fields (role identities required; other settings defaulted)
 
 - `[engine]` — `piDurable` (pinned release, asserted against the installed
   package at boot), `maxTurns` (tool rounds per run, default 50), `retryLimit`
   (waves per task before quarantine, default 3)
-- `[roles.planner|implementer|verifier]` — `provider`, `modelId`,
-  optional `thinkingLevel`, `costPerMillionInput`, `costPerMillionOutput`
-  (USD rate fallback for budget math when providers/catalog don't report cost)
-- `[budgets]` — `sessionUsd` (hard ceiling), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`
+- `[roles.planner|implementer|verifier]` — each role block requires string
+  `provider` and `modelId` identities; these fields are not optional. Optional
+  `thinkingLevel`, `costPerMillionInput`, and `costPerMillionOutput` provide
+  thinking configuration and USD-rate fallback for budget estimates when
+  providers/catalogs do not report cost.
+- `[budgets]` — `sessionUsd` (observed/estimated spend stop, not a hard provider-bill cap), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`. An admitted in-flight request can exceed the ceiling.
 - gate recipes — `[name]` tables in `evals/recipes.toml` and approved
   `evals/recipes.auto.toml`: argv-simple `cmd`, optional stdout `match`, path
   fast-skip `on`, and optional project-relative `cwd`. Human duplicate names
   override generated entries. Recipe cwd cannot be absolute or escape the root.
-- `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (scope check + guard),
+- `[gates]` — `timeoutSec` (per recipe), `enforceTargetPaths` (working-tree scope check + write/edit guard; neither is OS containment and bash/recipes still execute on the host),
   `skepticSecondPass` (default `true`, including when omitted): after primary
   approval, a fresh read-only adversarial verifier must also approve. Explicit
   `false` is the single-pass opt-out. The adversarial pass checks criteria,
@@ -67,7 +72,7 @@ panel payload), `.orch/pending-handoff.json` (queued user note), and
   effects remain in code; uncertain, conflicting, stale, missing-key, malformed,
   and network-error outcomes remain unknown and cannot alter feedback routing,
   retry limits, quarantine, task/adoption state, delivery, or approvals.
-- `[delivery]` — `mode`: `none` (default) | `commit` | `pr` (pr additionally requires the run's `--deliver` flag)
+- `[delivery]` — `mode`: `none` (default; leaves changes in the operator's working tree) | `commit` (attempts a commit on the checked-out branch) | `pr` (optionally attempts branch/PR creation and additionally requires the run's `--deliver` flag; never merges the PR)
 - `[paths]` — `prd` (default `docs/prd.md`), `specs`
 
 NO SECRETS live in config.toml: providers read credentials from the
@@ -100,7 +105,9 @@ discovery adoption or create `recipes.auto.toml`.
    `--skip-gates` is explicit. New evidence fingerprints reopen remembered
    findings; refresh additions/changes/removals require approval.
 6. On the next `plan`, approved remediations are additional planning
-   requirements. RouterDoc review and `run --approve` remain unchanged.
+   requirements. Review the durable RouterDoc through its `router.md` mirror;
+   to change the graph, revise the PRD/remediations and replan rather than
+   treating mirror edits as input. `run --approve` approves RouterDoc state.
 
 ## Upgrade & migration notes
 
@@ -130,16 +137,16 @@ discovery adoption or create `recipes.auto.toml`.
 ├── lock                 # PID lock (single storage owner)
 ├── durable.sqlite*      # pi-durable storage (WAL; local-only)
 ├── status.json          # atomic status payload (status --follow reads this)
-├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (git-tracked? NO — engine-owned, ignored)
+├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (local paper trail; no init ignore rule)
 ├── pending-handoff.json # queued handoff note (handoff command)
 └── artifacts/           # gate logs, quarantine patches, exports
 
-router.md                # git-tracked RouterDoc mirror (paper trail)
+router.md                # RouterDoc mirror (review/local paper trail; not plan input)
 PROMPT.md, evals/, docs/prd.md
 ```
 
-> Note on `.orch/wave-log.jsonl`: the research brief calls for a git-tracked
-> paper trail; the default `.gitignore` ignore includes the file because it
-> mirrors durable storage 1:1. Teams that want it committed can remove that
-> line from `.gitignore` — the engine re-renders it after every commit and
-> merge-free add-only content is safe.
+> Note on `.orch/wave-log.jsonl`: it mirrors durable storage and is rewritten
+> after state commits. The current init template does not ignore it; operators
+> choose whether to retain or commit that local paper trail. Neither this file
+> nor `router.md` is guaranteed committed evidence, and mirror content alone
+> does not certify rollback, delivery, or another external effect.

@@ -1,18 +1,20 @@
 # llm-toolkit-001 — durable, gate-enforced autonomous coding loop
 
 A maintained TypeScript **agent implementation loop template**: point it at a PRD,
-review one plan, and let a budget-governed `pi-durable` agent harness turn the
-plan into merged code — implementer waves → deterministic gates → read-only
-verifier + default-on adversarial second pass → done/quarantine, with a
-git-tracked paper trail at every step.
+review one plan, and let a budget-governed `pi-durable` agent harness produce
+working-tree changes, optional local commits, or optional pull requests —
+implementer waves → deterministic gates → read-only verifier + default-on
+adversarial second pass → done/quarantine, with local evidence along the way.
+Pull-request creation never merges code.
 
 - Runtime: [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable) **1.5.0** (pinned exact) on Node ≥ 22.19 (Node 24 LTS preferred).
 - One provider/model per ROLE (planner / implementer / verifier) from project config — subscription-budgeted, sequential v1, no parallel agent fan-out.
-- Durable SQLite storage is **local-only and git-ignored**; the committed paper
-  trail is markdown/JSONL side-cars: `router.md`, `.orch/wave-log.jsonl`, gate
-  artifacts, verifier verdicts, run summaries.
+- Durable SQLite storage is **local-only and git-ignored**. `router.md`,
+  `.orch/wave-log.jsonl`, gate artifacts, verifier verdicts, and run summaries
+  are local mirrors/artifacts, not guaranteed committed evidence; Git writes
+  occur only through the configured delivery path or explicit operator action.
 - Gates (recipes), a read-only verifier with a default-on adversarial second
-  pass, and a budget governor (session USD ceiling,
+  pass, and a budget governor (estimated session USD ceiling,
   zero-progress/duplicate-failure breakers, rate-limit durable sleep with exit
   42) are built in.
 
@@ -31,8 +33,9 @@ npx llm-toolkit-001 init . --with-demo     # in the repo root of your project
 # 3. write the PRD at docs/prd.md, then run one planning conversation
 llm-toolkit-001 plan --prd docs/prd.md     # writes RouterDoc + router.md, stops
 
-# 4. REVIEW router.md. approve, then watch the waves:
-llm-toolkit-001 run --approve              # 0 done · 42 sleeping · 1 busy/error
+# 4. REVIEW router.md, the generated mirror. To change the graph, revise the
+#    PRD and rerun plan; do not edit router.md as plan input. Then approve:
+llm-toolkit-001 run --approve              # 0 ended (check stopped-short) · 42 sleeping · 1 busy/error
 llm-toolkit-001 status --follow            # live panel (reads .orch/status.json)
 
 # 5. paper trail: router.md (mirror), .orch/wave-log.jsonl (rows),
@@ -45,7 +48,7 @@ llm-toolkit-001 handoff "context for the next wave"
 llm-toolkit-001 verify --task some-task-id  # one-off read-only verification
 ```
 
-### Scripted smoke, no API keys (proven against examples/demo-prd)
+### Scripted smoke, no API keys (fixture replay)
 
 `KIT_FAUX=1` runs every conversation on an in-package faux provider
 (`kit-planner` / `kit-impl` / `kit-verifier` model ids). `examples/demo-prd`
@@ -65,6 +68,10 @@ git init -q && git add -A && git commit -qm base   # the loop needs a repo
 KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 plan
 KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve   # → STATUS: COMPLETE
 ```
+
+The replay demonstrates loop transitions, not by itself a working generated
+product. At this baseline the demo's final CLI invocation has known renderer and
+parser defects; M0-P08 owns the behavioral gate for that invocation.
 
 Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 `---` separated chunks; a chunk is one model request's answer — plain text
@@ -90,7 +97,24 @@ primary approval followed by adversarial approval.
 | `handoff "note"` | queue a note the driver ingests at the start of the next wave |
 | `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
-Exit codes: `0` done · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` error or lock busy.
+Exit codes: `0` run ended, including stopped-short/quarantined outcomes (read the output) · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` error or lock busy.
+
+### Current behavior and limits
+
+- `run --approve` approves the durable RouterDoc. `router.md` is a rewritten
+  review mirror, not editable plan input; revise the PRD and rerun `plan`.
+- `delivery.mode = "none"` leaves accepted changes in the operator's working
+  tree. `commit` attempts a commit on the checked-out branch. `pr` additionally requires
+  `--deliver` and may create a branch and pull request; it never merges one.
+- Implementer tools, gates, probes, and delivery run on the host. Write/edit
+  guards, target-path checks, and `shell: false`-style process spawning are not
+  OS containment; use trusted projects and fixtures only.
+- Budget stops use recorded provider/catalog costs or configured rate estimates.
+  They are not a hard provider-bill cap and cannot prevent an already admitted
+  in-flight request from exceeding the ceiling.
+- Quarantine attempts to save display evidence and restore the working-tree
+  baseline. Artifact capture and restoration can fail; a quarantine row or patch
+  is not proof that rollback succeeded.
 
 ## Adopting an existing project
 
@@ -398,10 +422,11 @@ Verification runs locally (this repo carries no hosted CI): the engine suite
 and the ui sub-product's suites — including the faux e2e against the real
 CLI — before any push.
 
-The seam now (A.2/A.3) also persists a display-oriented per-task patch + stats
-side-car for every done/quarantined task (`.orch/artifacts/task-<id>.patch` +
+The seam now (A.2/A.3) also attempts a display-oriented per-task patch + stats
+side-car for done/quarantined tasks (`.orch/artifacts/task-<id>.patch` +
 `task-<id>.json`; engine paths excluded, 5 MiB cap, cumulative since baseline,
-never a rollback input — see the 0.2.2 changelog) and carries each task's
+never a rollback input — see the 0.2.2 changelog). Capture can fail or truncate,
+so these are not guaranteed evidence. The seam also carries each task's
 `baselineTreeSha` in `status.json` so the UI's live in-flight diff works while
 the run owns the lock.
 
@@ -416,12 +441,16 @@ PRD →[plan, one conversation, read-only]→ RouterDoc + router.md (planned)
       → gates (scope check + recipes) → primary verifier (read-only, strict JSON)
       → approving verdict ⇒ fresh adversarial verifier (default on; read-only)
       → both approve ⇒ done, or feedback ⇒ next wave (context reset between waves)
-      → exhausted/blocked ⇒ quarantine: patch saved, tree rolled back to baseline
+      → exhausted/blocked ⇒ quarantine: patch capture + baseline restore attempted
   budgets/breakers: session USD ceiling, wave warn, zero-change quarantine,
   duplicate gate-failure hash, consecutive-error cap, rate-limit durable sleep.
   malformed/inconclusive adversarial verdicts ⇒ needs_human (never approval)
-delivery: none (default) | commit | pr (needs --deliver)
+delivery: none (working tree; default) | commit (current branch) | pr (optional; needs --deliver; never merges)
 ```
+
+The implementer's final `STATUS: COMPLETE` / `STATUS: BLOCKED` line is a
+nonbinding report. It neither satisfies acceptance criteria nor changes task
+status; gates and verifier passes determine the loop's outcome.
 
 `[gates] skepticSecondPass` defaults to `true` when omitted. Set it to `false`
 for the explicit single-verifier opt-out. Each pass appends its own verdict,

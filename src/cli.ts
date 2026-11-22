@@ -132,7 +132,7 @@ async function cmdPlan(argv: string[]): Promise<void> {
 		const outcome = await runPlan(kit, prdPath, prdText);
 		we.log(`${c.green}PLANNED${RESET} — ${outcome.tasks.length} task(s) written to router.md`);
 		for (const t of outcome.tasks) we.log(`  [${t.id}] ${t.title}`);
-		we.log(`\nreview the graph (edit router.md if you wish), then: ${c.cyan}${CLI_NAME} run --approve${RESET}`);
+		we.log(`\nreview router.md (a generated mirror, not editable plan input). To change the plan, revise the PRD and rerun ${c.cyan}${CLI_NAME} plan${RESET}, then: ${c.cyan}${CLI_NAME} run --approve${RESET}`);
 		await kit.loop.close();
 		kit.lock.release();
 	} catch (err) {
