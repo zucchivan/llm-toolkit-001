@@ -1,35 +1,35 @@
 [planner]
 ---
-{"tasks": [{"id": "list-parse", "title": "parseList + renderList", "spec": "Add src/list.ts with parseList() and renderList().", "dependsOn": [], "acceptance": ["When parseList is called on '/a/-b', the system shall return ['a','b']."], "taskedPaths": ["src/"], "targetPaths": ["src/"], "priority": 2}, {"id": "list-query", "title": "queryList filter", "spec": "Add queryList(list, q).", "dependsOn": ["list-parse"], "acceptance": ["When queryList runs with 'A', the system shall match case-insensitively."], "targetPaths": ["src/"], "priority": 1}, {"id": "cli-render", "title": "bin/render.js", "spec": "Read argv[2], render output.", "dependsOn": ["list-query"], "acceptance": ["When bin/render.js runs with '/a/-b', the system shall print 'a b'."], "targetPaths": ["bin/"], "priority": 0}]}
+{"tasks":[{"id":"list-parse","title":"parseList + renderList","spec":"Add src/list.ts with parseList() and renderList().","dependsOn":[],"acceptance":["When parseList is called on '/a/-b', the system shall return ['a','b']."],"taskedPaths":["src/"],"targetPaths":["src/"],"priority":2},{"id":"list-query","title":"queryList filter","spec":"Add queryList(list, q).","dependsOn":["list-parse"],"acceptance":["When queryList runs with 'A', the system shall match case-insensitively."],"targetPaths":["src/"],"priority":1},{"id":"cli-render","title":"bin/render.js","spec":"Read argv[2], render output.","dependsOn":["list-query"],"acceptance":["When bin/render.js runs with '/a/-b', the system shall print 'a b'."],"targetPaths":["bin/"],"priority":0}]}
+---
 [implementer]
 ---
-{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\n"}
+{"tool":"write","path":"src/list.ts","content":"export function parseList(input: string): string[] {\n\treturn input.split(\"/\").flatMap((p) => p.split(\",\")).map((s) => s.trim()).filter((s) => s.length > 0).map((s) => s.startsWith(\"-\") ? s.slice(1) : s);\n}\nexport function renderList(items: string[]): string {\n\treturn items.join(\" \");\n}\n"}
 ---
 STATUS: COMPLETE
 ---
-{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\nexport const BROKEN = 'first wave of task 2 breaks the gate on purpose';\n"}
+{"tool":"write","path":"src/query.ts","content":"export function queryList(items: string[], q: string): string[] {\n\treturn items.filter((item) => item.includes(q));\n}\n"}
 ---
 STATUS: COMPLETE
 ---
-{"tool": "write", "path": "src/list.ts", "content": "export function parseList(input: string): string[] {\n\treturn input.split('/').flatMap((p) => p.split(',')).map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('-'));\n}\n"}
----
-{"tool": "write", "path": "src/query.ts", "content": "export function queryList(items: string[], q: string): string[] {\n\tconst needle = q.toLowerCase();\n\treturn items.filter((i) => i.toLowerCase().includes(needle));\n}\n"}
+{"tool":"write","path":"src/query.ts","content":"export function queryList(items: string[], q: string): string[] {\n\tconst needle = q.toLowerCase();\n\treturn items.filter((item) => item.toLowerCase().includes(needle));\n}\n"}
 ---
 STATUS: COMPLETE
 ---
-{"tool": "write", "path": "bin/render.js", "content": "#!/usr/bin/env node\nimport { parseList, renderList } from '../src/list.ts';\nconsole.log(renderList(parseList(process.argv[2] ?? '-x')));\n"}
+{"tool":"write","path":"bin/render.js","content":"#!/usr/bin/env node\nimport { parseList, renderList } from '../src/list.ts';\nconsole.log(renderList(parseList(process.argv[2] ?? '-x')));\n"}
 ---
 STATUS: COMPLETE
+---
 [verifier]
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "diff matches the criterion"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-list"}]}], "notes": "gates pass; the executed gate-list run proves the criterion"}
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-list"}]}], "notes": "adversarial pass: no refutation found"}
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "fixed on wave 2"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-query"}]}], "notes": "wave 2 repaired the case-sensitive filter; the executed gate-query run proves it"}
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-query"}]}], "notes": "adversarial pass: no refutation found"}
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "present"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-cli"}]}], "notes": "the executed gate-cli run proves the CLI prints a b"}
 ---
-{"verdict": "approve", "criteria": [{"id": "1", "status": "pass"}], "notes": "adversarial pass: no refutation found"}
+{"verdict": "approve", "criteria": [{"id": "1", "status": "pass", "evidence": [{"kind": "gate", "id": "gate-cli"}]}], "notes": "adversarial pass: no refutation found"}

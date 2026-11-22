@@ -1,8 +1,10 @@
 /**
  * Demo mode (ui/PRD.md §15.2, ui 0.10.0): the official simulated backend.
  * bakeDemoProject must produce a complete, serveable loop project — faux
- * roles, §5 scaffold, broken-gate recipe, one git base commit — and a real
- * server started on it must answer the readout route like any project.
+ * roles, §5 scaffold, the fixture's ONE recipe file (three behavioral gates,
+ * M0-P08) with the reviewed gate bytes copied to evals/, one git base commit
+ * — and a real server started on it must answer the readout route like any
+ * project.
  */
 import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
@@ -29,9 +31,16 @@ describe("bakeDemoProject", () => {
 		const { readFile } = await import("node:fs/promises");
 		const prd = await readFile(join(root, "docs", "prd.md"), "utf8");
 		expect(prd.length).toBeGreaterThan(0);
+		// M0-P08: the fixture's ONE recipe file carries the three behavioral
+		// gates in literal argv form, and evals/ holds the executed copy of the
+		// reviewed gate bytes (byte-identical — no duplicate implementation).
 		const recipes = await readFile(join(root, "evals", "recipes.toml"), "utf8");
-		expect(recipes).toContain("[broken-gate]");
-		expect(recipes).toContain("node smoke-gate.cjs");
+		expect(recipes).toContain("[gate-list]");
+		expect(recipes).toContain('["node", "evals/smoke-gate.cjs", "list"]');
+		expect(recipes).toContain('match = [\'^a b\\n$\']');
+		const gateCopy = await readFile(join(root, "evals", "smoke-gate.cjs"), "utf8");
+		const reviewed = await readFile(join(REPO_ROOT, "examples", "demo-prd", "smoke-gate.cjs"), "utf8");
+		expect(gateCopy).toBe(reviewed);
 		const prompt = await readFile(join(root, "PROMPT.md"), "utf8");
 		expect(prompt.length).toBeGreaterThan(0);
 		const head = await exec(["git", "rev-parse", "--verify", "HEAD"], { cwd: root, timeoutMs: 15_000 });

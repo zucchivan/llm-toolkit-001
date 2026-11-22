@@ -6,6 +6,11 @@ import { exec } from "../../src/util/exec.ts";
 import { demoConfigToml } from "../../test/demo-project.ts";
 import { initProject } from "../../src/init.ts";
 
+// The explicit demo setup (M0-P08): the fixture's ONE recipe file + the
+// reviewed gate bytes → evals/. Re-exported so ui demo tests share the same
+// copy source as the core demo paths (generic scaffolds install no gates).
+export { installDemoGates } from "../../test/demo-project.ts";
+
 /** The kit repo root (this file lives at <repo>/ui/test/helpers.ts). */
 export const REPO_ROOT = new URL("../../", import.meta.url).pathname;
 

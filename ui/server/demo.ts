@@ -4,17 +4,23 @@
  *
  * `llm-toolkit-ui --demo` (or `npm run demo`) bakes the kit repo's
  * `examples/demo-prd` fixture into a fresh temp project — faux-role config,
- * init scaffold, broken-gate recipe, one git base commit — and the CLI sets
+ * init scaffold, the fixture's ONE recipe file (three BEHAVIORAL gates), the
+ * reviewed gate bytes copied to evals/, one git base commit — and the CLI sets
  * `KIT_FAUX=1` + `KIT_FAUX_SCRIPT=<baked>/smoke.replay` before starting the
  * server, so every job the UI spawns replays the scripted arc instead of
  * calling a real provider (job env is inherited from the server, §12).
+ *
+ * The demo is falsifiable at runtime (M0-P08): task 2's first scripted wave
+ * ships a case-sensitive queryList that the executed gate-query rejects; the
+ * wave-2 retry repairs it from the gate feedback; and the completed program
+ * satisfies `node bin/render.js '/a/-b'` → exit 0, stdout `a b`.
  *
  * UI-side only: existing kit surface (`initProject`, the faux overlay, the
  * fixture) is used read/execute-only — no kit change, `readout.seam` stays 1.
  * The baked root is printed and LEFT IN PLACE for post-mortem (delete any
  * time; it is a temp dir).
  */
-import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec } from "../../src/util/exec.ts";
@@ -71,14 +77,21 @@ enforceTargetPaths = true
 export async function bakeDemoProject(repoRoot: string): Promise<BakedDemo> {
 	const root = await mkdtemp(join(tmpdir(), "kit-ui-demo-"));
 	await mkdir(join(root, ".orch"), { recursive: true });
+	// The fixture copy brings evals/recipes.toml — the fixture's ONE recipe file
+	// (gate-list / gate-query / gate-cli, literal argv form).
 	await cp(join(repoRoot, "examples", "demo-prd"), root, { recursive: true });
+	// Demo setup copies the REVIEWED gate bytes (the fixture's top-level script,
+	// the single copy source) to evals/ for execution — no duplicate
+	// hand-maintained implementation, and the executed assertion is not
+	// task-writable (evals/ is a protected review control).
+	await copyFile(join(repoRoot, "examples", "demo-prd", "smoke-gate.cjs"), join(root, "evals", "smoke-gate.cjs"));
 	await writeFile(join(root, ".orch", "config.toml"), demoConfigToml(), "utf8");
-	// init scaffolds the §5 files (PROMPT.md, evals/recipes.toml, kit-version),
-	// skipping whatever the fixture already carries (docs/prd.md, src/, bin/).
+	// init scaffolds the §5 files (PROMPT.md, kit-version), skipping whatever
+	// the fixture already carries (docs/prd.md, src/, bin/, evals/recipes.toml).
 	await initProject(root, { projectName: "kit-ui-demo" });
-	// The fixture's gate: task 2 fails [broken-gate] on wave 1, passes on wave 2
-	// (drives the conversation-reset path). Written last so it is the final word.
-	await writeFile(join(root, "evals", "recipes.toml"), '[broken-gate]\ncmd = "node smoke-gate.cjs"\n', "utf8");
+	// The fixture's behavioral gates: task 2 fails gate-query on wave 1 (the
+	// case-sensitive queryList it ships), passes on wave 2 after the repair
+	// (drives the conversation-reset path — proven by behavior).
 	// The loop needs a repo; local identity keeps the bake independent of the
 	// operator's global git config.
 	const g = async (argv: string[]): Promise<void> => {

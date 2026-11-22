@@ -1,0 +1,37 @@
+# Demo gate recipes (M0-P08) — the fixture's ONE recipe file, copied by every
+# demo builder (`cp -r` of this fixture, or the UI demo bake). Three named
+# gates invoke the checked-in smoke-gate.cjs with literal argv subcommands;
+# demo setup copies the reviewed bytes from this fixture's top-level
+# smoke-gate.cjs to evals/smoke-gate.cjs for execution. Assertions are
+# BEHAVIORAL: the gates execute the product's modules and CLI, they never grep
+# file contents. evals/ is a protected review control — a task cannot rewrite
+# the checks that judge it.
+#
+# Requires Node >= 23.6: the demo product's src/*.ts modules are executed
+# through Node's default TypeScript type-stripping.
+#
+# `gates probe` on a FRESH demo reports these as pre-existing failures: the
+# product files under src/ and bin/ are created by the tasks, so run the loop
+# first — a pending task's gate must not fail merely because it has not run
+# yet (wave 1 only touches src/, so gate-query/gate-cli skip via `on`).
+
+[gate-list]
+# Always checks the parser + renderer (no `on` filter — it runs every wave).
+argv = ["node", "evals/smoke-gate.cjs", "list"]
+
+[gate-query]
+# Requires an actual case-insensitive result; runs once src/query.ts or bin/
+# is touched by the wave.
+argv = ["node", "evals/smoke-gate.cjs", "query"]
+on = ["src/query.ts", "bin/"]
+
+[gate-cli]
+# The second independent child invocation: the gate spawns `node bin/render.js
+# /a/-b` and forwards its stdout, so the ALL-match below proves through the
+# runner that the completed program exits 0 and prints exactly `a b\n`
+# (status 0 is the runner's own requirement; a missing export or a nonzero
+# exit fails the gate). The match anchors the exact stdout bytes: JS `$` does
+# not match before a trailing newline, so the newline is part of the pattern.
+argv = ["node", "evals/smoke-gate.cjs", "cli"]
+on = ["bin/"]
+match = ['^a b\n$']

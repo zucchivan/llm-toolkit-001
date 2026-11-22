@@ -34,6 +34,18 @@ if (cmd === "handoff") {
 	process.exit(0);
 }
 if (cmd === "run") {
+	const rest = args.slice(1);
+	// M0-P06 contract (mirrors the real CLI): a new grant is revision-qualified
+	// and refuses without --revision; bare `run` (no flags) is the resume path.
+	const flags = rest.filter((a) => a.startsWith("--"));
+	if (flags.includes("--approve") && !rest.includes("--revision")) {
+		console.error("stub: run refused: --approve needs --revision <uuid> — there is no hidden default revision");
+		process.exit(1);
+	}
+	if (flags.length === 0) {
+		console.log("stub: resume — stored grant unchanged (no new approval)");
+		process.exit(0);
+	}
 	console.log("▶ wave start: stub-task #w1");
 	// interruptible block: SIGINT → the CLI's clean path (exit 130)
 	process.on("SIGINT", () => {

@@ -17,7 +17,7 @@ import { readOnce } from "../server/readout.ts";
 import { jobsList, type JobRecord } from "../server/jobs.ts";
 import { resolveCli } from "../server/actions.ts";
 import { postAction, actionHeaders, waitFor, spawnSleeper } from "./actions-helper.ts";
-import { bakeConfiguredDemo } from "./helpers.ts";
+import { bakeConfiguredDemo, installDemoGates } from "./helpers.ts";
 
 const FAUX = process.env["KIT_FAUX"] === "1";
 
@@ -46,9 +46,10 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 	});
 
 	it("plan job → planned readout → run job completes the demo waves (+ per-task diffs)", { timeout: 300_000 }, async () => {
-		// project: demo PRD + recipes with the plan-fails-then-fixes gate + one baseline commit
+		// project: demo PRD + the fixture's ONE recipe file (three behavioral
+		// gates; task 2's wave 1 ships a case-sensitive queryList) + one baseline commit
 		root = await bakeConfiguredDemo();
-		await writeFile(join(root, "evals", "recipes.toml"), '[broken-gate]\ncmd = "node smoke-gate.cjs"\n', "utf8");
+		await installDemoGates(root);
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-dist-"));
@@ -74,8 +75,14 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect(planned.readout.tasks.map((t) => t.id).sort()).toEqual(["cli-render", "list-parse", "list-query"]);
 		expect(planned.readout.storage?.router.tasks.length).toBe(3);
 
+		// M0-P06 (A.8): the approval carries the reviewed tuple — the plan revision
+		// the readout displays plus the explicit task ids (repeated --tasks per id).
+		const revision = planned.readout.storage?.router.identity?.planRevision;
+		expect(revision).toMatch(/^[0-9a-f-]{36}$/);
+		const todoIds = planned.readout.tasks.filter((t) => t.status === "todo").map((t) => t.id).sort();
+
 		// --- approve & run through the UI (real CLI, faux implementer/verifier)
-		const run = await postAction(base, cookie, { kind: "run", approve: true }, headers);
+		const run = await postAction(base, cookie, { kind: "run", approve: true, revision: revision!, tasks: todoIds }, headers);
 		expect(run.status).toBe(202);
 		const { jobId: runId } = (await run.json()) as { jobId: string };
 
@@ -112,8 +119,10 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect(final.readout.artifacts.filter((a) => a.kind === "diff").length).toBeGreaterThanOrEqual(6); // 3 patches + 3 stats
 
 		// Drawer data: list-parse's patch carries its file hunks; list-query's
-		// cumulative patch (wave1 broke, wave2 fixed) shows query.ts and NO engine
-		// paths, and the fixed state (no BROKEN token in the final diff).
+		// cumulative patch (wave 1 shipped the case-sensitive filter, wave 2
+		// repaired it) shows query.ts and NO engine paths, and the final state
+		// carries the case-insensitive filter the executed gate demanded
+		// (M0-P08: a retry proven by behavior, not by a BROKEN token).
 		const drawerOf = async (task: string): Promise<{ diff: string; statsJson?: { wave: number } }> => {
 			const res = await fetch(`${base}/api/tasks/${task}/diff`, { headers: { cookie } });
 			expect(res.status).toBe(200);
@@ -127,7 +136,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect(parseDrawer.diff).not.toMatch(/diff --git a\/\.orch/u);
 		const queryDrawer = await drawerOf("list-query");
 		expect(queryDrawer.diff).toContain("src/query.ts");
-		expect(queryDrawer.diff).not.toContain("BROKEN"); // final state — cumulative patch shows the correction landed
+		expect(queryDrawer.diff).toContain("toLowerCase"); // the wave-2 repair landed
 		expect(queryDrawer.statsJson?.wave).toBe(2);
 
 		// diff artifacts exist per task on disk, byte-sized > 0
@@ -171,12 +180,15 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 	});
 
 	it("live diff: exclusions + content mid-wave; 409 for tasks not in flight", { timeout: 300_000 }, async () => {
-		// own project + a slow gate recipe: the sleep runs INSIDE list-parse's wave
-		// (after src/list.ts is written) so the live-diff window has real content.
+		// own project + a slow gate recipe (generated layer, real precedence: the
+		// human recipes keep the three behavioral gates): the sleep runs INSIDE
+		// list-parse's wave (after src/list.ts is written) so the live-diff
+		// window has real content.
 		root = await bakeConfiguredDemo();
+		await installDemoGates(root);
 		await mkdir(join(root, "evals"), { recursive: true });
 		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
-		await writeFile(join(root, "evals", "recipes.toml"), '[broken-gate]\ncmd = "node smoke-gate.cjs"\n[slow-gate]\ncmd = "node slow-gate.cjs"\n', "utf8");
+		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-live-dist-"));
@@ -192,7 +204,12 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		const { jobId } = (await plan.json()) as { jobId: string };
 		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
 
-		const run = await postAction(base, cookie, { kind: "run", approve: true }, headers);
+		// M0-P06 (A.8): the run job grants the reviewed revision + explicit ids
+		const planned = await readOnce(root);
+		const revision = planned.readout.storage?.router.identity?.planRevision!;
+		expect(revision).toMatch(/^[0-9a-f-]{36}$/);
+		const todoIds = planned.readout.tasks.filter((t) => t.status === "todo").map((t) => t.id).sort();
+		const run = await postAction(base, cookie, { kind: "run", approve: true, revision, tasks: todoIds }, headers);
 		expect(run.status).toBe(202);
 
 		try {
@@ -296,9 +313,10 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// spawn the runner like a terminal would: the SAME entry resolveCli()
 		// picks for spawning jobs, cwd = the project root, detached from jobs.
 		root = await bakeConfiguredDemo();
+		await installDemoGates(root);
 		await mkdir(join(root, "evals"), { recursive: true });
 		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
-		await writeFile(join(root, "evals", "recipes.toml"), '[broken-gate]\ncmd = "node smoke-gate.cjs"\n[slow-gate]\ncmd = "node slow-gate.cjs"\n', "utf8");
+		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-stop-dist-"));
@@ -314,9 +332,14 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		const { jobId } = (await plan.json()) as { jobId: string };
 		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
 
-		// terminal-spawned run (NOT a UI job record): same argv shape the human
-		// types, cwd on the project, the UI server's job layer left out entirely.
-		const child = spawn(resolveCli(root).argv[0]!, [...resolveCli(root).argv.slice(1), "run", "--approve"], {
+		// terminal-spawned run (NOT a UI job record): the same revision-qualified
+		// argv a human types (M0-P06: --revision + repeated --tasks from the
+		// reviewed tuple; the bare/stamp-less form refuses), cwd on the project,
+		// the UI server's job layer left out entirely.
+		const planned = await readOnce(root);
+		const revision = planned.readout.storage?.router.identity?.planRevision!;
+		expect(revision).toMatch(/^[0-9a-f-]{36}$/);
+		const child = spawn(resolveCli(root).argv[0]!, [...resolveCli(root).argv.slice(1), "run", "--approve", "--revision", revision, "--tasks", "list-parse"], {
 			cwd: root,
 			stdio: "ignore",
 			env: { ...process.env }, // KIT_FAUX=1 + KIT_FAUX_SCRIPT ride the test env
