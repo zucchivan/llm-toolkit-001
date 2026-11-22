@@ -1,16 +1,18 @@
 /**
  * `init` scaffolds a target project (brief §5): config, PROMPT.md, evals
- * templates, router.md mirror placeholder, .gitignore additions. Idempotent
- * per-version: existing non-empty files are never clobbered (we print what we
- * skipped) and .orch/kit-version records provenance.
+ * templates, router.md mirror placeholder, and one bounded ADR 04 hygiene
+ * block in .gitignore. Idempotent per-version: existing non-empty files are
+ * never clobbered (we print what we skipped) and .orch/kit-version records
+ * provenance.
  */
-import { mkdir, readFile, stat, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname as pd } from "node:path";
 import { KIT_VERSION } from "./config.ts";
-import { createRequire } from "node:module";
+import { readInstalledPiDurableVersion } from "./engine/kit.ts";
+import { installProjectHygiene } from "./hygiene.ts";
 
 export interface InitOptions {
 	withDemo?: boolean;
@@ -21,10 +23,12 @@ export interface InitReport {
 	written: string[];
 	skipped: string[];
 	appended: string[];
+	/** Hygiene conflicts: reported, never repaired (no index/history changes). */
+	warnings: string[];
 }
 
 export async function initProject(root: string, options: InitOptions = {}): Promise<InitReport> {
-	const report: InitReport = { written: [], skipped: [], appended: [] };
+	const report: InitReport = { written: [], skipped: [], appended: [], warnings: [] };
 	const templateDir = templateRoot();
 	const projectName = options.projectName ?? (existsSync(join(root, "package.json"))
 		? (JSON.parse(await readFile(join(root, "package.json"), "utf8")) as { name?: string }).name ?? basename(root)
@@ -57,27 +61,18 @@ export async function initProject(root: string, options: InitOptions = {}): Prom
 		report.written.push("docs/prd.md");
 	}
 
-	// .gitignore additions, appended only when missing.
-	const ignoreLines = [
-		".orch/durable.sqlite*",
-		".orch/lock",
-		".orch/status.json",
-		".orch/pending-handoff.json",
-		".orch/artifacts/",
-	];
-	const gitignore = join(root, ".gitignore");
-	const current = existsSync(gitignore) ? await readFile(gitignore, "utf8") : "";
-	for (const line of ignoreLines) {
-		if (!current.includes(`\n${line}\n`) && !current.startsWith(`${line}\n`) && current !== `${line}\n`) {
-			await appendFile(gitignore, `${line}\n`, "utf8");
-			report.appended.push(`.gitignore: ${line}`);
-		}
-	}
+	// .gitignore: ONE bounded ADR 04 hygiene block (idempotent, LF-delimited,
+	// newline-safe; existing comments/custom patterns preserved). Conflicts — a
+	// pre-existing .orch parent exclusion or an already-tracked private file —
+	// are reported, never repaired: init never touches the index or history.
+	const hygiene = await installProjectHygiene(root);
+	if (hygiene.installed) report.appended.push(".gitignore: llm-toolkit-001 hygiene block");
+	report.warnings.push(...hygiene.conflicts);
 
-	// Provenance marker.
-	const require = createRequire(import.meta.url);
-	const pkg = require("@earendil-works/pi-durable/package.json") as { version: string };
-	const kitVersionMarker = `kit=${KIT_VERSION} pi-durable=${pkg.version}\n`;
+	// Provenance marker: kit identity is the package version (config.ts reads
+	// package.json); the pi-durable side comes from the pinned seam, which owns
+	// every installed-version query.
+	const kitVersionMarker = `kit=${KIT_VERSION} pi-durable=${readInstalledPiDurableVersion()}\n`;
 	await writeFile(join(root, ".orch", "kit-version"), kitVersionMarker, "utf8");
 
 	return report;
@@ -113,12 +108,20 @@ function DEMO_PRD(projectName: string): string {
 	return `# PRD — demo queue (fixture)
 
 One paragraph of “what” for ${projectName}: a tiny list utility with three Tasks that
-exercise the loop (planner output → waves → gates → verifier).
+exercise the loop (planner output → waves → gates → verifier). This placeholder
+describes the examples/demo-prd fixture — init --with-demo writes guidance,
+not a baked project: the fixture's replay, its ONE recipe file and the
+reviewed gate script live in the kit repo and are copied by the demo builders.
 
 ## Tasks (guidance, the planner expands)
-1. list.ts — parseList + renderList with unit tests
-2. search filter — queryList with case-insensitive matching (deliberate test-fail first run in examples/demo-prd)
-3. CLI entry — bin that reads a file and prints the rendered list
+1. list.ts — parseList + renderList (parseList strips ONE leading dash per
+   token and keeps it: '/a/-b' → ['a','b'])
+2. query filter — queryList with case-insensitive matching (in examples/demo-prd
+   the FIRST scripted wave ships a case-sensitive filter that the behavioral
+   gate rejects; the wave-2 retry repairs it from the gate feedback — a retry
+   proven by behavior, not by a BROKEN token)
+3. CLI entry — bin that reads a text arg and prints the rendered list
+   (node bin/render.js '/a/-b' prints exactly "a b")
 
 ## Acceptance
 - Each above item: rendered as distinct RouterDoc tasks by the planner with targetPaths.

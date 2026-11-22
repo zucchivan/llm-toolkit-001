@@ -1,9 +1,15 @@
 node_modules/
 dist/
-.orch/durable.sqlite*
-.orch/lock
-.orch/status.json
-.orch/pending-handoff.json
-.orch/artifacts/
-.orch/config.toml
 repomix-output.xml
+
+# llm-toolkit-001 repository hygiene (ADR 04 three ownership classes), anchored
+# at this root: the kit dogfoods its own loop here. Reviewable kit controls
+# (.orch/config.toml, .orch/gate-decisions.json, .orch/gate-remediations.json)
+# stay committable; router.md and all other .orch state are the local paper
+# trail / private runtime and stay ignored by default. Root-anchored, so the
+# tracked config template at template/.orch/config.toml is unaffected.
+/.orch/*
+!/.orch/config.toml
+!/.orch/gate-decisions.json
+!/.orch/gate-remediations.json
+/router.md
