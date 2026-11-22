@@ -30,7 +30,6 @@ import { renderRouterMd, renderWaveLogJsonl } from "./infos.ts";
 import type { RouterTask, RouterDocValue, RunStatusDocValue, TaskStatus, WaveRow } from "./infos.ts";
 import {
 	estimateUsageUsd,
-	readInstalledPiDurableVersion,
 	roleRatesFor,
 	LoopGuardDoc,
 	UsageDoc,
@@ -44,7 +43,7 @@ import type {
 	Usage,
 } from "./harness.ts";
 import type { SessionState } from "./state.ts";
-import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
+import { BACKGROUND_CONTEXT, convId, readInstalledPiDurableVersion } from "./kit.ts";
 import type { Cursor, EntryRecord } from "./kit.ts";
 import type { CostRates } from "../util/budget.ts";
 import { usageUsd } from "../util/budget.ts";
@@ -306,6 +305,11 @@ export function liveFromPayload(payload?: StatusPayloads): KitLiveView | undefin
 export interface ReadoutOptions {
 	/** When absent, the readout degrades to side-cars only (storage untouched). */
 	loop?: LoopAndLock;
+	/**
+	 * Why the readout is side-car-only ("lock busy" vs "never run — no storage").
+	 * A view never opens storage it would have to create just to inspect.
+	 */
+	sidecarReason?: string;
 }
 
 /** Renderable sections of the inspect panel (positional filters on the CLI). */
@@ -327,9 +331,10 @@ export const CONV_ENTRY_TEXT_CAP = 4_096;
 // Entry point
 // ---------------------------------------------------------------------------
 
+/** `paths` is the host control root; task source and task diffs are never read from it here. */
 export async function readout(paths: ProjectPaths, opts: ReadoutOptions = {}): Promise<KitReadout> {
 	if (opts.loop) return storageReadout(paths, opts.loop);
-	return sidecarReadout(paths);
+	return sidecarReadout(paths, opts.sidecarReason);
 }
 
 /** The Harness/Session instance openProjectHarness hands out (a pi-durable Session). */
@@ -431,7 +436,7 @@ function sidecarDeliveryMode(root: string): string | undefined {
 	}
 }
 
-async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
+async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<KitReadout> {
 	const at = Date.now();
 	const payload = await readJson<StatusPayloads>(paths.status);
 	const rows = await readWaveLogRows(paths.waveLog);
@@ -466,7 +471,7 @@ async function sidecarReadout(paths: ProjectPaths): Promise<KitReadout> {
 		seam: 1,
 		live: liveFromPayload(payload),
 		degraded: true,
-		degradedReason: "storage is owned by another process — showing side-cars only",
+		degradedReason: reason ?? "storage is owned by another process — showing side-cars only",
 		identity: {
 			kit: payload?.kit ?? KIT_VERSION,
 			piDurable: payload?.piDurable ?? readInstalledPiDurableVersion(),
@@ -956,7 +961,7 @@ async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<He
 			// Fresh project: template placeholder bytes are expected — the engine syncs on the first commit.
 			checks.push({ id: "mirrors", ok: true, severity: "info", detail: "mirrors not written yet (no state committed; the engine syncs them on commit)" });
 		} else {
-			const expectedRouter = renderRouterMd(state.router.tasks, state.router.phase, state.runStatus.prdPath);
+			const expectedRouter = renderRouterMd(state.router.tasks, state.router.phase, state.runStatus.prdPath, state.router.identity, state.router.archived);
 			const expectedLog = renderWaveLogJsonl(state.rows);
 			const diskRouter = await readFile(paths.routerMd, "utf8").catch(() => undefined);
 			const diskLog = await readFile(paths.waveLog, "utf8").catch(() => undefined);

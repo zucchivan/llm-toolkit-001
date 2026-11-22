@@ -1,9 +1,9 @@
 /** Separately consented, read-only-baseline gate probe. */
-import { exec } from "../util/exec.ts";
-import type { ExecOutcome } from "../util/exec.ts";
-import { safeRecipeCwd } from "./discovery.ts";
+import { preflightRecipes, runRecipe } from "../engine/recipe-runner.ts";
+import type { ExecArgvCapability, RecipeRunOutcome } from "../engine/recipe-runner.ts";
+import { recipeCommandText, recipesFromBundle } from "../engine/gates.ts";
+import type { TaskExecutionContext } from "../engine/workspace.ts";
 import { inventoryGates } from "./gaps.ts";
-import type { RecipeSource } from "./types.ts";
 
 export interface ProbePrompt {
 	ask(question: string): Promise<string>;
@@ -23,8 +23,12 @@ export interface ProbeOptions {
 	prompt?: ProbePrompt;
 	/** Explicit non-interactive execution consent (`gates probe --yes`). */
 	confirmed?: boolean;
+	/** Same configured deadline as wave gates (`[gates] timeoutSec`). */
 	timeoutMs?: number;
-	execute?: (argv: readonly string[], inputs: { cwd: string; timeoutMs: number }) => Promise<ExecOutcome>;
+	/** Injected execArgv capability; defaults to the host runner (one runner for wave + probe). */
+	execute?: ExecArgvCapability;
+	/** Optional frozen, explicitly consented baseline; recipes and cwd come from this view. */
+	executionContext?: TaskExecutionContext;
 	output?: { log(message: string): void };
 }
 
@@ -33,19 +37,24 @@ export interface ProbeReport {
 	allPassed: boolean;
 	results: ProbeResult[];
 	messages: string[];
+	/** Set only when validation refused every command before any could start. */
+	errors?: string[];
 }
 
 /** Probe existing recipes without writing adoption files or hiding baseline failures. */
 export async function probeGates(root: string, options: ProbeOptions): Promise<ProbeReport> {
 	const messages: string[] = [];
 	const say = (message: string): void => { messages.push(message); options.output?.log(message); };
-	const recipes = inventoryGates(root).effective;
+	const context = options.executionContext;
+	if (context && context.controlPaths.root !== root) throw new Error("probe execution context does not match the explicitly selected project root");
+	const executionRoot = context?.frozenReadView.viewPath ?? root;
+	const recipes = context ? recipesFromBundle(context.recipeBundle) : inventoryGates(root).effective;
 	if (!recipes.length) {
 		say("No gate recipes to probe. Scope checking still runs during waves.");
 		return { consented: false, allPassed: true, results: [], messages };
 	}
 	say("Baseline probe executes each effective recipe sequentially (human duplicates override generated):");
-	for (const recipe of recipes) say(`  ${recipe.name}: ${recipe.cmd} [cwd ${recipe.cwd ?? "."}; source ${recipe.source}]`);
+	for (const recipe of recipes) say(`  ${recipe.name}: ${recipeCommandText(recipe)} [cwd ${recipe.cwd ?? "."}; source ${"source" in recipe ? recipe.source : "reviewed control snapshot"}]`);
 	say("This executes project commands but writes no adoption configuration. Failures are pre-existing baseline failures, not failures caused by refresh.");
 	if (!options.confirmed) {
 		if (!options.interactive) {
@@ -60,26 +69,35 @@ export async function probeGates(root: string, options: ProbeOptions): Promise<P
 		}
 	}
 
-	const execute = options.execute ?? exec;
+	// One runner for wave gates and probe: identical argv normalization, match
+	// semantics, caps and deadline handling. Invalid recipes fail BEFORE any
+	// command starts (never a partial baseline run).
+	const preflightErrors = preflightRecipes(executionRoot, recipes);
+	if (preflightErrors.length) {
+		for (const { name, error } of preflightErrors) say(`INVALID ${name}: ${error} — no command was started.`);
+		return { consented: false, allPassed: false, results: [], messages, errors: preflightErrors.map(({ error }) => error) };
+	}
+
 	const results: ProbeResult[] = [];
 	for (const recipe of recipes) {
-		const result = await probeRecipe(root, recipe, execute, options.timeoutMs ?? 120_000);
-		results.push(result);
-		say(`${result.passed ? "PASS" : "FAIL"} ${result.name} (exit ${result.exit ?? "spawn/timeout"}, cwd ${result.cwd})${result.tail ? `\n${result.tail}` : ""}`);
+		const outcome = await runRecipe(executionRoot, recipe, { timeoutMs: options.timeoutMs ?? 120_000, capability: context?.execArgv ?? options.execute });
+		results.push(probeResult(recipe, outcome));
+		const result = results[results.length - 1]!;
+		say(`${result.passed ? "PASS" : "FAIL"} ${result.name} (exit ${result.exit ?? "spawn/timeout"}${outcome.failure ? `, ${outcome.failure}` : ""}, cwd ${result.cwd})${outcome.reason ? ` — ${outcome.reason}` : ""}${result.tail ? `\n${result.tail}` : ""}`);
 	}
 	const allPassed = results.every((result) => result.passed);
 	say(allPassed ? "Baseline probe passed all effective recipes." : "Baseline probe found a pre-existing failure. Fix it before relying on the gate; refresh decisions and recipes were not changed.");
 	return { consented: true, allPassed, results, messages };
 }
 
-async function probeRecipe(root: string, recipe: RecipeSource, execute: NonNullable<ProbeOptions["execute"]>, timeoutMs: number): Promise<ProbeResult> {
-	const started = Date.now();
-	const argv = recipe.cmd.split(/\s+/);
-	const cwd = safeRecipeCwd(root, recipe.cwd ?? ".");
-	const outcome = await execute([argv[0]!, ...argv.slice(1)], { cwd, timeoutMs });
-	const matched = !recipe.match?.length || recipe.match.some((pattern) => new RegExp(pattern).test(outcome.stdout));
+/** Probe rows keep the recipe-relative cwd for display; the runner resolves it. */
+function probeResult(recipe: { cwd?: string }, outcome: RecipeRunOutcome): ProbeResult {
 	return {
-		name: recipe.name, passed: outcome.code === 0 && matched, exit: outcome.code,
-		tail: `${outcome.stdout}\n${outcome.stderr}`.trim().slice(-3000), cwd: recipe.cwd ?? ".", durationMs: Date.now() - started,
+		name: outcome.name,
+		passed: outcome.passed,
+		exit: outcome.exit,
+		tail: `${outcome.stdout}\n${outcome.stderr}`.trim().slice(-3000),
+		cwd: recipe.cwd ?? ".",
+		durationMs: outcome.durationMs,
 	};
 }

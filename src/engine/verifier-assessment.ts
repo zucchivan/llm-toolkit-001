@@ -28,6 +28,7 @@ export interface VerifierObservation {
 export interface VerifierEvidence {
 	task: VerifyTask;
 	diff: {
+		/** Pre-resolved input; task-context callers supply start-tree → candidate-tree only. */
 		stat: string;
 		files: string[];
 		patch: string;

@@ -11,6 +11,7 @@ import { LoopGuardDoc, estimateUsageUsd } from "./harness.ts";
 import type { LoopAndLock } from "./harness.ts";
 import type { RoleName } from "../config.ts";
 import type { CostRates } from "../util/budget.ts";
+import type { ExecutionContext } from "./workspace.ts";
 
 export interface WaveOutcome {
 	status: "done" | "unanswered";
@@ -33,6 +34,8 @@ export interface RoleSetup {
 	/** Set the model+thinking per role from config; absent: host default. */
 	model: { provider: string; modelId: string; thinkingLevel?: string };
 	maxTurns: number;
+	/** Internal host-created roots/grant descriptor; never a user-selected cwd. */
+	executionContext?: ExecutionContext;
 }
 
 export class ConversationKit {
@@ -47,6 +50,13 @@ export class ConversationKit {
 	 */
 	async createUnit(setup: RoleSetup): Promise<Conversation> {
 		const harness = this.kit.loop.harness;
+		const execution = setup.executionContext;
+		if (execution && execution.controlPaths.root !== this.kit.loop.paths.root) throw new Error("execution context control root does not match the open project harness");
+		const cwd = execution?.kind === "task-execution"
+			? setup.tools === "coding" ? execution.writableWorkspace.workspacePath : execution.frozenReadView.viewPath
+			: execution?.kind === "trusted-compatibility"
+				? setup.tools === "coding" ? execution.executionRoot : execution.readRoot
+				: this.kit.loop.paths.root;
 		const conv = await harness.createConversation(
 			{
 				ownership: { kind: "ownerless" },
@@ -55,13 +65,16 @@ export class ConversationKit {
 					thinkingLevel: (setup.model.thinkingLevel as "off" | "low" | "medium" | "high" | undefined) ?? undefined,
 					tools: setup.tools === "coding" ? [this.tools.read, this.tools.write, this.tools.edit, this.tools.bash] : [this.tools.read],
 					instructions: setup.instructions,
-					cwd: this.kit.loop.paths.root,
+					cwd,
 					maxTurns: setup.maxTurns,
 				},
 				init: async (tx, conversationId) => {
 					const doc = await tx.doc(LoopGuardDoc, conversationId);
 					doc.role = setup.guard.role;
 					doc.targetPaths = setup.guard.targetPaths;
+					if (execution?.kind === "task-execution") {
+						doc.execution = { planRevision: execution.grant.planRevision, taskId: execution.taskId, leaseId: execution.writableWorkspace.id };
+					}
 				},
 			},
 			BACKGROUND_CONTEXT,
