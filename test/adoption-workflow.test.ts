@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { refreshGates, type AdoptionPrompt } from "../src/adoption/workflow.ts";
+import { refreshGates, diffRecipes, serializeRecipes, type AdoptionPrompt } from "../src/adoption/workflow.ts";
 import { readJson } from "../src/util/fsx.ts";
 
 async function project(files: Record<string, string>): Promise<string> {
@@ -108,6 +108,26 @@ describe("gate adoption workflow", () => {
 		expect(quiet.messages.join("\n")).toContain("no open findings");
 		const stored = await readJson<any>(join(root, ".orch", "gate-decisions.json"));
 		expect(stored.decisions["unit-test"]).toMatchObject({ decision: "not-applicable", reason: "covered externally" });
+	});
+
+	it("compares recipes by canonical argv, so a legacy cmd decision equals its argv twin", async () => {
+		const cmdForm = { name: "unit-test", cmd: "npm test" };
+		const argvForm = { name: "unit-test", argv: ["npm", "test"] };
+		const diff = diffRecipes([cmdForm], [argvForm]);
+		expect(diff).toEqual({ additions: [], changes: [], removals: [] });
+		// A real difference in tokens is still a change.
+		const changed = diffRecipes([cmdForm], [{ name: "unit-test", argv: ["npm", "run", "test"] }]);
+		expect(changed.changes).toHaveLength(1);
+	});
+
+	it("serializes each command form canonically without re-quoting argv tokens", () => {
+		const text = serializeRecipes([
+			{ name: "unit-test", cmd: "npm test" },
+			{ name: "render-args", argv: ["node", "bin/render.js", "/a/-b", "a b", ""], cwd: "packages/web" },
+		]);
+		expect(text).toContain('cmd = "npm test"');
+		expect(text).toContain('argv = ["node","bin/render.js","/a/-b","a b",""]');
+		expect(text).toContain('cwd = "packages/web"');
 	});
 
 	it("shows refresh removals for approval instead of silently deleting stale gates", async () => {

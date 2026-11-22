@@ -1,5 +1,6 @@
 import type { JudgmentQuestion, JudgmentState } from "../judgment/types.ts";
 import { categoryForRecipe, findScript } from "./gaps.ts";
+import { recipeCommandText } from "../engine/gates.ts";
 import type {
 	DiscoveredPackage, GateCategory, GapReport, RecipeClassification, RecipeQualityAssessment,
 	RecipeSurfaceMatch, ScriptClassification, ShadowThresholds,
@@ -51,7 +52,7 @@ export function buildEvaluationPlan(report: GapReport, packages: readonly Discov
 	const state: JudgmentState = {
 		candidateScripts: candidateScripts.map(({ cwd, name, command }) => ({ cwd, name, command })),
 		recipes: recipes.map((recipe) => ({
-			name: recipe.name, command: recipe.cmd, cwd: recipe.cwd ?? ".", source: recipe.source,
+			name: recipe.name, command: recipeCommandText(recipe), cwd: recipe.cwd ?? ".", source: recipe.source,
 			deterministicCategory: recipe.category ?? null,
 		})),
 		findings,
@@ -87,7 +88,7 @@ export function buildEvaluationPlan(report: GapReport, packages: readonly Discov
 			criteria: CATEGORY_CRITERIA,
 		};
 		recipeTargets.push({
-			kind: "recipe", cwd: recipe.cwd ?? ".", name: recipe.name, command: recipe.cmd,
+			kind: "recipe", cwd: recipe.cwd ?? ".", name: recipe.name, command: recipeCommandText(recipe),
 			status: "unknown", categoryAnswerId,
 		});
 	});

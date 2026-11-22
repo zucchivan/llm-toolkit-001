@@ -1,6 +1,7 @@
 /** Thin CLI adapter for the adoption modules; all policy lives behind their seams. */
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline/promises";
+import { loadConfig, DEFAULT_CONFIG } from "../config.ts";
 import { analyzeGaps } from "./gaps.ts";
 import { discoverProject } from "./discovery.ts";
 import { refreshGates } from "./workflow.ts";
@@ -74,14 +75,26 @@ export async function runGatesCommand(root: string, argv: string[], io: GatesCli
 			const result = await probeGates(root, {
 				interactive: io.interactive, prompt: io.ask ? { ask: io.ask } : undefined,
 				confirmed: values.yes === true, output: { log: io.log },
+				// M0-P07: the probe shares the wave gates' configured deadline.
+				timeoutMs: configuredProbeTimeoutMs(root),
 			});
-			return result.consented && !result.allPassed ? 1 : 0;
+			return result.errors?.length || (result.consented && !result.allPassed) ? 1 : 0;
 		}
 		io.error(gatesHelp());
 		return 1;
 	} catch (err) {
 		io.error(`gates ${subcommand} failed: ${(err as Error).message}`);
 		return 1;
+	}
+}
+
+/** Same configured timeout as wave gates: `[gates] timeoutSec` from the project
+ * config; projects without a config (probe on a bare checkout) use the default. */
+function configuredProbeTimeoutMs(root: string): number {
+	try {
+		return loadConfig(root).gates.timeoutSec * 1000;
+	} catch {
+		return DEFAULT_CONFIG.gates.timeoutSec * 1000;
 	}
 }
 

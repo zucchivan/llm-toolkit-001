@@ -1,6 +1,6 @@
 /** Deterministic, read-only project discovery. No discovered command is executed. */
 import { readdir, readFile } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import type {
 	CiEvidence,
 	DiscoveredPackage,
@@ -200,12 +200,10 @@ function isApiRoute(path: string): boolean {
 	return /(?:^|\/)(?:app|pages|src)\/api\//i.test(path) || /(?:^|\/)routes?\//i.test(path) && /\.[cm]?[jt]s$/i.test(path);
 }
 
-/** Resolve a recipe cwd without permitting an absolute or parent escape. */
-export function safeRecipeCwd(root: string, cwd = "."): string {
-	const absolute = resolve(root, cwd);
-	const rel = relative(root, absolute);
-	if (isAbsolute(cwd) || rel === ".." || rel.startsWith(`..${sep}`)) {
-		throw new Error(`recipe cwd must stay inside the project: ${cwd}`);
-	}
-	return absolute;
-}
+/** Resolve a recipe cwd without permitting an absolute or parent escape.
+ *
+ * M0-P07: the ONE canonical validator lives with the shared runner
+ * (`engine/recipe-runner.ts`) and additionally rejects real-path escapes —
+ * a symlink inside the project pointing outside it refuses before any spawn.
+ * Re-exported here for the adoption modules. */
+export { safeRecipeCwdReal as safeRecipeCwd } from "../engine/recipe-runner.ts";

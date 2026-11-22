@@ -1,6 +1,7 @@
 /** Evidence-based gate inventory and cross-cutting coverage analysis. */
 import { createHash } from "node:crypto";
-import { loadRecipeFile } from "../engine/gates.ts";
+import { loadRecipeFile, recipeCommandText, recipesEquivalent } from "../engine/gates.ts";
+import { isSimpleCommand } from "../engine/recipe-runner.ts";
 import type { Recipe } from "../engine/gates.ts";
 import { discoverProject } from "./discovery.ts";
 import type {
@@ -94,7 +95,7 @@ export async function analyzeGaps(root: string, discovery?: ProjectDiscovery, de
 		const previous = decisions?.decisions[finding.id];
 		if (!previous) continue;
 		const generatedDrift = previous.decision === "accepted" && previous.recipe !== undefined
-			&& !inventory.generated.some((recipe) => sameRecipe(recipe, previous.recipe!));
+			&& !inventory.generated.some((recipe) => recipesEquivalent(recipe, previous.recipe!));
 		if (previous.fingerprint === findingFingerprint(finding) && !generatedDrift) continue;
 		// Newly covered findings close quietly. Disappearance to N/A only needs
 		// review when a previously accepted generated recipe may now be stale.
@@ -109,7 +110,7 @@ function addScriptFinding(findings: GateFinding[], inventory: GateInventory, dis
 	if (findings.some((finding) => finding.id === id)) return;
 	const expectedCmd = scriptCommand(discovery.packageManager, script);
 	const covered = inventory.effective.some((recipe) => recipe.category === category && sameCwd(recipe.cwd, cwd)
-		&& (recipe.source === "human" || recipe.cmd === expectedCmd));
+		&& (recipe.source === "human" || recipeCommandText(recipe) === expectedCmd));
 	const rootCovered = cwd !== "." && inventory.effective.some((recipe) => recipe.category === category && sameCwd(recipe.cwd, "."));
 	const recommendation = covered ? undefined : { name: recipeName(category, cwd), cmd: expectedCmd, ...(cwd === "." ? {} : { cwd }) };
 	findings.push({
@@ -172,7 +173,7 @@ function addCiFindings(findings: GateFinding[], inventory: GateInventory, discov
 			const script = ciScriptName(command);
 			const id = `ci-parity:${slug(script)}`;
 			if (findings.some((finding) => finding.id === id)) continue;
-			const covered = inventory.effective.some((recipe) => sameCwd(recipe.cwd, ".") && recipe.cmd === command);
+			const covered = inventory.effective.some((recipe) => sameCwd(recipe.cwd, ".") && recipeCommandText(recipe) === command);
 			findings.push({
 				id, category: "ci-parity", cwd: ".", title: `CI parity: ${command}`, why: WHY["ci-parity"],
 				status: covered ? "covered" : "present-but-unwired", evidence: [{ path: ci.path, detail: `literal CI run command: ${command}` }],
@@ -243,7 +244,7 @@ function scriptCommand(manager: ProjectDiscovery["packageManager"], script: stri
 }
 
 export function categoryForRecipe(recipe: Recipe): GateCategory | undefined {
-	const value = `${recipe.name} ${recipe.cmd}`.toLowerCase();
+	const value = `${recipe.name} ${recipeCommandText(recipe)}`.toLowerCase();
 	if (/a11y|accessibility|axe|pa11y/.test(value)) return "accessibility";
 	if (/e2e|playwright|cypress/.test(value)) return "e2e";
 	if (/integration|test:api|api:test/.test(value)) return "api-integration";
@@ -259,12 +260,6 @@ export function categoryForRecipe(recipe: Recipe): GateCategory | undefined {
 
 function sameCwd(a: string | undefined, b: string): boolean {
 	return (a ?? ".") === b;
-}
-
-function sameRecipe(a: Recipe, b: Recipe): boolean {
-	return a.name === b.name && a.cmd === b.cmd && a.cwd === b.cwd
-		&& JSON.stringify(a.match ?? []) === JSON.stringify(b.match ?? [])
-		&& JSON.stringify(a.on ?? []) === JSON.stringify(b.on ?? []);
 }
 
 function isPackageSurface(discovery: ProjectDiscovery, pkg: DiscoveredPackage): boolean {
@@ -292,8 +287,12 @@ function categoryLabel(category: GateCategory): string {
 }
 
 function safeCiCommand(command: string): boolean {
+	// M0-P07: only commands that can load as a legacy cmd-form recipe (no shell
+	// quoting/pipes/expansions) are recommended for generation; non-simple CI
+	// evidence stays a reportable finding, not an unloadable generated recipe.
 	return /^(?:npm (?:test|run [a-zA-Z0-9:_-]+)|pnpm (?:test|run [a-zA-Z0-9:_-]+)|yarn (?:test|run [a-zA-Z0-9:_-]+|[a-zA-Z0-9:_-]+)|bun (?:test|run [a-zA-Z0-9:_-]+))(?:\s+--\s+.*)?$/.test(command)
-		&& !/(?:^|\s)(?:ci|install|add|remove|exec|dlx)(?:\s|$)/.test(command);
+		&& !/(?:^|\s)(?:ci|install|add|remove|exec|dlx)(?:\s|$)/.test(command)
+		&& isSimpleCommand(command);
 }
 
 function ciScriptName(command: string): string {

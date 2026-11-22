@@ -1,11 +1,37 @@
-# Deterministic gate recipes. Zero exit and every optional `match` regex on stdout ⇒ pass.
+# Deterministic gate recipes. Zero exit, ALL optional `match` regexes matching
+# stdout, and a clean (non-terminated, non-aborted) run ⇒ pass.
+#
+# Every recipe sets EXACTLY ONE command form:
+#   cmd  = "npm run check"      # legacy simple form: trimmed and split on
+#                               # whitespace ONLY. Quotes, $/backtick
+#                               # expansions, globs, pipes, redirections and
+#                               # other shell operators are REFUSED with a
+#                               # pointer at argv — recipes run without a shell.
+#   argv = ["node", "bin/render.js", "/a/-b"]
+#                               # literal tokens: spaces, empty values and
+#                               # metacharacters are data, passed through
+#                               # verbatim (1–128 tokens, non-empty executable,
+#                               # no NUL, ≤32 KiB total).
+#
+# `match` rules:
+#   - ALL listed regexes must match the captured stdout (an empty list is
+#     vacuously true); a single failing or invalid pattern fails the recipe.
+#   - stderr is never matched.
+#   - stdout beyond the 256 KiB capture cap with `match` present fails the
+#     recipe (output_capped) instead of proving a whole-stream expression on a
+#     truncated tail.
+#   - matching runs in a bounded worker under the remaining recipe deadline; a
+#     pathological regex fails its check instead of blocking the run.
+#
 # `on` = path prefixes/globs that skip the recipe when untouched by the wave.
-# Start with NO shell gates (scope check only) and add what your project needs.
+# Optional `cwd` is a project-relative directory, useful for npm workspaces; it
+# must stay inside the project (symlink escapes refuse before any command).
+#
 # `gates refresh` can discover existing checks and, only after human approval,
 # write evals/recipes.auto.toml. This human-owned file is never rewritten;
 # same-named recipes here override generated entries. `gates probe` is the
-# separate baseline-execution consent step.
-# Optional `cwd` is a project-relative directory, useful for npm workspaces.
+# separate baseline-execution consent step and shares this file's deadline
+# (`[gates] timeoutSec`) and runner with wave gates.
 
 # [lint]
 # cmd = "npm run lint"
@@ -24,3 +50,11 @@
 # [workspace-unit-test]
 # cmd = "npm test"
 # cwd = "packages/web"
+
+# Spaced/literal-argument example (M0-P07). Every token below reaches the
+# process EXACTLY as written — `"a b"` is one argument containing a space, `""`
+# is one empty argument, and `/a/-b` is a literal token with slashes and a dash;
+# no shell is involved. Every `match` regex must match the captured stdout.
+# [render-args]
+# argv = ["node", "bin/render.js", "/a/-b", "a b", ""]
+# match = ["a b"]

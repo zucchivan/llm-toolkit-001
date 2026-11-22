@@ -1,6 +1,5 @@
 import type { Recipe } from "../engine/gates.ts";
 import type { JudgmentAnswer, JudgmentQuestion, JudgmentState, JudgmentTokenUsage } from "../judgment/types.ts";
-
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 export type SurfaceKind = "web" | "api" | "cli" | "publishable-package" | "migrations" | "e2e" | "accessibility";
 export type GateCategory =
@@ -59,11 +58,14 @@ export interface ProjectDiscovery {
 	warnings: string[];
 }
 
-export interface RecipeSource extends Recipe {
+/** §3 RecipeSource: an intersection with the one-command-form Recipe union —
+ * an interface cannot extend a union, and the canonical form comparison lives
+ * in `engine/gates.ts` (`recipesEquivalent`). */
+export type RecipeSource = Recipe & {
 	source: "human" | "generated";
 	file: string;
 	category?: GateCategory;
-}
+};
 
 export interface GateInventory {
 	human: RecipeSource[];
