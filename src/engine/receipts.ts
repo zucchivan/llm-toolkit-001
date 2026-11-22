@@ -1,12 +1,11 @@
 /**
  * Receipts (M0-P11, §3 transition protocol): the `loop.receipts` session doc —
  * a tagged union of durable observations recorded with the Router/Run mutation
- * they authorize, each with a stable operation ID and timestamp. P11 introduces
- * the GATE and PASS events: a gate receipt binds the checked tree and its
- * per-check outcomes; a pass receipt binds one read-only verifier pass
- * (criteria, effective verdict, policy) to that gate receipt and candidate.
- * Later packets extend the union (acceptance/intent/rollback/delivery/
- * resolution/checkpoint); the payload shape is additive per kind.
+ * they authorize, each with a stable operation ID and timestamp. P11 adds GATE
+ * and PASS events; P12 adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY
+ * journal events with stable per-stage keys, attempt ordinals, and latest
+ * pointers. P11 event shapes remain unchanged; later packets may add
+ * resolution/checkpoint kinds additively.
  *
  * Bindings: receipts reference the candidate (checked tree), the gate receipt,
  * the effective verification policy, and the plan's reviewed controls digest.
@@ -76,12 +75,123 @@ export type PassReceipt = WaveKey & {
 	review: ReviewPass;
 };
 
-/** P11 union: gate + pass. Later receipt packets extend this union. */
+/** Acceptance decision about one exact checked candidate (§3 transition 4). */
+export type AcceptanceReceipt = WaveKey & {
+	id: string;
+	parent: string;
+	tree: string;
+	gateId: string;
+	controlsSha256?: string;
+	policy: VerifierPolicy;
+	required: ("primary" | "skeptic" | "human")[];
+	passes: ReviewPass[];
+	authority: "verifier" | "human";
+	at: number;
+	reason?: string;
+};
+
+/** Durable integration intent + the host's latest observation of its CAS. */
+export type IntegrationIntent = WaveKey & {
+	acceptedId: string;
+	parent: string;
+	candidate: string;
+	commit: string;
+	at: number;
+};
+export type IntegrationReceipt = IntegrationIntent & {
+	state: "pending" | "integrated" | "failed" | "unknown";
+	code?: string;
+};
+
+/** Workspace-disposal receipt; `leaseId` is a host-created workspace identity. */
+export type RollbackReceipt = WaveKey & {
+	id: string;
+	baseTree: string;
+	producedTree?: string;
+	state: "pending" | "discarded" | "failed" | "unknown";
+	checkedAt: number;
+	code?: string;
+	leaseId?: string;
+};
+
+/** Separates local/none acknowledgment from a confirmed local branch update. */
+export type DeliveryReceipt = WaveKey & {
+	id: string;
+	acceptedId: string;
+	commit: string;
+	mode: "none" | "commit" | "pr";
+	state: "not_requested" | "pending" | "published" | "failed" | "unknown";
+	ref?: string;
+	baseRef?: string;
+	prNumber?: number;
+	prUrl?: string;
+	checkedAt: number;
+	code?: string;
+};
+
+export type Resolution = WaveKey & { action: "retry" | "accept-tree"; reason: string; evidenceSha256?: string; tree?: string };
+export type Checkpoint = WaveKey & {
+	stage: "implement" | "gates" | "primary" | "skeptic" | "integrate" | "publish" | "rollback" | "terminal";
+	parent: string;
+	startTree: string;
+	candidate?: string;
+	conversationId?: number;
+	submissionKey?: string;
+	leaseId?: string;
+	grantedFeedbackIds: string[];
+};
+
+export type ReceiptPayloads = {
+	gate: GateReceipt;
+	pass: PassReceipt;
+	acceptance: AcceptanceReceipt;
+	integrate: IntegrationReceipt;
+	rollback: RollbackReceipt;
+	delivery: DeliveryReceipt;
+	resolution: Resolution;
+	checkpoint: Checkpoint;
+};
+
+/** The four mutable journal stages get an address and per-key attempt ordinal.
+ *  P11 gate/pass events intentionally retain their original wrapper shape. */
+export type JournalReceiptKind = "acceptance" | "integrate" | "rollback" | "delivery";
+export type JournalReceiptEvent = {
+	[K in JournalReceiptKind]: { kind: K; opId: string; at: number; key: string; ordinal: number; value: ReceiptPayloads[K] }
+}[JournalReceiptKind];
 export type ReceiptEvent =
 	| { kind: "gate"; opId: string; at: number; value: GateReceipt }
-	| { kind: "pass"; opId: string; at: number; value: PassReceipt };
+	| { kind: "pass"; opId: string; at: number; value: PassReceipt }
+	| JournalReceiptEvent;
 
-export type ReceiptsDocValue = { version: 1; events: ReceiptEvent[] };
+export type ReceiptStage = JournalReceiptKind;
+export type ReceiptIdentity = WaveKey & { stage: ReceiptStage };
+export type ReceiptLatest = { opId: string; ordinal: number };
+export type ReceiptsDocValue = { version: 1; events: ReceiptEvent[]; latest?: Record<string, ReceiptLatest> };
+
+const REVISION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TASK_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** Stable journal address: the key is independent of attempts and timestamps. */
+export function receiptKey(identity: ReceiptIdentity): string {
+	if (!REVISION_RE.test(identity.planRevision)) throw new Error("receipt key requires a lowercase planRevision UUIDv4");
+	if (!TASK_RE.test(identity.taskId)) throw new Error(`receipt key has an invalid task id ${JSON.stringify(identity.taskId)}`);
+	if (!Number.isSafeInteger(identity.wave) || identity.wave < 1) throw new Error("receipt key requires a positive safe-integer wave");
+	return `${identity.planRevision}/${identity.taskId}/${identity.wave}/${identity.stage}`;
+}
+
+/** Latest event by journal key, falling back to event history for pre-index docs. */
+export function latestJournalEvent(doc: ReceiptsDocValue, key: string): JournalReceiptEvent | undefined {
+	const pointer = doc.latest?.[key];
+	if (pointer) {
+		const event = doc.events.find((candidate): candidate is JournalReceiptEvent =>
+			"key" in candidate && candidate.opId === pointer.opId && candidate.key === key && candidate.ordinal === pointer.ordinal,
+		);
+		if (event) return event;
+	}
+	return doc.events
+		.filter((event): event is JournalReceiptEvent => "key" in event && event.key === key)
+		.sort((a, b) => b.ordinal - a.ordinal)[0];
+}
 
 export const ReceiptsDoc = defineDoc({
 	kind: "loop.receipts",
@@ -95,7 +205,7 @@ export const ReceiptsDoc = defineDoc({
 export function gateReceiptEvent(
 	waveKey: WaveKey,
 	value: { tree: string; controlsSha256?: string; checks: GateCheck[] },
-): ReceiptEvent {
+): Extract<ReceiptEvent, { kind: "gate" }> {
 	const id = randomUUID();
 	// Optional means omit: a plan without approved controls records no digest.
 	const receipt: GateReceipt = value.controlsSha256 === undefined
@@ -107,7 +217,7 @@ export function gateReceiptEvent(
 export function passReceiptEvent(
 	waveKey: WaveKey,
 	value: { tree: string; gateId: string; policy: VerifierPolicy; review: ReviewPass },
-): ReceiptEvent {
+): Extract<ReceiptEvent, { kind: "pass" }> {
 	const id = randomUUID();
 	const review: ReviewPass = value.review.conversationId === undefined
 		? { ...value.review, pass: value.review.pass, criteria: [...value.review.criteria] }

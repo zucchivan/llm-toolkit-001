@@ -5,10 +5,12 @@
  * and .orch/status.json (atomic cross-process status payload).
  */
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import { RouterDoc, RunStatusDoc, WaveLogDoc, syncSideCars, renderRouterMd } from "./infos.ts";
 import { ReceiptsDoc } from "./receipts.ts";
-import type { ReceiptEvent, ReceiptsDocValue } from "./receipts.ts";
+import { receiptKey } from "./receipts.ts";
+import type { JournalReceiptEvent, ReceiptEvent, ReceiptIdentity, ReceiptsDocValue } from "./receipts.ts";
 import type { ArchivedPlanRef, PlanIdentity } from "./plans.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
@@ -256,6 +258,11 @@ export async function approvalMirrorRefusal(loopAndLock: LoopAndLock, state: Ses
 	return undefined;
 }
 
+export type ReceiptAttempt = {
+	identity: ReceiptIdentity;
+	build: (meta: { key: string; ordinal: number; opId: string; at: number }) => JournalReceiptEvent;
+};
+
 export interface StateInput {
 	/** Mutate the RouterDoc draft inside the commit. Edits apply last. */
 	router?: RouterDocValue | ((d: ChordDraft<RouterDocValue>) => void);
@@ -265,6 +272,9 @@ export interface StateInput {
 	 *  the Router/Run mutation they authorize. An array APPENDS; a mutator gets
 	 *  the draft. Authoritative observations/intents ride one harness.commit. */
 	receipts?: ReceiptEvent[] | ((d: ChordDraft<ReceiptsDocValue>) => void);
+	/** Journal attempts: allocate per-key ordinals and update latest pointers
+	 *  inside the same harness transaction as any accompanying state changes. */
+	receiptAttempts?: ReceiptAttempt[];
 	/** Wave-log rows appended inside the commit (then mirrored to JSONL). */
 	rows?: WaveRow[];
 	/** What status.json should show after this commit. */
@@ -369,10 +379,30 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 				const wlDraft = await tx.doc(WaveLogDoc);
 				wlDraft.rows.push(...input.rows);
 			}
-			if (input.receipts) {
+			if (input.receipts || input.receiptAttempts?.length) {
 				const recDraft = await tx.doc(ReceiptsDoc);
-				if (typeof input.receipts === "function") input.receipts(recDraft);
-				else recDraft.events.push(...input.receipts);
+				if (input.receipts) {
+					if (typeof input.receipts === "function") input.receipts(recDraft);
+					else recDraft.events.push(...input.receipts);
+				}
+				if (input.receiptAttempts?.length) {
+					const latest = { ...(recDraft.latest ?? {}) };
+					for (const attempt of input.receiptAttempts) {
+						const key = receiptKey(attempt.identity);
+						const recordedOrdinal = recDraft.events.reduce((max, event) =>
+							"key" in event && event.key === key ? Math.max(max, event.ordinal) : max, 0);
+						const ordinal = Math.max(latest[key]?.ordinal ?? 0, recordedOrdinal) + 1;
+						const opId = randomUUID();
+						const at = Date.now();
+						const event = attempt.build({ key, ordinal, opId, at });
+						if (event.key !== key || event.ordinal !== ordinal || event.opId !== opId || event.at !== at) {
+							throw new Error("receipt attempt builder changed its allocated key, ordinal, operation id, or timestamp");
+						}
+						recDraft.events.push(event);
+						latest[key] = { opId, ordinal };
+					}
+					recDraft.latest = latest;
+				}
 			}
 		},
 		BACKGROUND_CONTEXT,

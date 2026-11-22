@@ -129,7 +129,8 @@ export type WaveRow = {
 	modelId?: string;
 	reason?: string;
 	/** M0-P11 (additive): the `loop.receipts` pass receipt id this verdict row
-	 *  was committed with. Absent on legacy rows and one-off diagnostic verifies. */
+	 *  was committed with. Journal-stage latest pointers live in ReceiptsDoc,
+	 *  not in display rows. Absent on legacy rows and diagnostic verifies. */
 	receipt?: string;
 }
 

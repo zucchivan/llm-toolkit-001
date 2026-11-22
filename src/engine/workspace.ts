@@ -275,6 +275,13 @@ export function fenceWorkspace(lease: TaskWorkspaceLease, controls: TaskControls
 	return token;
 }
 
+/** Validate the opaque host fence token and return its owned lease. */
+export function requireFencedWorkspace(fencedWorkspace: FencedWorkspace): TaskWorkspaceLease {
+	const authority = fenced.get(fencedWorkspace);
+	if (!authority) throw new Error("operation requires a workspace fence created by fenceWorkspace");
+	return fencedWorkspace.lease;
+}
+
 /**
  * Freeze a fenced workspace into a host-owned tree. Starts from the pinned
  * parent index, overlays only its projected delta, validates every delta path,
@@ -387,6 +394,18 @@ export async function materializeRead(treeSource: GitTreeSource, controls: TaskC
 	});
 	owned.set(view, data);
 	return view;
+}
+
+/** Observe the private directory behind a still-known opaque lease; never follows links. */
+export async function observeLease(ownedLease: OwnedLease): Promise<"present" | "absent"> {
+	const data = owned.get(ownedLease);
+	if (!data) throw new Error("lease observation requires a handle created by this workspace module");
+	const state = await privateWorkRoot(data.root);
+	assertInside(state, data.privateRoot);
+	const info = await lstat(data.privateRoot).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+	if (!info) return "absent";
+	if (info.isSymbolicLink() || !info.isDirectory()) throw new Error("owned lease path was replaced by a non-directory or symbolic link");
+	return "present";
 }
 
 /** Remove only an opaque lease created by this module; callers supply no path. */

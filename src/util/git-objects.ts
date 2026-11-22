@@ -15,6 +15,7 @@ export type GitTreeChange = {
 	before?: { mode: string; oid: GitOid };
 	after?: { mode: string; oid: GitOid };
 };
+export type GitCommit = { oid: GitOid; tree: GitOid; parents: GitOid[] };
 
 const OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_TEXT_OUTPUT = 64 * 1024 * 1024;
@@ -125,6 +126,72 @@ export async function resolveTree(root: string, oid: string): Promise<GitOid> {
 	assertGitOid(oid);
 	const tree = await gitText(root, ["rev-parse", "--verify", `${oid}^{tree}`]);
 	return assertGitOid(tree);
+}
+
+/** Read the immutable commit headers needed to validate lineage and tree identity. */
+export async function readCommit(root: string, oid: string): Promise<GitCommit> {
+	assertGitOid(oid);
+	const kind = await gitText(root, ["cat-file", "-t", oid], { timeoutMs: 15_000 });
+	if (kind !== "commit") throw new Error(`Git object ${oid} has type ${kind}, not commit`);
+	const raw = await gitText(root, ["cat-file", "-p", oid], { timeoutMs: 15_000 });
+	const header = raw.split("\n\n", 1)[0] ?? "";
+	const treeLine = header.split("\n").find((line) => line.startsWith("tree "));
+	if (!treeLine) throw new Error(`Git object ${oid} is not a commit with a tree header`);
+	const tree = assertGitOid(treeLine.slice(5));
+	const parents = header.split("\n").filter((line) => line.startsWith("parent ")).map((line) => assertGitOid(line.slice(7)));
+	return { oid, tree, parents };
+}
+
+/** Create a reproducible one-parent commit object; caller pins it before journaling intent. */
+export async function createCommitObject(root: string, tree: string, parent: string, message: string): Promise<GitOid> {
+	const checkedTree = assertGitOid(tree);
+	const checkedParent = assertGitOid(parent);
+	if (await resolveTree(root, checkedTree) !== checkedTree) throw new Error("candidate tree OID did not resolve exactly");
+	await readCommit(root, checkedParent);
+	if (message.includes("\0") || message.length > 2000) throw new Error("commit message is invalid or exceeds 2000 characters");
+	const oid = await gitText(root, ["commit-tree", checkedTree, "-p", checkedParent, "-m", message], {
+		timeoutMs: 30_000,
+		env: {
+			GIT_AUTHOR_NAME: "llm-toolkit-001",
+			GIT_AUTHOR_EMAIL: "loop@localhost",
+			GIT_COMMITTER_NAME: "llm-toolkit-001",
+			GIT_COMMITTER_EMAIL: "loop@localhost",
+			GIT_AUTHOR_DATE: "@0 +0000",
+			GIT_COMMITTER_DATE: "@0 +0000",
+		},
+	});
+	return assertGitOid(oid.trim());
+}
+
+/** Read one exact ref name; an absent ref is undefined, not an error. */
+export async function readRef(root: string, ref: string): Promise<GitOid | undefined> {
+	await gitBytes(root, ["check-ref-format", ref]);
+	const output = await gitText(root, ["for-each-ref", "--format=%(refname)%00%(objectname)", ref]);
+	for (const line of output.split("\n")) {
+		const [name, oid] = line.split("\0");
+		if (name === ref && oid) return assertGitOid(oid);
+	}
+	return undefined;
+}
+
+/** Compare-and-swap a ref; `expectedOld=null` means it must be absent. */
+export async function compareAndSwapRef(root: string, ref: string, newOid: string, expectedOld: string | null): Promise<boolean> {
+	const next = assertGitOid(newOid);
+	await gitBytes(root, ["check-ref-format", ref]);
+	const expected = expectedOld === null ? "0".repeat(next.length) : assertGitOid(expectedOld);
+	try {
+		await gitBytes(root, ["update-ref", ref, next, expected], { timeoutMs: 15_000 });
+		return true;
+	} catch {
+		return false; // caller MUST read back and distinguish conflict from command failure
+	}
+}
+
+/** True when any linked worktree currently has this local branch checked out. */
+export async function isBranchCheckedOut(root: string, ref: string): Promise<boolean> {
+	await gitBytes(root, ["check-ref-format", ref]);
+	const listing = await gitText(root, ["worktree", "list", "--porcelain"]);
+	return listing.split("\n").some((line) => line === `branch ${ref}`);
 }
 
 /** Recursive, NUL-delimited tree listing; path bytes must be valid UTF-8. */

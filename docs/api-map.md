@@ -113,7 +113,7 @@ These are host-side path and data-flow distinctions only. The injected literal r
 
 ## M0-P11 — criterion evidence + reviewed passes (`loop.receipts`)
 
-**`src/engine/receipts.ts`** introduces the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[]}`): a tagged union of durable observations, each with a stable operation id and timestamp. P11 records the GATE and PASS kinds; later packets extend the union (acceptance/integration/rollback/delivery/resolution/checkpoint). Events append through `commitState`'s `receipts` input, in the SAME harness commit as the Router/Run rows they authorize. Raw output/tails stay out of documents (the gate log and wave log carry them).
+**`src/engine/receipts.ts`** defines the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[], latest?: Record<key,{opId,ordinal}>}`). P11 records GATE and PASS; P12 additively adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY journal events. P12 event wrappers carry a stable `planRevision/taskId/wave/stage` key and a unique per-key attempt ordinal. `commitState({receiptAttempts})` allocates the ordinal, appends the event, and updates `latest` in the SAME harness commit as accompanying state changes. P11's gate/pass event shapes and `commitState({receipts})` behavior stay unchanged. Raw output/tails stay out of documents (the gate log and wave log carry them).
 
 - `GateReceipt` = wave key + `{id, tree, controlsSha256?, checks}`: the checked tree plus every `GateCheck` `{id, kind: scope|recipe, outcome: pass|fail|skip|error, exit, ms}` observed on it. The driver commits one per wave, including failed-gate waves. `controlsSha256` is absent when the plan has no approved control bundle (absent ≠ empty).
 - `PassReceipt` = wave key + `{id, tree, gateId, policy, review}`: one read-only pass — `ReviewPass = {pass: primary|skeptic|human, verdict, criteria: CriterionResult[], notes, conversationId?}` — bound to the candidate tree, the wave's gate receipt, and the effective verification policy (`always`/`never` from `[gates] skepticSecondPass`; `risk-v1` arrives with routing). Each pass is committed BEFORE the next pass is dispatched; the verdict row's additive `receipt` field carries the pass receipt id.
@@ -123,6 +123,33 @@ These are host-side path and data-flow distinctions only. The injected literal r
 **`src/engine/verifier.ts`** feeds the checked tree, gate receipt id and non-skipped outcomes to BOTH read-only passes independently; enforcement is symmetric (the skeptic previously had a completeness check the primary lacked). Malformed JSON and prose around the JSON object degrade to `needs_human` (one optional code fence is tolerated); reply criteria entries map 1:1 — malformed entries are preserved and refuse an approval, never silently filtered. A well-formed explicit `reject` stays reject without evidence. No skeptic dispatch happens after an invalid or nonapproving primary. The one-off `verify --task` diagnostic path passes no gate evidence (so no gate reference can be evidence) and records no wave-keyed pass receipts; it still writes its verdict rows.
 
 Prepared `runVerify({executionContext})` callers resolve the checked tree from the context's `candidateOid`; the trusted compatibility path (still the serial driver until P14) captures the wave content the gates inspected. `readout.seam` stays at 1; the new `receipt` WaveRow field is additive for v1 reads.
+
+## M0-P12 — integration journal + local publication (`src/engine/delivery.ts`)
+
+**Prepared host operations only; NOT driver-active before P14.** The existing serial driver's legacy `runDelivery` remains unchanged until cutover; callers must not infer that the P12 operations already govern ordinary `run`.
+
+- `acceptCandidate(kit, {planRevision,taskId,wave,parent,tree,policy,required})` requires the current grant to include the task, a matching gate receipt, and each required approving pass receipt. It revalidates every pass's criterion evidence against the checked tree, pins the candidate tree under `refs/kit/`, and journals an acceptance event. An identical already-recorded acceptance is idempotent; a different candidate/parent for the same wave is recovery-required.
+- `integrateAcceptedCandidate(kit, waveKey)` creates a deterministic one-parent commit from the accepted tree and exact recorded parent, pins it at `refs/kit/<revision>/integration-objects/<task>/<wave>/commit`, then commits the integration intent before CAS-updating `refs/kit/<revision>/accepted`. Replays reuse the pinned/recorded OID. The commit tree and sole parent are read back, and the accepted ref is read back before `integrated` is recorded.
+- `publishLocalResult(kit, waveKey, mode)` is local-only: `none` records `not_requested` after confirming the private accepted ref; it does not touch `refs/heads/`, HEAD, or the operator index. `commit` compare-and-swaps only `refs/heads/kit/<revision>/result`, from absent on the first task or the prior accepted commit later. It refuses a result branch checked out in any worktree. PR mode remains unsupported here; no network or `gh` call is made.
+- `discardCandidateWorkspace(kit, {fencedWorkspace,...})` only accepts the opaque token from `fenceWorkspace`. It records pending first and records `discarded` only after observing the private lease directory absent and `refs/kit/<revision>/accepted` unchanged. Disposal failure becomes `failed`; uncertain fence/ref observations become `unknown`. No UI patch is used for recovery.
+- `src/util/git-objects.ts` supplies checked commit read/create, ref read, compare-and-swap, and checked-out-branch observation. All Git operations address objects and named refs; none checks out a branch, stages files, restores the operator tree, or uses its index. Workspace-fence assertion is not OS containment.
+
+### Journal crash/replay contract
+
+| Stop point | Durable state / observed ref | Retry action |
+|---|---|---|
+| Before acceptance commit | No acceptance; candidate remains private | Revalidate gate/pass receipts and retry; no accepted outcome is inferred |
+| After integration commit is pinned, before intent commit | Stable private commit pin may exist; accepted ref stays at parent | Reuse/verify the deterministic pinned OID, then write intent |
+| After intent commit, before accepted-ref CAS | Latest integrate event is pending/unknown; accepted ref is parent | Reuse the exact recorded OID and retry the parent→commit CAS |
+| After accepted-ref CAS, before integrated receipt | Intent is pending/unknown; accepted ref reads the recorded commit | Verify commit type/tree/sole parent and ref; append integrated, never make a second commit |
+| CAS reads neither expected parent nor recorded commit | Journal records unknown; ref has a conflicting value | Stop with `RecoveryRequiredError`; do not overwrite/adopt the foreign ref |
+| Rollback interrupted before disposal | Pending/failed; workspace still present | Remain blocking; retry only while the host can present the owned fence token |
+| Rollback interrupted after disposal | Pending/unknown; directory is absent and accepted ref is unchanged | With the same valid fence token, re-observe both facts and append discarded; if the token/fence cannot be re-established, remain unknown and blocking |
+| Local branch CAS interrupted | Delivery pending/unknown; branch reads parent or recorded commit | Retry CAS only from expected parent; recorded commit is acknowledged by readback |
+| Local branch has a foreign value | Delivery unknown; branch is neither expected parent nor commit | Recovery-required; never force/update the foreign ref |
+| `none` acknowledgment | Delivery `not_requested`; only private accepted lineage changes | Return the detached result at `refs/kit/<revision>/accepted` |
+
+Local result refs: the private integration head is `refs/kit/<revision>/accepted`; immutable per-wave integration commits are pinned below `refs/kit/<revision>/integration-objects/`; commit mode publishes the named local branch `refs/heads/kit/<revision>/result`. For `none`, the operator may inspect the result with a separate `git worktree add --detach <new-dir> refs/kit/<revision>/accepted`; the prepared operation itself does not create that worktree. Test fault injection is exposed at every receipt-commit and ref/disposal effect boundary. Effect-receipt write failures propagate and leave a pending/unknown receipt for reconciliation; display-artifact writes remain best-effort.
 
 ## src/engine/harness.ts
 
@@ -346,11 +373,12 @@ Prepared `runVerify({executionContext})` callers resolve the checked tree from t
 
 ## src/engine/delivery.ts
 
-- `none` leaves changes in the operator's working tree. `commit` uses
-  `git add -A` + `git commit -m "<project>: <task> (wave <n>)"` on the
-  checked-out branch. `pr` optionally branches, commits, pushes, and calls
-  `gh pr create --fill` before returning to the previous branch; it requires
-  `--deliver` and never merges the PR
+- The production serial driver still calls the legacy `runDelivery` path until
+  M0-P14: its old `none`/`commit`/`pr` behavior is not the P12 guarantee and
+  must not be described as safe local publication. P12's prepared host APIs
+  are `acceptCandidate`, `integrateAcceptedCandidate`, `publishLocalResult`,
+  and `discardCandidateWorkspace` (contract and replay table above). They are
+  callable under the host lock but deliberately not wired into `waves.ts` yet.
 
 ## src/views/*.ts + src/cli.ts
 
