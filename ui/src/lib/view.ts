@@ -5,7 +5,7 @@
  */
 import type { ReadoutSnapshot, JobsPayload, RoleModelInfo } from "./api.ts";
 import type { JobRecord } from "../../server/jobs.ts";
-import type { KitTaskView, KitUsage, HealthCheck, ConvSummary, ConvEntryView, DeliveryRow, DeliveryView } from "../../../src/engine/inspector.ts";
+import type { KitReadout, KitTaskView, KitUsage, HealthCheck, ConvSummary, ConvEntryView, DeliveryRow, DeliveryView } from "../../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../../src/engine/infos.ts";
 import type { RoleName } from "../../../src/config.ts";
 
@@ -111,6 +111,57 @@ export function jobOutcome(exitCode: number | undefined): JobOutcome {
 	if (exitCode === 42) return "sleeping";
 	if (exitCode === 130) return "interrupted";
 	return "failed";
+}
+
+// ---------------------------------------------------------------------------
+// Run reporting (M0-P06, A.8): the CLI's exit code alone no longer names the
+// outcome. Exit 0 has TWO distinct CLI strings — "STATUS: COMPLETE" (whole
+// plan) vs "selection complete" (the granted subset only) — and whole-plan
+// completion is a durable router phase, never inferred from exit 0. Exit 2 is
+// a policy stop (quarantine/budget), not a crash. The UI maps the five
+// outcomes to plain words; a subset completion never reads as whole-plan
+// success.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whole-plan completion from DURABLE state: the router's complete phase (the
+ * engine records it only when every task is done) or, when the phase hasn't
+ * surfaced yet, every task done — quarantined is not done.
+ */
+export function wholePlanComplete(readout: Pick<KitReadout, "phase" | "tasks"> | undefined): boolean {
+	if (!readout) return false;
+	if (readout.phase === "complete") return true;
+	return readout.tasks.length > 0 && readout.tasks.every((t) => t.status === "done");
+}
+
+/** The plain-words job-end line for a run (severity + toast text); undefined → no toast. */
+export interface RunReportLine {
+	severity: "info" | "warn" | "error";
+	text: string;
+}
+
+/**
+ * The five-way run outcome (A.8): sleeping (42), interrupted (130),
+ * stopped-short (2), whole-plan complete and selection complete (both exit 0,
+ * told apart by the DURABLE phase/todo state — never by the exit code alone),
+ * plus the ordinary hard-failure bucket (1, anything else).
+ */
+export function runReportLine(
+	exitCode: number | undefined,
+	ctx: { planComplete: boolean; todoCount: number; reason?: string },
+): RunReportLine | undefined {
+	if (exitCode === undefined) return undefined;
+	if (exitCode === 42) return { severity: "warn", text: "run sleeping (exit 42) — provider reset; Resume reruns the loop without re-approval" };
+	if (exitCode === 130) return { severity: "warn", text: "run interrupted (exit 130) — durable state stays resumable" };
+	if (exitCode === 2) {
+		return { severity: "error", text: `run stopped short (exit 2) — a policy stop (quarantine/budget);${ctx.reason ? ` ${ctx.reason}` : " nothing auto-resumes"}` };
+	}
+	if (exitCode === 0) {
+		return ctx.planComplete
+			? { severity: "info", text: "run complete — STATUS: COMPLETE: every task in the plan is done (whole plan fulfilled)" }
+			: { severity: "info", text: `run finished — selection complete: the granted task(s) are fulfilled; ${ctx.todoCount} todo task(s) remain outside the grant` };
+	}
+	return { severity: "error", text: `run failed (exit ${exitCode}): ${ctx.reason ?? "see its log in the jobs panel"}` };
 }
 
 export function decideView(snapshot: ReadoutSnapshot | undefined, jobs: JobsPayload | undefined): ViewDecision {

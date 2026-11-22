@@ -6,9 +6,12 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/svelte";
 import ActionDialog from "../src/components/ActionDialog.svelte";
+import { describeRunRequest } from "../src/lib/dialog-requests.ts";
 import type { ActionRequest } from "../src/lib/actions-model.ts";
 
 afterEach(() => cleanup());
+
+const REV = "1b08d7ce-1111-4aaa-8bbb-cccccccccccc";
 
 describe("ActionDialog keyboard behavior (§10)", () => {
 	it("Escape cancels (closes) the dialog", async () => {
@@ -28,6 +31,19 @@ describe("ActionDialog keyboard behavior (§10)", () => {
 		expect(onConfirm).toHaveBeenCalledWith({ note: "", prd: undefined });
 		await fireEvent.click(screen.getByRole("button", { name: "cancel" }));
 		expect(onCancel).toHaveBeenCalledTimes(1);
+	});
+
+	it("M0-P06: the run dialog shows the captured revision echo and confirms the captured tuple request", async () => {
+		const onConfirm = vi.fn();
+		// the exact request ActionBar builds at open time (revision + tasks snapshot)
+		const request = describeRunRequest({ revision: REV, todoIds: ["a", "b"], selection: [], quarantinedCount: 1, withTasks: false });
+		render(ActionDialog, { request, models: undefined, configError: undefined, onConfirm, onCancel: () => {} });
+		const body = screen.getByRole("dialog").textContent ?? "";
+		expect(body).toContain(REV); // the revision echo (A.8) is visible BEFORE confirming
+		expect(body).toMatch(/all 2 todo task\(s\)/);
+		expect(body).toMatch(/1 already-quarantined task\(s\) will NOT run/);
+		await fireEvent.click(screen.getByRole("button", { name: "Approve & run (2)" }));
+		expect(onConfirm).toHaveBeenCalledTimes(1); // App maps this request to {run, approve, revision, tasks}
 	});
 
 	it("handoff: the note textarea reaches the confirm result; aria-label carries the title", async () => {

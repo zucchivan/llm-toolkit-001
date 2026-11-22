@@ -7,7 +7,7 @@
 	 * deferred to M5). Run again only when todo tasks remain.
 	 */
 	import type { ReadoutSnapshot, JobsPayload } from "../lib/api.ts";
-	import { deliveryReport } from "../lib/view.ts";
+	import { deliveryReport, wholePlanComplete } from "../lib/view.ts";
 	import { usd, msDuration, relativeAge } from "../lib/format.ts";
 	import type { JobRecord } from "../../server/jobs.ts";
 
@@ -39,13 +39,17 @@
 			.sort((a, b) => (b.endedAt ?? b.startedAt) - (a.endedAt ?? a.startedAt))[0] as JobRecord | undefined,
 	);
 	const exportable = $derived(readout.artifacts.some((a) => a.name.startsWith("report.")));
+	// M0-P06 (A.8): "complete" means WHOLE-PLAN completion — the durable router
+	// phase (every task done), never a subset run's exit 0. Anything else with
+	// terminal rows is stopped-short, named as such.
+	const planComplete = $derived(wholePlanComplete(readout));
 </script>
 
 <section class="panel">
 	<div class="panel-header">
 		<span>completion report</span>
 		<span class="badge ph-complete">
-			{#if quarantined.length}stopped short — {quarantined.length} quarantined{:else}complete{/if}
+			{#if planComplete}complete{:else if quarantined.length}stopped short — {quarantined.length} quarantined{:else}stopped short — todo tasks remain{/if}
 		</span>
 		{#if endedRun && endedRun.endedAt}
 			<span class="muted" style="font-size:11px">run ended {relativeAge(Math.max(0, now - endedRun.endedAt))} ago (exit {endedRun.exitCode ?? "?"})</span>

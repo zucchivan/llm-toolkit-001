@@ -7,7 +7,7 @@
 	import type { ReadoutSnapshot, JobsPayload } from "../lib/api.ts";
 	import { postAction, type ActionBody } from "../lib/api.ts";
 	import type { ActionRequest } from "../lib/actions-model.ts";
-	import { describeStopTarget, stopAcceptedLine } from "../lib/dialog-requests.ts";
+	import { describeRunRequest, describeStopTarget, stopAcceptedLine } from "../lib/dialog-requests.ts";
 	import type { RouterTask } from "../../../src/engine/infos.ts";
 
 	let { snapshot, jobs, selection = [], planTasks = undefined, request = () => {}, done = () => {}, error = () => {} }: {
@@ -38,7 +38,12 @@
 	const attachedStoppable = $derived(jobs.attached?.stop?.ok === true);
 
 	const canPlan = $derived(planJob === undefined && runJob === undefined);
-	const canRun = $derived(runJob === undefined && planJob === undefined && todoCount > 0 && !lockedBusy);
+	// M0-P06 (A.8): a run grant binds to the reviewed plan revision — visible
+	// only in storage mode with an identity-bearing plan. Without it the run
+	// actions are DISABLED (no identity, no approval), never mapped to run-all.
+	const runRevision = $derived(snapshot.readout.storage?.router.identity?.planRevision);
+	const todoIds = $derived(snapshot.readout.tasks.filter((t) => t.status === "todo").map((t) => t.id));
+	const canRun = $derived(runJob === undefined && planJob === undefined && todoCount > 0 && !lockedBusy && runRevision !== undefined);
 	const canStop = $derived(runJob !== undefined || planJob !== undefined || attachedStoppable);
 	const resumeReady = $derived(sleepBanner && !lockedBusy);
 	const selectedCount = $derived(selection.length);
@@ -61,16 +66,16 @@
 	}
 
 	function clickRun(withTasks: boolean): void {
-		const selectedMode = withTasks && selectedCount < todoCount;
-		const n = selectedMode ? selectedCount : todoCount;
-		request({
-			kind: selectedMode ? "run-selected" : "run-all",
-			title: quarantinedCount > 0 ? "Approve & run — with quarantined tasks in the graph" : "Approve & run",
-			body:
-				`waves run ${n === todoCount ? `all ${n} todo task(s)` : `only the selected ${n} task(s)`}, paying provider tokens until each passes or the budget/breakers stop it.` +
-				(quarantinedCount > 0 ? ` ${quarantinedCount} already-quarantined task(s) will NOT run (there is no retry-quarantined action in the loop).` : ""),
-			confirmLabel: `Approve & run (${n})`,
-		});
+		// M0-P06 (A.8): the {planRevision, selected} tuple is captured HERE, when
+		// the dialog opens — the confirmation binds to exactly what this dialog
+		// displays. A replan behind the open dialog leaves the request stale on
+		// purpose (the CLI refuses it under the lock); the live selection is
+		// never re-read at confirm time.
+		try {
+			request(describeRunRequest({ revision: runRevision, todoIds, selection, quarantinedCount, withTasks }));
+		} catch (err) {
+			error((err as Error).message);
+		}
 	}
 
 	function clickStop(): void {
@@ -81,7 +86,7 @@
 		request({
 			kind: "resume",
 			title: "Resume after provider-reset sleep",
-			body: "reruns `run` without --approve: this plan is already approved and the durable sleep task resumes where it stopped.",
+			body: "reruns bare `run` (no flags): it resumes the stored grant exactly — no new approval is sent, the granted revision and task set stay as approved.",
 			confirmLabel: "Resume run",
 		});
 	}
@@ -126,10 +131,10 @@
 	{#if sleepBanner}
 		<button class="btn resume" onclick={clickResume} disabled={!resumeReady} title="rerun after the provider-reset sleep (exit 42)">⏾ Resume</button>
 	{/if}
-	<button class="btn positive" onclick={() => clickRun(false)} disabled={!canRun} title="run all todo tasks with --approve">
+	<button class="btn positive" onclick={() => clickRun(false)} disabled={!canRun} title="run all todo tasks — approves exactly the reviewed plan revision and task set shown in the dialog">
 		Approve &amp; run{todoCount > 0 && canRun ? ` (${todoCount})` : ""}
 	</button>
-	<button class="btn" onclick={() => clickRun(true)} disabled={!canRunSelected} title="run only the selected todo tasks (--tasks)">Run selected</button>
+	<button class="btn" onclick={() => clickRun(true)} disabled={!canRunSelected} title="run only the selected todo tasks of the reviewed revision (--tasks per id)">Run selected</button>
 	<button
 		class="btn stop"
 		onclick={clickStop}

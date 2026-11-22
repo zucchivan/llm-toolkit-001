@@ -208,7 +208,10 @@ export async function fetchJobLog(id: string, lines = 200): Promise<{ lines: str
 
 export type ActionBody =
 	| { kind: "plan"; prd?: string }
-	| { kind: "run"; approve: true; tasks?: string[] }
+	/** M0-P06 (A.8): approvals are revision-qualified — the reviewed revision plus
+	 *  the explicit task tuple the dialog showed (repeated --tasks per id on the
+	 *  wire). No revision-less approve exists anymore. */
+	| { kind: "run"; approve: true; revision: string; tasks?: string[] }
 	| { kind: "run"; resume: true }
 	| { kind: "stop"; target?: "job" }
 	| { kind: "stop"; target: "attached"; pid: number }

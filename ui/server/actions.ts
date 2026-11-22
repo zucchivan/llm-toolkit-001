@@ -36,7 +36,7 @@ export type ActionKind = (typeof ACTION_KINDS)[number];
 
 const ACTION_FIELDS: Record<ActionKind, readonly string[]> = {
 	plan: ["kind", "prd"],
-	run: ["kind", "approve", "resume", "tasks"],
+	run: ["kind", "approve", "resume", "revision", "tasks"],
 	stop: ["kind", "target", "pid"],
 	handoff: ["kind", "note"],
 	verify: ["kind", "task"],
@@ -51,6 +51,12 @@ export interface ActionBody {
 	approve?: boolean;
 	/** run: resume after a rate-limit sleep (exit 42) without re-approving. */
 	resume?: boolean;
+	/**
+	 * run + approve: the reviewed plan revision (M0-P06, A.8) — REQUIRED; the CLI
+	 * refuses an approval that does not name the current plan revision, and this
+	 * server refuses the doomed POST before spawning (fail old clients closed).
+	 */
+	revision?: string;
 	/** run: explicit todo-task subset (--tasks, repeated flag). */
 	tasks?: string[];
 	/** handoff note (one CLI positional arg). */
@@ -108,6 +114,23 @@ export function validateAction(raw: unknown): Validation {
 			}
 			if (!approve && !resume) {
 				return { ok: false, status: 400, error: "there is no silent run — run needs approve: true (or resume: true after a sleep)" };
+			}
+			// M0-P06 (A.8): a new grant is revision-qualified — the CLI refuses
+			// `run --approve` without --revision, so this server refuses it first
+			// (fail old clients closed BEFORE a doomed job spawns).
+			if (approve) {
+				const revision = body["revision"];
+				if (typeof revision !== "string" || !revision.trim()) {
+					return { ok: false, status: 400, error: "approve: true needs revision: the plan revision the review dialog showed (the CLI refuses an approval that does not name the current plan revision)" };
+				}
+				const trimmed = revision.trim();
+				if (trimmed.length > 128 || /\s/.test(trimmed)) {
+					return { ok: false, status: 400, error: `revision must be one bare plan-revision token (≤128 chars, no whitespace), got ${JSON.stringify(trimmed.slice(0, 24))}…` };
+				}
+				out.revision = trimmed;
+			}
+			if (resume && body["tasks"] !== undefined) {
+				return { ok: false, status: 400, error: "resume takes no tasks — bare `run` resumes the stored grant exactly; a new/wider grant goes through approve: true with revision" };
 			}
 			out.approve = approve === true;
 			out.resume = resume === true;
@@ -242,13 +265,21 @@ export function buildArgv(resolved: CliResolution, body: ActionBody): string[] {
 	switch (body.kind) {
 		case "plan":
 			return [...base, "plan", ...(body.prd ? ["--prd", body.prd] : [])];
-		case "run":
+		case "run": {
+			// M0-P06 (A.8): a new grant names its revision and repeats --tasks per
+			// id (the exact reviewed tuple); bare `run` is ONLY the explicit resume.
+			// An approve without a revision must NEVER degrade into a bare (resume)
+			// argv — fail closed here; validation refuses it before this point.
+			if (body.approve && !body.revision) {
+				throw new Error("run argv refused: approve: true needs revision — a revision-less approval must not become a bare (resume) run");
+			}
 			return [
 				...base,
 				"run",
-				...(body.approve ? ["--approve"] : []),
+				...(body.approve ? ["--approve", "--revision", body.revision!] : []),
 				...(body.tasks ? body.tasks.flatMap((t) => ["--tasks", t]) : []),
 			];
+		}
 		case "verify":
 			return [...base, "verify", "--task", body.task!];
 		case "handoff":

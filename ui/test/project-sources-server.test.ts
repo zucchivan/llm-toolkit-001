@@ -64,12 +64,14 @@ describe("GET /api/project/sources (M5-a read-only viewers)", () => {
 		expect(payload.prompt.exists).toBe(true);
 		expect(payload.prompt.text).toBe(readFileSync(join(root, "PROMPT.md"), "utf8"));
 		expect(payload.prompt.text).toContain("RULES OF THE LOOP");
-		// recipes (M5-b): the demo's init scaffold is a commented starter — parses to zero
-		// recipes, which loadRecipes reports as a DEFINED empty-gates state (no parseError)
+		// recipes (M5-b): since M0-P08 the demo bake ships the fixture's ONE recipe
+		// file — the three behavioral gates, parsed cleanly (no parseError), raw
+		// and byte-identical to disk.
 		expect(payload.recipes.path).toBe("evals/recipes.toml");
 		expect(payload.recipes.exists).toBe(true);
 		expect(payload.recipes.parseError).toBeUndefined();
-		expect(payload.recipes.text).toContain("[lint]");
+		expect(payload.recipes.text).toBe(readFileSync(join(root, "evals", "recipes.toml"), "utf8"));
+		expect(payload.recipes.text).toContain("[gate-list]");
 	});
 
 	it("missing prd (configured path that doesn't exist): exists:false with the kind path reflected, config still fine", async () => {

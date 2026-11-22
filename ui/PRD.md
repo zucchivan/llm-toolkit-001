@@ -154,8 +154,8 @@ The UI exposes exactly these mutations. Every one maps to a CLI invocation
 | action | CLI equivalent | enabled when | notes |
 | --- | --- | --- | --- |
 | Plan | `plan [--prd path]` | no run active; router empty, or explicit replace confirmation | phase `planning` while it runs |
-| Approve & run | `run --approve` | router planned/running; no other run active | the human approval stamp |
-| Run selected | `run --approve --tasks <ids…>` | plan reviewed; selection non-empty | subset of `todo` tasks |
+| Approve & run | `run --approve --revision <uuid> --tasks <id>…` | router planned/running with a visible plan revision; no other run active | the human approval stamp: the exact `{planRevision, selected}` tuple the dialog displayed (M0-P06) |
+| Run selected | `run --approve --revision <uuid> --tasks <id>…` (checked ids only) | plan reviewed; selection non-empty; revision visible | subset of `todo` tasks; the same tuple rule — empty selection never becomes run-all |
 | Stop | SIGINT to the active job | a running UI job, or a terminal-started run whose §7.2.1 identity verification passes | graceful; state stays resumable (exit 130); exactly one re-verified signal |
 | Handoff | `handoff "<note>"` | always (atomic side-car, safe during a run) | queued for the next wave |
 | Verify | `verify --task <id>` | no run active; task has a baseline | one-off read-only check |
@@ -166,6 +166,15 @@ Guardrails:
 - No config, router, PRD, or delivery editing.
 - `run` always passes `--approve` from the Approve & run / Run selected
   buttons; there is no silent run.
+- **Revision-bound confirmation (M0-P06, A.8):** opening a run dialog
+  snapshots the displayed `{planRevision, selected ids}` tuple; confirming
+  sends exactly that tuple — `--revision` plus repeated `--tasks` per id —
+  and never re-reads the live selection. An empty selection or an absent
+  plan revision disables/rejects the action; there is no fallthrough to
+  run-all. Bare `run` (no flags) is sent ONLY by the explicit Resume path;
+  it resumes the stored grant and never carries a new approval. If the plan
+  is replanned behind an open dialog, the job uses the old revision and the
+  CLI refuses it under the lock.
 - Stop for a terminal-started run is offered only through the §7.2.1
   verification; an unverifiable holder is never signalled — the UI states the
   plain-words reason, and "stop it from its terminal" stands.
@@ -224,11 +233,14 @@ authoritative gate.
 - **Reattach:** on UI server start, scan job records; a job whose PID is alive
   is `running`, otherwise `stale` with its last exit code if recorded.
 - **Sleep:** exit code 42 is surfaced as a distinct `sleeping` state with
-  `sleepUntil` countdown when available, and a "Resume" action (= `run`, no
-  `--approve` needed if already stamped).
-- **Exit codes:** 0 complete/stopped-short, 42 sleeping, 1 error, 130
-  interrupted. The UI maps them to plain-language states; it never hides a
-  non-zero exit.
+  `sleepUntil` countdown when available, and a "Resume" action (= bare `run`:
+  it resumes the stored grant exactly; no new approval is ever sent).
+- **Exit codes (M0-P06, A.8):** 0 is TWO outcomes told apart by durable
+  state — whole-plan completion (the durable complete phase) vs "selection
+  complete" (the granted subset fulfilled; todo tasks remain); 2 is a policy
+  stop (quarantine/budget — stopped short, never success); 42 sleeping; 1
+  error; 130 interrupted. The UI never infers completion from exit 0 alone
+  and never presents a subset completion or an exit 2 as whole-plan success.
 
 ### 7.4 Diffs
 
@@ -267,8 +279,20 @@ authoritative gate.
   task): the stage-1 summary plus the A.5 bounded transcript excerpt
   (newest ≤ 2,000 entries, per-entry text capped, tool results collapsed;
   the caps state themselves in the drawer copy). Never a chat client.
-- The verifier only receives a diff stat + changed-file list from the engine;
-  the UI must not imply it saw the full patch.
+- The verifier receives the diff stat + changed-file list plus the checked
+  tree, the gate receipt id and the non-skipped gate outcomes; the UI must not
+  imply it saw the full patch or every file.
+- Approval requires per-criterion evidence on the checked tree (M0-P11): each
+  pass must mark every criterion pass and cite `{"kind":"gate","id":…}` (an
+  executed, non-scope, non-skipped passing gate) or `{"kind":"line","path":…,
+  "line":…}` (an existing line in a text blob of that tree). Missing, malformed,
+  duplicated, or unproven entries fail closed to `needs_human`; a well-formed
+  explicit `reject` stays reject. Each pass commits its `loop.receipts` pass
+  receipt before the next pass runs; verdict rows carry the additive `receipt`
+  id. The UI renders these as recorded verdicts — it never treats an approval
+  string count, an implementer status line, or a legacy row as conclusive
+  evidence, and it does not decide human resolutions (that stays with the
+  operator via the CLI).
 
 ### 7.6 Local operation — loopback default, opt-in LAN/Tailscale (C.1)
 
@@ -620,17 +644,23 @@ The acceptance recipe is ALSO a shipped feature: ui 0.10.0 made it the
 official demo mode — `llm-toolkit-ui --demo` (or `npm run demo` in `ui/`)
 performs exactly the bake below in a temp project, sets `KIT_FAUX=1` +
 `KIT_FAUX_SCRIPT=<baked>/smoke.replay` (an already-set script is honored),
-prints a DEMO banner with the baked path, and serves the UI over it. UI-side
-only — existing kit surface (`init`, the faux overlay, the fixture), no kit
-change, `readout.seam` stays 1. The raw recipe remains the documentation of
-what the mode does:
+prints a DEMO banner with the baked path, and serves the UI over it. Since
+M0-P08 the demo is falsifiable at runtime: the bake installs the fixture's ONE
+recipe file (three behavioral gates) and copies the reviewed gate bytes
+(`examples/demo-prd/smoke-gate.cjs`) to `evals/smoke-gate.cjs` for execution —
+`evals/` is a protected review control, so the executed assertion is not
+task-writable. UI-side only — existing kit surface (`init`, the faux overlay,
+the fixture), no kit change, `readout.seam` stays 1. The raw recipe remains
+the documentation of what the mode does:
 
 ```bash
 cp -r examples/demo-prd /tmp/demo && cd /tmp/demo
+cp examples/demo-prd/smoke-gate.cjs /tmp/demo/evals/   # demo setup: reviewed bytes → evals/
 npm i <kit repo>
 llm-toolkit-001 init . --with-demo
 # [roles.*] -> provider "faux", modelId kit-planner|kit-implementer|kit-verifier
-# evals/recipes.toml -> [broken-gate]\ncmd = "node smoke-gate.cjs"
+# evals/recipes.toml (shipped with the fixture) -> gate-list/gate-query/gate-cli
+#   → node evals/smoke-gate.cjs list|query|cli (behavioral: executes the product)
 git init -q && git add -A && git commit -qm base
 
 npm --prefix <kit repo>/ui install
@@ -643,19 +673,27 @@ Pass criteria:
 1. Plan completes; review shows the demo's tasks and dependencies.
 2. Approve & run starts a detached job; the current task/wave and elapsed time
    appear within 2s.
-3. Wave 1 fails its gate; feedback and the failed gate log are visible; wave 2
-   starts and fixes it; the run completes.
+3. Wave 1 fails its gate — the CASE-SENSITIVE `queryList` the scripted wave
+   ships is rejected by the executed `gate-query` (behavior, not a grep-able
+   token); feedback and the failed gate log are visible; wave 2 starts and
+   repairs it from the gate feedback; the run completes.
 4. The completed task's diff drawer shows the expected files and hunks; a
    quarantine (if exercised in a variant) shows its available patch and the
    current rollback claim, which is not an independently verified restore.
 5. Budget spent, waves, and health match `inspect --json`.
 6. Closing the browser does not kill the run; reopening the UI reattaches and
    shows the correct final state.
-7. Starting `run --approve` in a terminal while the UI is open shows the same
+7. Starting `run --approve --revision <uuid> --tasks <id>…` (the revision the
+   review shows) in a terminal while the UI is open shows the same
    live state with an "attached" badge; Stop is disabled until the §7.2.1
    identity check passes, then sends one verified SIGINT (exit 130,
-   resumable).
+   resumable). A terminal `run --approve` WITHOUT `--revision` is refused by
+   the CLI (exit 1) — the same fail-closed contract the UI's server guards.
 8. Export produces the same `.orch/artifacts/report.{json,html}` as the CLI.
+9. The demo is falsifiable: on the completed result the independent invocation
+   `node bin/render.js '/a/-b'` exits 0 and prints exactly `a b` (a missing
+   `renderList` export, a case-sensitive query or a wrong stdout fails the
+   corresponding executed gate — M0-P08; needs Node ≥ 23.6 for type-stripping).
 
 ### 15.3 Manual checks
 
@@ -767,7 +805,7 @@ together with the milestone that consumes it.
 | visual | dense dark operational dashboard |
 | alerts | in-page + tab-title badge |
 | browser notifications | shipped as an opt-in extension of the alerts surface (ui 0.10.0): a header toggle asks the browser's Notification permission (never on page load) and the UI keeps its own localStorage preference; a new failure row raises an OS notification only while the tab is hidden — the in-page toasts + tab-title badge stay the always-on channel |
-| demo mode | §15.2's no-API-keys acceptance recipe is a shipped feature, not just a runbook: `llm-toolkit-ui --demo` bakes `examples/demo-prd` into a temp project (faux roles, init scaffold, broken-gate recipe, git base commit), exports `KIT_FAUX=1` + the replay to its spawned jobs via env inheritance, and serves the UI over it with a stated-words banner (ui 0.10.0; UI-side only — no kit change, `readout.seam` stays 1) |
+| demo mode | §15.2's no-API-keys acceptance recipe is a shipped feature, not just a runbook: `llm-toolkit-ui --demo` bakes `examples/demo-prd` into a temp project (faux roles, init scaffold, the fixture's ONE recipe file wiring three behavioral gates to the reviewed gate bytes copied into `evals/`, git base commit), exports `KIT_FAUX=1` + the replay to its spawned jobs via env inheritance, and serves the UI over it with a stated-words banner (ui 0.10.0; behavioral-gate bake ui 0.12.0/M0-P08; UI-side only — no kit change, `readout.seam` stays 1) |
 | execution | vertical slices, walking skeleton first |
 | attached stop | verified single-SIGINT for terminal-started runs, shipped in M5-slice-3 (decision D6, 2026-11-08, §7.2.1): live pid + cwd + installed-entry argv match; a failed check is a stated reason and NO signal; never SIGTERM/KILL; Linux-only v1 — macOS needs the deferred status.json runner extra |
 | LAN/Tailscale access | shipped as the opt-in bind (`--host <addr>` / `KIT_UI_HOST`, default `127.0.0.1` unchanged, Appendix C.1): the SAME per-session token/cookie/same-origin model serves non-loopback peers — only the Host/Origin hostname gate widens, to any name that is this machine (interfaces incl. Tailscale, or a name resolving to one); no TLS by design — Tailscale's encrypted mesh is the supported remote path, a raw LAN is plaintext and the docs + startup banner say so in words (ui 0.9.1; kit untouched) |
@@ -906,19 +944,20 @@ drawer).
   wave-log format version bump, no delivery change (D3/D5 hold), no CLI
   output change, no new UI deps.
 
-### A.8 — Revision-bound control and observed outcomes (approved design scope; not shipped)
+### A.8 — Revision-bound control and observed outcomes (approved design scope; revision echo and exit 2 shipped by M0-P06, the rest not shipped)
 
-This amendment reserves design scope only. **None of these fields, CLI flags,
-exit codes, receipts, views, metrics, or launcher rules is implemented by this
-PRD edit.** Until the named activation packets land, current behavior remains
-as documented above: approval has no revision identity, run exit 0 can include
-stopped-short work, badges/diffs use projections and the working copy, cache
-metrics are absent, and the launcher uses its existing resolution chain.
+This amendment reserves design scope. **The revision echo/exact confirmation
+and the policy-stop exit 2 mapping are SHIPPED (M0-P06, ui 0.11.0)**; the
+remaining fields, CLI flags, exit codes, receipts, views, metrics, and
+launcher rules are not implemented. Until the named activation packets land,
+current behavior remains as documented above for them: badges/diffs use
+projections and the working copy, cache metrics are absent, and the launcher
+uses its existing resolution chain.
 
 | Reserved design item | Required behavior and activation |
 | --- | --- |
-| Revision echo and exact confirmation | M0-P04 adds a fresh `planRevision` to CLI/mirror output; M0-P05 makes new grants revision-qualified with an exact task set; M0-P06 snapshots the displayed `{planRevision, selected}` tuple when the dialog opens and confirms exactly that tuple. Empty selection or absent identity rejects/disables rather than becoming run-all. |
-| Policy-stop exit 2 | M0-P05 introduces CLI exit 2 for policy stops and distinguishes whole-plan from selection completion; M0-P06 maps it in jobs/UI. Exit 0 alone must not be presented as whole-plan success. |
+| Revision echo and exact confirmation | **SHIPPED (M0-P06, ui 0.11.0):** the UI snapshots the displayed `{planRevision, selected}` tuple when the dialog opens and confirms exactly that tuple (`run --approve --revision <uuid>` plus repeated `--tasks` per id). Empty selection or absent identity rejects/disables rather than becoming run-all; bare `run` is the explicit resume only; a replan behind an open dialog leaves the stale revision for the CLI to refuse under the lock. |
+| Policy-stop exit 2 | **SHIPPED (M0-P06, ui 0.11.0):** the UI maps CLI exit 2 to a "stopped short" policy-stop state (toast + job chip + report badge), distinguishes whole-plan completion (durable phase) from selection completion, and never presents exit 0 alone as whole-plan success. |
 | Receipt-based badges | M0-P11–M0-P14 establish the review/integration/recovery/publication evidence, and M0-P15 activates separate review, checks, workspace-recovery, and publication labels. Quarantined must not imply discarded/rolled back; review approval must not imply delivered. |
 | Checkpoint diff, not working-copy diff | M0-P14 freezes and addresses candidate checkpoints; M0-P15 switches the live view to the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists. Later operator-checkout edits are not task changes. |
 | Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
@@ -929,9 +968,12 @@ metrics are absent, and the launcher uses its existing resolution chain.
 package-only UI consumption require M4-P01's explicit Appendix A amendment and
 subsequent activation packets. A.8 does not approve those wire/package changes.
 
-A.8 also does not authorize revision grants, receipt generation, workspace
-isolation, sandboxing, a UI state writer, automatic merge, or any implementation
-before its owning packet.
+A.8 also does not authorize receipts, workspace isolation, sandboxing, a UI
+state writer, automatic merge, or any implementation before its owning packet.
+M0-P06's shipped rows stay exactly within that boundary: they read the plan
+identity the core readout already exposes (Appendix A seam, no new core reads)
+and spawn the same CLI argv a human types — no UI state writes, no
+resolution/delivery command.
 
 ## Appendix B — Detached job runner
 

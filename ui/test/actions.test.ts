@@ -34,7 +34,7 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 		const root = await rootWithConfig(goodConfig);
 		try {
 			expect(await configPreflight(root, { kind: "plan", prd: "docs/prd.md" })).toBeUndefined();
-			expect(await configPreflight(root, { kind: "run", approve: true })).toBeUndefined();
+			expect(await configPreflight(root, { kind: "run", approve: true, revision: "0f0f0f0f-0000-4000-8000-000000000000" })).toBeUndefined();
 			expect(await configPreflight(root, { kind: "verify", task: "t1" })).toBeUndefined();
 			expect(await configPreflight(root, { kind: "export" })).toBeUndefined(); // no models needed
 			expect(await configPreflight(root, { kind: "handoff", note: "n" })).toBeUndefined();
@@ -53,7 +53,7 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 
 			// the loader names the first role block it could not validate (planner);
 			// fixing it re-runs the preflight, which then names the next gap
-			const run = await configPreflight(noRoles, { kind: "run", approve: true });
+			const run = await configPreflight(noRoles, { kind: "run", approve: true, revision: "0f0f0f0f-0000-4000-8000-000000000000" });
 			expect(run!.missing).toEqual(["planner"]);
 			expect(run!.error).toMatch(/\[roles\.planner\]/);
 		} finally {
@@ -137,14 +137,29 @@ describe("action validation (allowlist, per-kind shapes)", () => {
 		expect(validateAction({ kind: "run", approve: true, resume: true })).toMatchObject({ ok: false, status: 400 });
 		expect((validateAction({ kind: "run", approve: true, resume: true }) as { error: string }).error).toMatch(/not both/);
 		expect(validateAction({ kind: "run", approve: true, resume: true })).toMatchObject({ ok: false, status: 400 });
-		expect(validateAction({ kind: "run", approve: true }).ok).toBe(true);
+		// M0-P06: an approval is revision-qualified — the revision-less stamp is
+		// refused server-side (fail old clients closed; the CLI would refuse it too)
+		expect(validateAction({ kind: "run", approve: true })).toMatchObject({ ok: false, status: 400 });
+		expect((validateAction({ kind: "run", approve: true }) as { error: string }).error).toMatch(/needs revision/);
+		expect(validateAction({ kind: "run", approve: true, revision: "" })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: "   " })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: "two tokens" })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: "r".repeat(129) })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: "0f0f0f0f-0000-4000-8000-000000000000" }).ok).toBe(true);
+	});
+
+	it("resume is bare: no tasks — the stored grant is never widened (M0-P06)", () => {
+		expect(validateAction({ kind: "run", resume: true, tasks: ["t1"] })).toMatchObject({ ok: false, status: 400 });
+		expect((validateAction({ kind: "run", resume: true, tasks: ["t1"] }) as { error: string }).error).toMatch(/resume takes no tasks/);
+		expect(validateAction({ kind: "run", resume: true }).ok).toBe(true);
 	});
 
 	it("run tasks: non-empty unique ids only", () => {
-		expect(validateAction({ kind: "run", approve: true, tasks: [] })).toMatchObject({ ok: false, status: 400 });
-		expect(validateAction({ kind: "run", approve: true, tasks: ["a", "a"] })).toMatchObject({ ok: false, status: 400 });
-		expect(validateAction({ kind: "run", approve: true, tasks: ["ok id"] })).toMatchObject({ ok: false, status: 400 });
-		expect(validateAction({ kind: "run", approve: true, tasks: ["t1", "t2"] }).ok).toBe(true);
+		const rev = "0f0f0f0f-0000-4000-8000-000000000000";
+		expect(validateAction({ kind: "run", approve: true, revision: rev, tasks: [] })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: rev, tasks: ["a", "a"] })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: rev, tasks: ["ok id"] })).toMatchObject({ ok: false, status: 400 });
+		expect(validateAction({ kind: "run", approve: true, revision: rev, tasks: ["t1", "t2"] }).ok).toBe(true);
 	});
 
 	it("handoff notes: non-empty, capped, dash-prefixed is refused (CLI would drop it)", () => {
@@ -166,10 +181,15 @@ describe("action validation (allowlist, per-kind shapes)", () => {
 describe("argv construction: CLI only via argv arrays, never a shell", () => {
 	it("maps kinds to the human-typed CLI flags", () => {
 		const cli = { argv: ["/kit/dist/cli.js"], via: "test" };
+		const rev = "0f0f0f0f-0000-4000-8000-000000000000";
 		expect(buildArgv(cli, { kind: "plan" })).toEqual(["/kit/dist/cli.js", "plan"]);
 		expect(buildArgv(cli, { kind: "plan", prd: "docs/prd.md" })).toEqual(["/kit/dist/cli.js", "plan", "--prd", "docs/prd.md"]);
-		expect(buildArgv(cli, { kind: "run", approve: true })).toEqual(["/kit/dist/cli.js", "run", "--approve"]);
-		expect(buildArgv(cli, { kind: "run", approve: true, tasks: ["t2", "t3"] })).toEqual(["/kit/dist/cli.js", "run", "--approve", "--tasks", "t2", "--tasks", "t3"]);
+		// M0-P06 (A.8): a grant carries --revision plus repeated --tasks per id
+		expect(() => buildArgv(cli, { kind: "run", approve: true })).toThrow(/needs revision/); // never degrades to a bare (resume) argv
+		expect(buildArgv(cli, { kind: "run", approve: true, revision: rev })).toEqual(["/kit/dist/cli.js", "run", "--approve", "--revision", rev]);
+		expect(buildArgv(cli, { kind: "run", approve: true, revision: rev })).toEqual(["/kit/dist/cli.js", "run", "--approve", "--revision", rev]);
+		expect(buildArgv(cli, { kind: "run", approve: true, revision: rev, tasks: ["t2", "t3"] })).toEqual(["/kit/dist/cli.js", "run", "--approve", "--revision", rev, "--tasks", "t2", "--tasks", "t3"]);
+		// bare `run` is ONLY the explicit resume path
 		expect(buildArgv(cli, { kind: "run", resume: true })).toEqual(["/kit/dist/cli.js", "run"]);
 		expect(buildArgv(cli, { kind: "verify", task: "t1" })).toEqual(["/kit/dist/cli.js", "verify", "--task", "t1"]);
 		expect(buildArgv(cli, { kind: "handoff", note: "keep the gate green" })).toEqual(["/kit/dist/cli.js", "handoff", "keep the gate green"]);
@@ -294,7 +314,7 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 			expect(job.exitCode).toBe(7);
 		}
 		// Now hold one open (stub run blocks until SIGINT) and check the one-mutation rule.
-		const holder = await startAction(baked.root, { kind: "run", approve: true });
+		const holder = await startAction(baked.root, { kind: "run", approve: true, revision: "0f0f0f0f-0000-4000-8000-000000000000" });
 		expect(holder.ok).toBe(true);
 		const second = await postAction(baked.base, baked.cookie, { kind: "plan" }, actionHeaders(baked.csrf));
 		expect(second.status).toBe(409);
@@ -311,7 +331,7 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 	});
 
 	it("handoff is allowed during a run (side-car write, no lock needed)", async () => {
-		const run = await startAction(baked.root, { kind: "run", approve: true });
+		const run = await startAction(baked.root, { kind: "run", approve: true, revision: "0f0f0f0f-0000-4000-8000-000000000000" });
 		expect(run.ok).toBe(true);
 		try {
 			const accept = await postAction(baked.base, baked.cookie, { kind: "handoff", note: "watch the gate" }, actionHeaders(baked.csrf));

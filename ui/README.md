@@ -55,15 +55,22 @@ already there; `readout.seam` stays 1), no new deps.
 
 ### Current limits and reserved A.8 design
 
-Appendix A.8 in `ui/PRD.md` is **approved design scope, not shipped behavior**.
-The current UI sends no plan revision, can interpret stopped-short exit 0 as
-completion, derives rollback/delivery labels from existing rows, and computes
-live diffs from the working copy. Cache metrics are not present. The reserved
-activations are M0-P04/P05/P06 for revision-bound confirmation and exit 2,
-M0-P11–P15 for receipts and checkpoint diffs, M2-P03/P04 for cache metrics,
-and M4-P04 for trusted installed-CLI resolution. Live-plan facts, `seam: 2`,
+Appendix A.8 in `ui/PRD.md` is **approved design scope**; its first two rows
+are **shipped as of 0.11.0 (M0-P06)**: run dialogs snapshot the displayed
+`{planRevision, selected ids}` tuple and confirm exactly that tuple
+(`run --approve --revision <uuid>` plus repeated `--tasks` per id — an empty
+selection or a missing revision disables/rejects instead of becoming
+run-all), bare `run` is sent only by the explicit Resume path (it resumes
+the stored grant; no new approval), and run outcomes are reported five ways
+— whole-plan complete (durable complete phase), selection complete (subset
+fulfilled; todo remains), stopped short (exit 2 policy stop), sleeping (42),
+interrupted (130) — so exit 0 alone is never read as whole-plan success.
+Still reserved and NOT implemented: receipt-based badges (rollback/delivery
+labels derive from existing rows) and checkpoint diffs (live diffs compute
+from the working copy) for M0-P11–P15, cache metrics for M2-P03/P04, and
+trusted installed-CLI resolution for M4-P04. Live-plan facts, `seam: 2`,
 and packaging/package-only consumption remain reserved for the separate
-M4-P01 amendment; none is implemented by this documentation change.
+M4-P01 amendment.
 
 What M1 adds on top of the M0 read (see the M0 list in the 0.1.0 CHANGELOG
 entry for the status strip / task table / event log / degradation basics):
@@ -71,8 +78,10 @@ entry for the status strip / task table / event log / degradation basics):
 - **Actions** — Plan, Approve & run, Run selected, Stop, Handoff, Verify,
   Export in one bar. Every run is a confirm-with-effect dialog (no silent
   run; plan replace is confirmed; approve with quarantined tasks says so).
-  Each action spawns the same CLI invocation a human would type — as a
-  detached job (Appendix B): the run survives browser AND UI-server death.
+  The run dialogs show the exact grant being approved — the reviewed plan
+  revision and the task set (M0-P06, A.8) — and each action spawns the same
+  CLI invocation a human would type — as a detached job (Appendix B): the
+  run survives browser AND UI-server death.
 - **Jobs list** — one row per record in `.orch/ui/jobs/` (kind, status chip,
   pid, age, log tail, stop). Terminal-started runs show as `attached · not
   launched here`; their row gains `stop (verified)` when the §7.2.1 identity
@@ -321,9 +330,13 @@ over it with the kit's faux provider replaying the fixture's scripted
 conversation — every model request is answered from `smoke.replay`, so you can
 click through Plan → review cards → Approve & run → diffs → completion report
 with zero provider credentials. What to expect: task `list-query` fails its
-gate on wave 1 (the driver resets the conversation) and wave 2 fixes it →
-`STATUS: COMPLETE`. That final implementer line is a nonbinding report, not by
-itself acceptance evidence or proof that the generated CLI behaves correctly.
+BEHAVIORAL gate on wave 1 (the fixture's executed gate-query rejects the
+case-sensitive `queryList` the scripted wave ships — M0-P08 made the demo
+falsifiable at runtime), the driver resets the conversation, and wave 2
+repairs it from the gate feedback → `STATUS: COMPLETE`. On the completed
+result the demo's outcome test holds: `node bin/render.js '/a/-b'` exits 0 and
+prints exactly `a b`. That final implementer STATUS line is still a nonbinding
+report — the executed gates, not the line, are the runtime evidence.
 The startup banner says all of this next to the URL, prints
 the baked project path (left in place for post-mortem — delete it any time),
 and an already-set `KIT_FAUX_SCRIPT` is honored, so `KIT_FAUX_SCRIPT=…/smoke-slow.replay

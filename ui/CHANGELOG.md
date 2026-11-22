@@ -4,6 +4,90 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.12.0 — M0-P08: the demo bake is falsifiable at runtime
+
+The demo mode's bake now installs the fixture's behavioral gates, so what the
+UI shows during `--demo` is proven by EXECUTION, not by file contents or task
+status. Pure bake/test/docs surface: no kit change (`readout.seam` stays 1;
+kit 0.2.3); no new deps; the UI still never writes state.
+
+- **The bake carries the fixture's ONE recipe file + the reviewed gate bytes**
+  — `bakeDemoProject` copies `examples/demo-prd/evals/recipes.toml`
+  (`gate-list` / `gate-query` / `gate-cli`, literal argv form invoking
+  `node evals/smoke-gate.cjs list|query|cli`) with the fixture, and copies the
+  REVIEWED gate bytes (the fixture's top-level `smoke-gate.cjs`, the single
+  copy source — no duplicate hand-maintained implementation) to
+  `evals/smoke-gate.cjs` for execution. `evals/` is a protected review control,
+  so the executed assertion is not task-writable. The hand-written
+  `[broken-gate]` recipe is gone.
+- **The demo arc is behavioral** — task 2's first scripted wave ships a
+  CASE-SENSITIVE `queryList` that the executed gate-query rejects; wave 2
+  repairs it from the gate feedback (a retry proven by behavior, not by a
+  BROKEN token), and on the completed result the independent
+  `node bin/render.js '/a/-b'` invocation exits 0 printing exactly `a b`
+  (the demo requires Node ≥ 23.6: the product's `src/*.ts` modules run through
+  Node's default TypeScript type-stripping).
+- **Demo tests ride the same fixture** — `ui/test/helpers.ts` re-exports the
+  kit's `installDemoGates` so `e2e-real-cli` installs the same recipe file +
+  gate bytes as the core demo paths; its live-diff/stop tests add their
+  stall recipe via `evals/recipes.auto.toml` (generated layer, real
+  precedence). `demo-mode` asserts the three gates and the byte-identical
+  gate copy.
+- **Validation** — ui `npm test`, `typecheck`, `check`, `test:e2e` (through
+  the REAL CLI with the behavioral gates); PRD §15.2/Appendix row + README
+  bookkeeping.
+
+## 0.11.0 — M0-P06: revision-bound confirmation and five-way run reporting (A.8 activation)
+
+The first two A.8 reservations ship. The UI now approves exactly what the
+human reviewed: the `{planRevision, selected ids}` tuple is captured when a
+run dialog OPENS and confirmed verbatim — no live-selection re-read, no
+fallthrough to run-all — against the M0-P05 revision-qualified CLI. Pure UI +
+spawn surface: no kit change (`readout.seam` stays 1; kit 0.2.3); no new
+deps; the UI still never writes state (it spawns the same CLI argv a human
+types, and the refusal of stale/invalid tuples happens in the CLI under the
+lock).
+
+- **Tuple captured at open** — Approve & run / Run selected dialogs embed the
+  CURRENT plan revision (from the readout's durable router identity, storage
+  mode) plus the exact task ids at open time (all todo ids, or the checked
+  subset narrowed to ids still todo). The dialog body echoes the revision and
+  the count; confirming maps the captured tuple to
+  `{kind: "run", approve: true, revision, tasks}` →
+  `run --approve --revision <uuid> --tasks <id>…` (repeated flag per id).
+  A replan behind an open dialog leaves the request stale ON PURPOSE — the
+  CLI refuses the old revision under the lock; the UI never silently re-aims
+  at the new plan.
+- **Empty/absent is refused, never widened** — an empty selection, a
+  selection that narrows to nothing, or an absent plan revision (legacy
+  plan, sidecars-only read) disables the run buttons and — as a backstop —
+  rejects the request at open AND at confirm with a plain-words toast.
+  Bare `run` is sent ONLY by the explicit Resume path (it resumes the stored
+  grant; resume requests carrying tasks are refused 400 server-side).
+- **Server fails old clients closed** — `POST /api/actions` refuses
+  `approve: true` without `revision` (400, before any job spawns — the CLI
+  would refuse it too), non-token revisions (whitespace, >128 chars), and
+  `resume` + `tasks`. `buildArgv` additionally refuses to mint a
+  revision-less approve argv (it must never degrade into a bare resume run).
+- **Five-way run reporting (A.8)** — whole-plan completion is read from the
+  DURABLE router complete phase (or every task done), never from exit 0
+  alone: exit 0 with todo tasks remaining reports "selection complete — the
+  granted task(s) are fulfilled; N todo task(s) remain outside the grant",
+  while whole-plan completion names "STATUS: COMPLETE". Exit 2 is a
+  "stopped short" policy stop (toast + jobs-panel chip + completion-report
+  badge), distinct from hard failures (exit 1/other); 42 sleeping and 130
+  interrupted keep their dedicated states. The completion report's badge
+  says "complete" only for whole-plan fulfillment — quarantined or remaining
+  todo is "stopped short", never success.
+- **Stub CLI mirrors the contract** — `ui/test/stub-cli.mjs` refuses
+  `run --approve` without `--revision` (exit 1) and answers a bare `run` as
+  the resume path, so server tests exercise the real fail-closed shape.
+- **Validation** — ui `npm test` (278 passed/4 skipped), `typecheck`,
+  `check` (0/0), `test:e2e` (4/4 through the REAL CLI with revision-qualified
+  approvals, including the terminal-spawned attached-stop run); root
+  `npm test` (23 files/143 tests) + `npm run typecheck` + `npm run build`.
+  PRD §7.2/§7.3/§15.2/A.8 + README bookkeeping.
+
 ## 0.10.0 — §18: browser notifications (opt-in Notification API)
 
 The third §18 menu item shipped; an agent pick, not an owner pick — the

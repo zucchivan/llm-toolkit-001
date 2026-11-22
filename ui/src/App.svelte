@@ -6,7 +6,7 @@
 	 * replaces on each snapshot.
 	 */
 	import { fetchReadout, fetchJobs, postAction, type ReadoutSnapshot, type JobsPayload, type ActionBody } from "./lib/api.ts";
-	import { decideView, jobOutcome, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, hashConversationDrawer, isConversationListHash, conversationById, firstFailureLine, type FailureRow } from "./lib/view.ts";
+	import { decideView, jobOutcome, wholePlanComplete, runReportLine, failureRows, diffDrawerState, latestDiffTask, globalShortcut, escapeTarget, hashDiffTask, hashConversationDrawer, isConversationListHash, conversationById, firstFailureLine, type FailureRow } from "./lib/view.ts";
 	import type { ToastMessage } from "./components/Toasts.svelte";
 	import { actionRequestToBody, describeStopTarget, stopAcceptedLine } from "./lib/dialog-requests.ts";
 	import type { ActionRequest } from "./lib/actions-model.ts";
@@ -274,7 +274,10 @@
 	const latestDiff = $derived(latestDiffTask(snapshot?.readout.artifacts));
 
 	// --- job end→toast (exit codes surfaced plainly, §7.3; the reason line
-	// comes from the record's log tail when the payload carried one)
+	// comes from the record's log tail when the payload carried one).
+	// M0-P06 (A.8): runs report their outcome five ways — sleeping (42),
+	// interrupted (130), stopped-short (2), and the TWO exit-0 cases told apart
+	// by the durable phase/todo state, never by the exit code alone.
 	let seenJobEnds = $state<Set<string>>(new Set());
 	$effect(() => {
 		if (!jobs || !rowsSeen) return;
@@ -283,8 +286,17 @@
 			const key = `${job.id}@${job.exitCode ?? job.status}`;
 			if (seenJobEnds.has(key)) continue;
 			seenJobEnds.add(key);
-			const outcome = jobOutcome(job.exitCode);
 			const reason = firstFailureLine(job.tail);
+			if (job.kind === "run") {
+				const line = runReportLine(job.exitCode, {
+					planComplete: wholePlanComplete(snapshot?.readout),
+					todoCount: snapshot?.readout.tasks.filter((t) => t.status === "todo").length ?? 0,
+					reason,
+				});
+				if (line) pushToast(line.severity, line.text);
+				continue;
+			}
+			const outcome = jobOutcome(job.exitCode);
 			if (outcome === "failed") {
 				pushToast("error", `${job.kind} job failed (exit ${job.exitCode}): ${reason ?? "see its log in the jobs panel"}`);
 			} else if (outcome === "interrupted") {
@@ -361,7 +373,14 @@
 		const request = dialog;
 		dialog = undefined;
 		if (!request) return;
-		await runAction(actionRequestToBody(request, result, selection));
+		try {
+			// M0-P06: the request carries the tuple captured at dialog-open time;
+			// an empty/absent tuple throws here (stale dialogs can't fall through
+			// to run-all) and the plain reason lands as a toast.
+			await runAction(actionRequestToBody(request, result));
+		} catch (err) {
+			pushToast("error", (err as Error).message);
+		}
 	}
 
 	async function runAction(body: ActionBody): Promise<void> {

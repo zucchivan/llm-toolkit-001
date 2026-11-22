@@ -3,7 +3,7 @@
  * topological order + selection defaults, failure-row toasts.
  */
 import { describe, expect, it } from "vitest";
-import { decideView, topoOrder, jobOutcome, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded, conversationGroups, conversationById, hashConversationDrawer, isConversationListHash, excerptErrorState, entryKindLabel, deliveryReport, windowedTail, EVENT_LOG_DOM_WINDOW, filterTasks, TASK_STATUSES } from "../src/lib/view.ts";
+import { decideView, topoOrder, jobOutcome, wholePlanComplete, runReportLine, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded, conversationGroups, conversationById, hashConversationDrawer, isConversationListHash, excerptErrorState, entryKindLabel, deliveryReport, windowedTail, EVENT_LOG_DOM_WINDOW, filterTasks, TASK_STATUSES } from "../src/lib/view.ts";
 import type { RoleModelInfo } from "../src/lib/api.ts";
 import type { HealthCheck } from "../../src/engine/inspector.ts";
 import type { ReadoutSnapshot } from "../src/lib/api.ts";
@@ -90,6 +90,70 @@ describe("exit-code mapping", () => {
 		expect(jobOutcome(130)).toBe("interrupted");
 		expect(jobOutcome(1)).toBe("failed");
 		expect(jobOutcome(undefined)).toBe("none");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// M0-P06 (A.8): run reporting — five outcomes; whole-plan completion is the
+// durable phase, never inferred from exit 0 alone.
+// ---------------------------------------------------------------------------
+
+describe("wholePlanComplete (durable truth, not an exit code)", () => {
+	it("the complete router phase is whole-plan completion even before tasks catch up", () => {
+		expect(wholePlanComplete(snap({ phase: "complete" }).readout)).toBe(true);
+	});
+
+	it("every task done counts; quarantined is NOT done; todo remains is not completion", () => {
+		const done: KitReadout["tasks"] = [
+			{ id: "a", title: "a", status: "done", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 },
+			{ id: "b", title: "b", status: "done", waveCount: 1, dependsOn: ["a"], targetPaths: [], priority: 1, feedback: 0 },
+		];
+		expect(wholePlanComplete(snap({ phase: "idle", tasks: done }).readout)).toBe(true);
+
+		const withQuarantined = [...done.slice(0, 1), { id: "b", title: "b", status: "quarantined", waveCount: 2, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 } as KitTaskView];
+		expect(wholePlanComplete(snap({ phase: "idle", tasks: withQuarantined }).readout)).toBe(false);
+
+		const withTodo = [...done, { id: "c", title: "c", status: "todo", waveCount: 0, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 } as KitTaskView];
+		expect(wholePlanComplete(snap({ phase: "running", tasks: withTodo }).readout)).toBe(false);
+		expect(wholePlanComplete(snap({ phase: "idle", tasks: [] }).readout)).toBe(false);
+		expect(wholePlanComplete(undefined)).toBe(false);
+	});
+});
+
+describe("runReportLine (the five run outcomes, §7.3/A.8)", () => {
+	it("exit 0 splits by durable phase: whole-plan complete vs selection complete", () => {
+		const done = runReportLine(0, { planComplete: true, todoCount: 0 });
+		expect(done?.severity).toBe("info");
+		expect(done?.text).toMatch(/STATUS: COMPLETE/);
+		expect(done?.text).toMatch(/whole plan fulfilled/);
+
+		const subset = runReportLine(0, { planComplete: false, todoCount: 2 });
+		expect(subset?.severity).toBe("info");
+		expect(subset?.text).toMatch(/selection complete/);
+		expect(subset?.text).toContain("2 todo task(s) remain");
+		expect(subset?.text).not.toMatch(/whole plan|STATUS: COMPLETE/);
+	});
+
+	it("exit 2 is a stopped-short policy stop, never success and never a plain crash", () => {
+		const stopped = runReportLine(2, { planComplete: false, todoCount: 1 });
+		expect(stopped?.severity).toBe("error");
+		expect(stopped?.text).toMatch(/stopped short \(exit 2\)/);
+		expect(stopped?.text).toMatch(/policy stop/);
+		// the log's reason line rides along when the payload carried one
+		expect(runReportLine(2, { planComplete: false, todoCount: 1, reason: "quarantined: list-query" })?.text).toContain("quarantined: list-query");
+	});
+
+	it("42 sleeping · 130 interrupted · other codes hard-fail with the log reason", () => {
+		expect(runReportLine(42, { planComplete: false, todoCount: 3 })?.text).toMatch(/sleeping \(exit 42\)/);
+		expect(runReportLine(130, { planComplete: false, todoCount: 3 })?.text).toMatch(/interrupted \(exit 130\)/);
+		const failed = runReportLine(1, { planComplete: false, todoCount: 3, reason: "lock is held" });
+		expect(failed?.severity).toBe("error");
+		expect(failed?.text).toContain("exit 1");
+		expect(failed?.text).toContain("lock is held");
+	});
+
+	it("no exit code → no line", () => {
+		expect(runReportLine(undefined, { planComplete: false, todoCount: 0 })).toBeUndefined();
 	});
 });
 

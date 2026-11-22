@@ -42,6 +42,12 @@
 			case "stale":
 				return { text: "stale", cls: "chip-stale", title: "process gone without an exit record — the run died with its server; durable state resumes on the next run" };
 			case "exited":
+				// M0-P06 (A.8): a run's exit 2 is a policy stop, not a crash — named
+				// as such; exit 0 stays "exit 0" because the completion report (durable
+				// phase), not the chip, tells whole-plan from selection completion.
+				if (job.kind === "run" && job.exitCode === 2) {
+					return { text: "stopped short (2)", cls: "chip-warn", title: "exit 2 — policy stop (quarantine/budget); durable state stays resumable" };
+				}
 				return { text: `exit ${job.exitCode ?? "?"}`, cls: (job.exitCode ?? 1) === 0 ? "chip-ok" : (job.exitCode === 42 ? "chip-sleep" : "chip-warn"), title: `exit code ${job.exitCode}` };
 			case "failed":
 				return { text: `failed (${job.exitCode ?? "?"})`, cls: "chip-bad", title: `exit code ${job.exitCode} — see the log` };
