@@ -1,18 +1,21 @@
 /**
  * Planner (§4.1): PRD → RouterDoc in ONE planning conversation on the planner
- * role model with read tools only. Commits RouterDoc ("planned") + RunStatus
- * provenance + wave-log row via commitState, mirrors router.md, and stops for
- * human approval (`run --approve` or a stamped humanApprovedAt).
+ * role model with read tools only. Commits RouterDoc ("planned", with a fresh
+ * plan identity — M0-P04) + RunStatus provenance + wave-log row via
+ * commitState, mirrors router.md, and stops for human approval
+ * (`run --approve`). A successful plan REPLACES the previous one atomically:
+ * the old identity is archived and any prior approval is invalidated in the
+ * same commit. A failed parse leaves the old plan untouched.
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock, ToolRegistration } from "./harness.ts";
-import { commitState, flushStatusSnapshot } from "./state.ts";
-import { shasum } from "../util/git.ts";
-import type { RouterTask, RouterDocValue } from "./infos.ts";
+import { commitState, flushStatusSnapshot, readSessionState } from "./state.ts";
+import type { RouterTask } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
+import { buildPlanIdentity, type ArchivedPlanRef } from "./plans.ts";
 import type { Remediation } from "../adoption/types.ts";
 
 export class PlanParseError extends Error {}
@@ -88,21 +91,61 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 	}
 
 	const tasks = normalizeTasks(parsePlannerJson(outcome.answer));
-	const router: RouterDocValue = { version: 1, phase: "planned", tasks };
+	// Identity inputs are read BEFORE the commit: a failure here (git, paths,
+	// controls) leaves the previous plan untouched. planRevision is a fresh
+	// UUIDv4 per plan — even for an identical replan.
+	const root = kitAndLock.loop.paths.root;
+	const identity = await buildPlanIdentity(root, prdPath, prdText, tasks);
+	// What this plan REPLACES is read before the commit (the same lock makes
+	// this consistent): the replaced identity drives archiving and the provenance
+	// row, and a prior approval — v1 legacy stamps included — is invalidated.
+	const before = await readSessionState(kitAndLock.loop.harness);
+	const previous = before.router.identity;
+	const replacedRevision = previous?.planRevision;
+	const clearedApproval = before.runStatus.humanApprovedAt !== undefined || before.runStatus.approvedPlanRevision !== undefined;
+	const archived: ArchivedPlanRef[] = previous
+		? [
+				{
+					planRevision: previous.planRevision,
+					definitionSha256: previous.definitionSha256,
+					prdPath: previous.prdPath,
+					prdSha256: previous.prdSha256,
+					archivedAt: Date.now(),
+				},
+				...(before.router.archived ?? []),
+		  ]
+		: [...(before.router.archived ?? [])];
 	await commitState(kitAndLock, {
-		router,
+		router: (d) => {
+			// Archive the replaced plan's identity references (most recent first);
+			// a legacy (v1) plan has no identity, so there is nothing to archive.
+			d.archived = archived;
+			d.identity = identity;
+			d.tasks = tasks;
+			d.phase = "planned";
+		},
 		runStatus: (d) => {
-			d.prdPath = prdPath;
-			d.prdSha = shasum(prdText);
+			d.prdPath = identity.prdPath;
+			d.prdSha = identity.prdSha256;
 			d.kitVersion = KIT_VERSION;
-			},
+			// The old approval does not survive plan replacement: prior grant and
+			// stamp are invalidated ATOMICALLY in this same commit (a replaced
+			// plan is a new review point; timestamps authorize nothing without a
+			// revision that matches the current plan).
+			d.approvedPlanRevision = undefined;
+			d.humanApprovedAt = undefined;
+		},
 		rows: [
 			{
 				ts: Date.now(),
 				kind: "wave",
 				task: "session",
 				verb: "planned",
-				detail: `${tasks.length} task(s) from ${prdPath} (sha256 ${shasum(prdText).slice(0, 12)}), one planning conversation`,
+				detail:
+					`${tasks.length} task(s) from ${identity.prdPath} (sha256 ${identity.prdSha256.slice(0, 12)}), one planning conversation; ` +
+					`plan revision ${identity.planRevision}` +
+					(replacedRevision ? `; replaced ${replacedRevision} (archived)` : "") +
+					(clearedApproval ? "; prior approval invalidated" : ""),
 				provider: role.provider,
 				modelId: role.modelId,
 				costUsd: outcome.usage.usd,
@@ -111,12 +154,16 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 		],
 		statusPhase: { phase: "planning" },
 	});
-	return { tasks, conversationId: conv.id };
+	return { tasks, conversationId: conv.id, planRevision: identity.planRevision, replacedRevision };
 }
 
 export interface PlanOutcome {
 	tasks: RouterTask[];
 	conversationId: number;
+	/** Fresh revision minted by THIS plan. */
+	planRevision: string;
+	/** Revision of the plan this one replaced (undefined when none existed). */
+	replacedRevision?: string;
 }
 
 export async function loadApprovedRemediations(root: string): Promise<Remediation[]> {
@@ -155,23 +202,42 @@ export function parsePlannerJson(text: string): { tasks: unknown[] } {
 }
 
 export function normalizeTasks(raw: { tasks: unknown[] }): RouterTask[] {
+	// Empty plan: at least one task is required (§3 M0-P04).
+	if (raw.tasks.length === 0) {
+		throw new PlanParseError("planner returned an empty plan — at least one task is required");
+	}
 	const out: RouterTask[] = [];
+	const seen = new Set<string>();
 	raw.tasks.forEach((entry, i) => {
 		const t = entry as Record<string, unknown>;
 		if (typeof t["id"] !== "string" || !t["id"].trim()) {
 			throw new PlanParseError(`task #${i + 1} is missing an id (string)`);
 		}
+		// IDs are safe after normalization: lower [a-z0-9][a-z0-9_-]{0,63}. An id
+		// that cannot be normalized into that shape (e.g. "-b" keeps its leading
+		// dash) is rejected, not silently kept or dropped.
+		const id = toSlug(String(t["id"]));
+		if (!SAFE_TASK_ID.test(id)) {
+			throw new PlanParseError(
+				`task #${i + 1} (${String(t["id"])}): normalized id "${id}" is not a safe task id — ids must match ${SAFE_TASK_ID.source} after normalization`,
+			);
+		}
+		// Colliding normalized IDs reject BEFORE any state replacement.
+		if (seen.has(id)) {
+			throw new PlanParseError(`task #${i + 1}: duplicate task id after normalization — two entries normalize to "${id}"`);
+		}
+		seen.add(id);
 		const acceptance = strList(t["acceptance"]);
 		if (acceptance.length < 1 || acceptance.length > 5) {
-			throw new PlanParseError(`task ${String(t["id"])}: acceptance needs 1–5 criteria (got ${acceptance.length})`);
+			throw new PlanParseError(`task ${id}: acceptance needs 1–5 criteria (got ${acceptance.length})`);
 		}
 		out.push({
-			id: toSlug(String(t["id"])),
+			id,
 			title: typeof t["title"] === "string" ? t["title"] : String(t["id"]),
 			spec: typeof t["spec"] === "string" ? t["spec"] : "",
-			dependsOn: strList(t["dependsOn"]).map(toSlug),
+			dependsOn: depList(t["dependsOn"], id),
 			acceptance,
-			targetPaths: strList(t["targetPaths"]).slice(0, 20),
+			targetPaths: targetList(t["targetPaths"], id),
 			priority: typeof t["priority"] === "number" && Number.isFinite(t["priority"]) ? (t["priority"] as number) : 0,
 			status: "todo",
 			waveCount: 0,
@@ -186,6 +252,59 @@ export function normalizeTasks(raw: { tasks: unknown[] }): RouterTask[] {
 		}
 	}
 	ensureAcyclic(out);
+	return out;
+}
+
+/** Safe normalized task id: lower [a-z0-9][a-z0-9_-]{0,63}. */
+export const SAFE_TASK_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/** dependsOn must be an array of strings; duplicate deps are rejected (absent → []). */
+function depList(v: unknown, taskId: string): string[] {
+	if (v === undefined) return [];
+	if (!Array.isArray(v)) throw new PlanParseError(`task ${taskId}: dependsOn must be an array of task ids`);
+	const deps = v.map((item) => {
+		if (typeof item !== "string" || !item.trim()) {
+			throw new PlanParseError(`task ${taskId}: dependsOn entries must be non-empty task id strings`);
+		}
+		return toSlug(item);
+	});
+	if (new Set(deps).size !== deps.length) {
+		throw new PlanParseError(`task ${taskId}: dependsOn has duplicate entries (${deps.join(", ")})`);
+	}
+	return deps;
+}
+
+/**
+ * targetPaths must be an EXPLICIT array of non-empty project-relative path
+ * specs — `[]` is the legitimate way to say "unrestricted admissible project
+ * paths", so a missing field is a parse error, not a silent unrestricted
+ * default. Entries must be bounded, non-absolute, and must not traverse out of
+ * the project.
+ */
+function targetList(v: unknown, taskId: string): string[] {
+	if (v === undefined) {
+		throw new PlanParseError(`task ${taskId}: missing targetPaths — targetPaths must be an explicit array ([] means unrestricted admissible paths)`);
+	}
+	if (!Array.isArray(v)) {
+		throw new PlanParseError(`task ${taskId}: targetPaths must be an array of project-relative paths ([] means unrestricted admissible paths)`);
+	}
+	const out: string[] = [];
+	for (const item of v) {
+		if (typeof item !== "string" || !item.trim()) {
+			throw new PlanParseError(`task ${taskId}: targetPaths entries must be non-empty strings`);
+		}
+		const p = item.trim();
+		if (p.length > 512) {
+			throw new PlanParseError(`task ${taskId}: target path is longer than 512 characters`);
+		}
+		if (p.startsWith("/") || /^[A-Za-z]:/.test(p) || p.includes("\\") || p.split("/").includes("..")) {
+			throw new PlanParseError(`task ${taskId}: target path ${JSON.stringify(p)} is not a safe project-relative path`);
+		}
+		out.push(p);
+	}
+	if (out.length > 20) {
+		throw new PlanParseError(`task ${taskId}: targetPaths exceeds 20 entries`);
+	}
 	return out;
 }
 

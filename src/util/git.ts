@@ -20,6 +20,29 @@ export function hasRepo(cwd: string): Promise<boolean> {
 	return run(["git", "rev-parse", "--is-inside-work-tree"], cwd).then((r) => r.ok);
 }
 
+/**
+ * HEAD commit oid for plan identity, or null when there is no usable commit
+ * (no repository, no commit yet, or git unavailable) — never a guess.
+ */
+export async function headCommit(cwd: string): Promise<string | null> {
+	try {
+		const r = await run(["git", "rev-parse", "--verify", "HEAD"], cwd);
+		return r.ok && /^[0-9a-f]{40}$/.test(r.stdout) ? r.stdout : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Checked-out branch name, or null when HEAD is detached / outside a repository. */
+export async function headBranch(cwd: string): Promise<string | null> {
+	try {
+		const r = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd);
+		return r.ok && r.stdout && r.stdout !== "HEAD" ? r.stdout : null;
+	} catch {
+		return null;
+	}
+}
+
 export function shasum(text: string): string {
 	return createHash("sha256").update(text).digest("hex");
 }
