@@ -1,11 +1,15 @@
 /**
  * Delivery host operations. M0-P12 adds prepared journaled local integration,
- * discard, and publication helpers above; they are not wired into the serial
- * driver until P14. The legacy `runDelivery` implementation below intentionally
+ * discard, and local-publication helpers; M0-P13 adds prepared verified PR
+ * publication. They are not wired into the serial driver until P14. The legacy
+ * `runDelivery` implementation below intentionally
  * remains unchanged for the pre-cutover driver and is not the P12 guarantee.
  */
 import { exec } from "../util/exec.ts";
 import type { LoopAndLock } from "./harness.ts";
+import { classifyProjectPath } from "../hygiene.ts";
+import { parseApprovedGitHubOrigin, readApprovedDeliveryOrigin } from "../sandbox/host-profile.ts";
+import type { ApprovedGitHubOrigin } from "../sandbox/host-profile.ts";
 import { commitState, readGrant, readSessionState } from "./state.ts";
 import type { ReceiptAttempt } from "./state.ts";
 import type { WaveRow } from "./infos.ts";
@@ -19,7 +23,7 @@ import type {
 import { ReceiptsDoc } from "./receipts.ts";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import {
-	assertGitOid, compareAndSwapRef, createCommitObject, isBranchCheckedOut, readCommit, readRef, resolveTree,
+	assertGitOid, compareAndSwapRef, createCommitObject, isBranchCheckedOut, readCommit, readRef, readTreeEntries, resolveTree,
 } from "../util/git-objects.ts";
 import { validateApprovingCriteria } from "./review.ts";
 import { discard as discardWorkspace, observeLease, requireFencedWorkspace } from "./workspace.ts";
@@ -40,7 +44,9 @@ export type JournalFaultPoint =
 	| "integration-init:before-cas" | "integration-init:after-cas"
 	| "integration-cas:before-effect" | "integration-cas:after-effect"
 	| "rollback-discard:before-effect" | "rollback-discard:after-effect"
-	| "delivery-cas:before-effect" | "delivery-cas:after-effect";
+	| "delivery-cas:before-effect" | "delivery-cas:after-effect"
+	| "pr-ref-create:before-effect" | "pr-ref-create:after-effect"
+	| "pr-host-create:before-effect" | "pr-host-create:after-effect";
 
 export class RecoveryRequiredError extends Error {
 	constructor(message: string) {
@@ -495,6 +501,464 @@ async function recordDeliveryState(
 		},
 	}), options, "delivery-result");
 	return { receipt: event.value, event };
+}
+
+// ---------------------------------------------------------------------------
+// Prepared PR publication (M0-P13). This is intentionally not driver-active
+// until P14. The only destination authority is host-v1.json; callers inject
+// narrow transport/host interfaces in tests and may not supply an origin.
+// ---------------------------------------------------------------------------
+
+export type RemotePullRequest = {
+	repository: string;
+	number: number;
+	url: string;
+	baseRef: string;
+	baseOid: string;
+	headRef: string;
+	headOid: string;
+	state?: "open" | "closed";
+};
+
+export type PullRequestIdentity = {
+	repository: string;
+	baseRef: string;
+	baseOid: string;
+	headRef: string;
+	headOid: string;
+};
+
+/** Narrow Git surface: no checkout, arbitrary remote name, ref update, or force API. */
+export interface RemoteGitTransport {
+	readRemoteRef(origin: string, ref: string): Promise<string | undefined>;
+	createRemoteRef(origin: string, ref: string, oid: string): Promise<void>;
+}
+
+/** The host adapter searches all PRs for this repo/head so conflicting bases are visible. */
+export interface PullRequestHost {
+	findForHead(identity: PullRequestIdentity): Promise<RemotePullRequest[]>;
+	create(identity: PullRequestIdentity & { title: string; body: string }): Promise<void>;
+}
+
+export type PrPublicationOptions = JournalFaultOptions & {
+	deliverExplicit: boolean;
+	/** Internal test seam; production reads the operator host profile by default. */
+	profilePath?: string;
+	gitTransport?: RemoteGitTransport;
+	prHost?: PullRequestHost;
+};
+
+function deliveryBranchRef(wave: WaveKey): string {
+	return `refs/heads/kit/${wave.planRevision}/${wave.taskId}`;
+}
+
+function shortHeadRef(ref: string): string {
+	if (!ref.startsWith("refs/heads/")) throw new Error(`expected a fully qualified branch ref, got ${ref}`);
+	return ref.slice("refs/heads/".length);
+}
+
+function assertBranchRef(ref: string): string {
+	const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : "";
+	const forbidden = ["~", "^", ":", "?", "*", "[", "\\", "]"];
+	const hasControl = [...branch].some((char) => char.charCodeAt(0) <= 0x20 || char.charCodeAt(0) === 0x7f);
+	if (!branch || ref.length > 512 || hasControl || branch.split("/").some((part) =>
+		!part || part === "." || part === ".." || part.endsWith(".") || part.endsWith(".lock") || forbidden.some((char) => part.includes(char)),
+	) || branch.includes("@{")) {
+		throw new Error(`invalid publication branch ref ${JSON.stringify(ref)}`);
+	}
+	return ref;
+}
+
+function secretPath(path: string): boolean {
+	const parts = path.split("/");
+	return parts.some((part) => {
+		const name = part.toLowerCase();
+		return name === ".env" || name.startsWith(".env.") || name === ".npmrc" || name === ".netrc" || name === ".pypirc"
+			|| name === ".ssh" || name === ".aws" || name.endsWith(".pem") || name.endsWith(".key");
+	});
+}
+
+async function assertPublicTree(root: string, tree: string, label: string): Promise<void> {
+	for (const entry of await readTreeEntries(root, tree)) {
+		if (classifyProjectPath(entry.path) === "private") {
+			throw new Error(`refusing public PR delivery: ${label} tracks private runtime path ${JSON.stringify(entry.path)}; remove it manually and replan`);
+		}
+		if (secretPath(entry.path)) {
+			throw new Error(`refusing public PR delivery: ${label} tracks §2 secret path ${JSON.stringify(entry.path)}; remove it manually and replan`);
+		}
+	}
+}
+
+function latestDeliveryFor(doc: ReceiptsDocValue, event: Extract<ReceiptEvent, { kind: "delivery" }>): Extract<ReceiptEvent, { kind: "delivery" }> | undefined {
+	const latest = latestJournalEvent(doc, receiptKey({ ...event.value, stage: "delivery" }));
+	return latest?.kind === "delivery" ? latest : undefined;
+}
+
+function assertReportedPullRequest(record: RemotePullRequest, identity: PullRequestIdentity): RemotePullRequest {
+	if (!record || record.repository !== identity.repository || record.baseRef !== identity.baseRef || record.baseOid !== identity.baseOid
+		|| record.headRef !== identity.headRef || record.headOid !== identity.headOid || record.state === "closed"
+		|| !Number.isSafeInteger(record.number) || record.number < 1) {
+		throw new RecoveryRequiredError("PR host reported a repository, base, head, OID, or PR identity different from the reviewed publication intent");
+	}
+	const expectedUrl = `https://github.com/${identity.repository}/pull/${record.number}`;
+	if (record.url !== expectedUrl) throw new RecoveryRequiredError("PR host reported a non-canonical or mismatched GitHub PR URL");
+	return record;
+}
+
+function findExactPr(records: RemotePullRequest[], identity: PullRequestIdentity): RemotePullRequest | undefined {
+	if (records.length === 0) return undefined;
+	if (records.length !== 1) throw new RecoveryRequiredError("multiple PRs exist for the same repository/head; publication is ambiguous");
+	return assertReportedPullRequest(records[0]!, identity);
+}
+
+async function publicationBase(
+	root: string,
+	planRevision: string,
+	baseCommit: string,
+	baseBranch: string | null,
+	parent: string,
+	doc: ReceiptsDocValue,
+): Promise<string> {
+	if (parent === baseCommit) {
+		if (!baseBranch || baseBranch.startsWith("(") || baseBranch.startsWith("refs/")) {
+			throw new Error("PR delivery requires the reviewed base branch captured by the plan; detached-base plans cannot publish");
+		}
+		const ref = assertBranchRef(`refs/heads/${baseBranch}`);
+		const check = await exec(["git", "check-ref-format", ref], { cwd: root, timeoutMs: 10_000 });
+		if (check.code !== 0) throw new Error(`reviewed base branch ${JSON.stringify(baseBranch)} is not a valid Git branch`);
+		return ref;
+	}
+	const matches = doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "delivery" }> =>
+		event.kind === "delivery" && event.value.planRevision === planRevision && event.value.mode === "pr"
+			&& event.value.state === "published" && event.value.commit === parent && !!latestDeliveryFor(doc, event)
+			&& latestDeliveryFor(doc, event)!.opId === event.opId,
+	);
+	const unique = [...new Map(matches.map((event) => [event.value.ref, event])).values()];
+	if (unique.length !== 1 || !unique[0]!.value.ref) {
+		throw new RecoveryRequiredError(`integration parent ${parent} is not the reviewed base or one uniquely published PR head; refusing to guess a stack base`);
+	}
+	const ref = assertBranchRef(unique[0]!.value.ref!);
+	return ref;
+}
+
+/**
+ * Publish an integrated accepted commit as a create-only remote branch and a
+ * validated GitHub PR. Retries first reconcile both effects; remote branches
+ * are never updated, and an uncertain PR-create attempt is never repeated.
+ */
+export async function publishPullRequest(
+	kit: LoopAndLock,
+	wave: WaveKey,
+	options: PrPublicationOptions,
+): Promise<JournalOperationResult<Extract<JournalReceiptEvent, { kind: "delivery" }>>> {
+	if (!options.deliverExplicit) throw new Error("PR publication requires explicit --deliver consent");
+	if (kit.loop.config.delivery.mode !== "pr") throw new Error("PR publication requires reviewed delivery.mode = pr");
+	const { state } = await assertCurrentTask(kit, wave);
+	const plan = state.router.identity!;
+	const grant = readGrant(state.runStatus);
+	if (!grant || grant.planRevision !== wave.planRevision || !grant.selected.includes(wave.taskId)) {
+		throw new Error("PR publication requires the current revision-qualified grant to include this task");
+	}
+	if (!plan.baseCommit) throw new Error("PR publication requires a reviewed base commit");
+	const doc = await receiptSnapshot(kit);
+	const integration = latestOf(doc, wave, "integrate");
+	const acceptance = latestOf(doc, wave, "acceptance");
+	if (!integration || integration.value.state !== "integrated" || !acceptance || acceptance.value.id !== integration.value.acceptedId) {
+		throw new Error("PR publication requires the matching confirmed integration and acceptance receipts");
+	}
+	const root = kit.loop.paths.root;
+	const commit = assertGitOid(integration.value.commit);
+	const commitData = await readCommit(root, commit);
+	assertJournalCommit(commitData, acceptance.value.tree, acceptance.value.parent);
+	if (await readRef(root, acceptedRef(wave.planRevision)) !== commit) throw new RecoveryRequiredError("private accepted ref does not name the integrated commit");
+	const parent = assertGitOid(commitData.parents[0]!);
+	if (parent !== acceptance.value.parent) throw new RecoveryRequiredError("integration commit parent differs from the accepted candidate's recorded parent");
+	await assertPublicTree(root, commitData.tree, "accepted candidate");
+	await assertPublicTree(root, (await readCommit(root, parent)).tree, "integration parent");
+
+	const approved: ApprovedGitHubOrigin = await readApprovedDeliveryOrigin(root, options.profilePath);
+	const baseRef = await publicationBase(root, wave.planRevision, plan.baseCommit, plan.baseBranch, parent, doc);
+	const headRef = assertBranchRef(deliveryBranchRef(wave));
+	const identity: PullRequestIdentity = {
+		repository: approved.repository,
+		baseRef: shortHeadRef(baseRef),
+		baseOid: parent,
+		headRef: shortHeadRef(headRef),
+		headOid: commit,
+	};
+	const git = options.gitTransport ?? new TrustedGitRemoteTransport(root);
+	const host = options.prHost ?? new GhPullRequestHost(root);
+	const prior = latestOf(doc, wave, "delivery");
+	const firstAttempt = prior === undefined;
+	if (prior && (prior.value.acceptedId !== acceptance.value.id || prior.value.commit !== commit || prior.value.mode !== "pr"
+		|| prior.value.ref !== headRef || prior.value.baseRef !== baseRef)) {
+		throw new RecoveryRequiredError("PR delivery retry differs from its durable acceptance, commit, head, or stack base");
+	}
+
+	// Confirm the reviewed base still names exactly the expected parent. A base
+	// movement is never repaired by selecting a newer origin tip.
+	let observedBase: string | undefined;
+	try { observedBase = await git.readRemoteRef(approved.origin, baseRef); }
+	catch (error) { throw new RecoveryRequiredError(`cannot query approved PR base ${baseRef}: ${(error as Error).message}`); }
+	if (observedBase !== parent) throw new RecoveryRequiredError(`approved PR base ${baseRef} is ${observedBase ?? "absent"}, expected reviewed parent ${parent}`);
+
+	let deliveryIntent = prior?.value;
+	if (deliveryIntent?.state === "published") {
+		// A published receipt is an observation, not permission to overlook a
+		// later ref/PR conflict. Re-verify below before returning it.
+	} else if (!deliveryIntent) {
+		const event = await appendJournal(kit, wave, "delivery", (meta) => ({
+			kind: "delivery", ...meta, value: {
+				...wave, id: meta.opId, acceptedId: acceptance.value.id, commit, mode: "pr", state: "pending",
+				ref: headRef, baseRef, checkedAt: meta.at, code: "remote-ref-pending",
+			},
+		}), options, "delivery-intent");
+		deliveryIntent = event.value;
+	}
+
+	let observedHead: string | undefined;
+	try { observedHead = await git.readRemoteRef(approved.origin, headRef); }
+	catch (error) {
+		if (!deliveryIntent) throw error;
+		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-unreadable", options);
+		throw new RecoveryRequiredError(`cannot observe approved remote head ${headRef}: ${(error as Error).message}`);
+	}
+	if (observedHead !== undefined && observedHead !== commit) {
+		if (deliveryIntent?.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-conflict", options);
+		throw new RecoveryRequiredError(`refusing conflicting existing remote head ${headRef}: ${observedHead}; expected exact commit ${commit}`);
+	}
+	if (observedHead === undefined && !firstAttempt) {
+		// A prior intent means the create may already have happened and the ref
+		// may since have been removed. Recreating it would be repair, not replay.
+		await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-missing-after-intent", options);
+		throw new RecoveryRequiredError(`remote head ${headRef} is absent after a recorded publication intent; refusing to recreate or repair it`);
+	}
+	if (observedHead === undefined) {
+		// First attempt only: an empty-expected lease creates the ref atomically.
+		// If the response is lost, readback decides whether the exact commit appeared.
+		try {
+			await fault(options, "pr-ref-create:before-effect");
+			await git.createRemoteRef(approved.origin, headRef, commit);
+			await fault(options, "pr-ref-create:after-effect");
+		} catch (error) {
+			const readback = await git.readRemoteRef(approved.origin, headRef).catch(() => undefined);
+			if (readback !== commit) {
+				await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", readback ? "remote-ref-conflict" : "remote-ref-create-uncertain", options);
+				throw new RecoveryRequiredError(`create-only remote ref effect is uncertain (${(error as Error).message}); observed ${readback ?? "absence"}`);
+			}
+		}
+		observedHead = await git.readRemoteRef(approved.origin, headRef);
+		if (observedHead !== commit) {
+			await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-readback-mismatch", options);
+			throw new RecoveryRequiredError(`remote head readback is ${observedHead ?? "absent"}, not ${commit}`);
+		}
+	}
+
+	// Persist the confirmed branch before any PR-host mutation. A crash before
+	// the next intent can safely resume from the create-only branch observation.
+	const latestAfterBranch = latestOf(await receiptSnapshot(kit), wave, "delivery")?.value ?? deliveryIntent!;
+	if (latestAfterBranch.code !== "pr-create-intent" && latestAfterBranch.code !== "pr-create-uncertain"
+		&& (latestAfterBranch.state !== "published" || !latestAfterBranch.prNumber)) {
+		deliveryIntent = (await recordPrDeliveryState(kit, wave, latestAfterBranch, "pending", "remote-ref-confirmed", options)).receipt;
+	} else {
+		deliveryIntent = latestAfterBranch;
+	}
+
+	let records: RemotePullRequest[];
+	try { records = await host.findForHead(identity); }
+	catch (error) {
+		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", deliveryIntent.code === "pr-create-intent" || deliveryIntent.code === "pr-create-uncertain" ? "pr-create-uncertain" : "pr-lookup-failed", options);
+		throw new RecoveryRequiredError(`PR lookup failed; no blind create/retry will be made: ${(error as Error).message}`);
+	}
+	let found: RemotePullRequest | undefined;
+	try { found = findExactPr(records, identity); }
+	catch (error) {
+		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "pr-identity-conflict", options);
+		throw error;
+	}
+	if (found) {
+		if (deliveryIntent.state === "published" && deliveryIntent.prNumber === found.number && deliveryIntent.prUrl === found.url) {
+			const existing = latestOf(await receiptSnapshot(kit), wave, "delivery");
+			if (existing?.value.state === "published") return { receipt: existing.value, event: existing };
+		}
+		return await recordPrDeliveryState(kit, wave, deliveryIntent, "published", undefined, options, found);
+	}
+
+	const prCreateMayHaveOccurred = deliveryIntent.prNumber !== undefined
+		|| ["pr-create-intent", "pr-create-uncertain", "pr-identity-conflict"].includes(deliveryIntent.code ?? "");
+	if (prCreateMayHaveOccurred) {
+		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "pr-create-uncertain", options);
+		throw new RecoveryRequiredError("no matching PR is currently observable after a possibly attempted/conflicting create; refusing a blind duplicate create");
+	}
+	const createIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "pr-create-intent", options)).receipt;
+	try {
+		await fault(options, "pr-host-create:before-effect");
+		await host.create({
+			...identity,
+			title: `llm-toolkit-001: ${wave.taskId}`,
+			body: `Automated candidate from reviewed plan ${wave.planRevision}.\n\nHead: ${commit}\nBase: ${parent}\n\nThis PR is not auto-merged.`,
+		});
+		await fault(options, "pr-host-create:after-effect");
+	} catch (error) {
+		// A timed-out create may have succeeded. Reconcile by repo/base/head/OID;
+		// never repeat create merely because its response was lost.
+		const reconciled = await host.findForHead(identity).catch(() => undefined);
+		if (reconciled) {
+			try {
+				const exact = findExactPr(reconciled, identity);
+				if (exact) return await recordPrDeliveryState(kit, wave, createIntent, "published", undefined, options, exact);
+			} catch (lookupError) {
+				await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-identity-conflict", options);
+				throw lookupError;
+			}
+		}
+		await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-create-uncertain", options);
+		throw new RecoveryRequiredError(`PR create response was lost or uncertain; retry will only look up this exact PR identity (${(error as Error).message})`);
+	}
+
+	let created: RemotePullRequest[];
+	try { created = await host.findForHead(identity); }
+	catch (error) {
+		await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-create-uncertain", options);
+		throw new RecoveryRequiredError(`PR create completed but its identity could not be queried: ${(error as Error).message}`);
+	}
+	let exact: RemotePullRequest | undefined;
+	try { exact = findExactPr(created, identity); }
+	catch (error) {
+		await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-identity-conflict", options);
+		throw error;
+	}
+	if (!exact) {
+		await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-create-uncertain", options);
+		throw new RecoveryRequiredError("PR create returned without an observable matching PR; it will not be repeated blindly");
+	}
+	return await recordPrDeliveryState(kit, wave, createIntent, "published", undefined, options, exact);
+}
+
+async function recordPrDeliveryState(
+	kit: LoopAndLock,
+	wave: WaveKey,
+	intent: DeliveryReceipt,
+	state: DeliveryReceipt["state"],
+	code: string | undefined,
+	options: JournalFaultOptions,
+	pr?: RemotePullRequest,
+): Promise<JournalOperationResult<Extract<JournalReceiptEvent, { kind: "delivery" }>>> {
+	const event = await appendJournal(kit, wave, "delivery", (meta) => ({
+		kind: "delivery", ...meta, value: {
+			...wave, id: meta.opId, acceptedId: intent.acceptedId, commit: intent.commit, mode: "pr", state,
+			...(intent.ref ? { ref: intent.ref } : {}), ...(intent.baseRef ? { baseRef: intent.baseRef } : {}),
+			...(pr ? { prNumber: pr.number, prUrl: pr.url } : intent.prNumber !== undefined ? { prNumber: intent.prNumber, ...(intent.prUrl ? { prUrl: intent.prUrl } : {}) } : {}),
+			checkedAt: meta.at, ...(code ? { code } : {}),
+		},
+	}), options, state === "pending" ? "delivery-intent" : "delivery-result");
+	return { receipt: event.value, event };
+}
+
+/** Trusted Git implementation. It always receives the profile-approved URL and exact full refs. */
+export class TrustedGitRemoteTransport implements RemoteGitTransport {
+	constructor(private readonly root: string) {}
+
+	async readRemoteRef(origin: string, ref: string): Promise<string | undefined> {
+		assertBranchRef(ref);
+		const result = await trustedGit(this.root, ["ls-remote", "--refs", origin, ref], 30_000);
+		if (result.code !== 0) throw new Error(`git ls-remote failed: ${result.stderr.trim().slice(0, 500)}`);
+		const rows = result.stdout.trim().split("\n").filter(Boolean);
+		if (!rows.length) return undefined;
+		if (rows.length !== 1) throw new Error(`remote query returned ambiguous rows for ${ref}`);
+		const [oid, returnedRef] = rows[0]!.split("\t");
+		if (returnedRef !== ref || !oid) throw new Error(`remote query returned a different ref than ${ref}`);
+		return assertGitOid(oid);
+	}
+
+	async createRemoteRef(origin: string, ref: string, oid: string): Promise<void> {
+		assertBranchRef(ref);
+		assertGitOid(oid);
+		// Empty expected OID means the destination ref must be absent. This lease
+		// cannot overwrite a value; no remote name or update/repair path is exposed.
+		const result = await trustedGit(this.root, [
+			"push", "--porcelain", `--force-with-lease=${ref}:`, origin, `${oid}:${ref}`,
+		], 120_000);
+		if (result.code !== 0) throw new Error(`create-only git push failed: ${result.stderr.trim().slice(0, 500)}`);
+	}
+}
+
+/** Trusted gh adapter; every operation pins --repo, --base, and --head explicitly. */
+export class GhPullRequestHost implements PullRequestHost {
+	constructor(private readonly root: string) {}
+
+	async findForHead(identity: PullRequestIdentity): Promise<RemotePullRequest[]> {
+		const result = await exec(["gh", "pr", "list", "--repo", identity.repository, "--head", identity.headRef,
+			"--state", "all", "--json", "number,url,headRefName,headRefOid,baseRefName,baseRefOid,state"], {
+			cwd: this.root, timeoutMs: 30_000, env: trustedHostEnv(true),
+		});
+		if (result.code !== 0 || result.stdoutCapped || result.stderrCapped) throw new Error(`gh pr list failed: ${result.stderr.trim().slice(0, 500)}`);
+		let parsed: unknown;
+		try { parsed = JSON.parse(result.stdout); } catch { throw new Error("gh pr list returned malformed JSON"); }
+		if (!Array.isArray(parsed)) throw new Error("gh pr list returned a non-array response");
+		return parsed.map((item) => {
+			if (!item || typeof item !== "object") throw new Error("gh pr list returned a malformed PR identity");
+			const row = item as Record<string, unknown>;
+			if (typeof row["number"] !== "number" || typeof row["url"] !== "string" || typeof row["headRefName"] !== "string"
+				|| typeof row["headRefOid"] !== "string" || typeof row["baseRefName"] !== "string" || typeof row["baseRefOid"] !== "string") {
+				throw new Error("gh pr list omitted required repository/base/head OID fields");
+			}
+			return {
+				repository: identity.repository, number: row["number"], url: row["url"],
+				baseRef: row["baseRefName"], baseOid: assertGitOid(row["baseRefOid"]),
+				headRef: row["headRefName"], headOid: assertGitOid(row["headRefOid"]),
+				...(row["state"] === "OPEN" || row["state"] === "open" ? { state: "open" as const } : { state: "closed" as const }),
+			};
+		});
+	}
+
+	async create(identity: PullRequestIdentity & { title: string; body: string }): Promise<void> {
+		const result = await exec(["gh", "pr", "create", "--repo", identity.repository, "--base", identity.baseRef,
+			"--head", identity.headRef, "--title", identity.title, "--body", identity.body], {
+			cwd: this.root, timeoutMs: 60_000, env: trustedHostEnv(true),
+		});
+		if (result.code !== 0) throw new Error(`gh pr create failed: ${(result.stderr || result.stdout).trim().slice(0, 500)}`);
+	}
+}
+
+function trustedHostEnv(includeGitHubCredentials = false): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (key.startsWith("GIT_") || key === "GH_DEBUG" || key === "GH_ENTERPRISE_TOKEN"
+			|| (!includeGitHubCredentials && (key === "GH_TOKEN" || key === "GITHUB_TOKEN"))) env[key] = undefined;
+		else env[key] = value;
+	}
+	env["GIT_TERMINAL_PROMPT"] = "0";
+	env["GH_HOST"] = "github.com";
+	return env;
+}
+
+async function trustedGit(root: string, args: string[], timeoutMs: number): Promise<Awaited<ReturnType<typeof exec>>> {
+	const origin = args[0] === "ls-remote" ? args[2] : args[0] === "push" ? args.at(-2) : undefined;
+	if (!origin) throw new Error("trusted Git transport requires an explicit origin argument");
+	let includeCredentials = false;
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(origin)) {
+		const approved = parseApprovedGitHubOrigin(origin);
+		if (approved.origin !== origin) throw new Error("trusted Git transport requires the canonical approved GitHub origin");
+		includeCredentials = true;
+	}
+	const safeEnv = trustedHostEnv(includeCredentials);
+	const rewrite = await exec(["git", "config", "--local", "--no-includes", "--get-regexp", "^url\\..*\\.(insteadOf|pushInsteadOf)$"], {
+		cwd: root, timeoutMs: 10_000, env: safeEnv,
+	});
+	if (rewrite.code === 0 && rewrite.stdout.trim()) throw new Error("local Git URL rewrite config is not allowed for approved-origin publication");
+	if (rewrite.code !== 1 && rewrite.code !== 0) throw new Error(`cannot inspect local Git URL rewrite config: ${rewrite.stderr.trim().slice(0, 300)}`);
+	const env = safeEnv;
+	env["GIT_CONFIG_NOSYSTEM"] = "1";
+	env["GIT_CONFIG_GLOBAL"] = process.platform === "win32" ? "NUL" : "/dev/null";
+	env["GIT_ATTR_NOSYSTEM"] = "1";
+	env["GIT_OPTIONAL_LOCKS"] = "0";
+	env["GIT_TERMINAL_PROMPT"] = "0";
+	const result = await exec(["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=!gh auth git-credential", ...args], {
+		cwd: root, timeoutMs, env,
+	});
+	if (result.timedOut || result.stdoutCapped || result.stderrCapped) throw new Error("trusted Git remote operation timed out or exceeded output limits");
+	return result;
 }
 
 /**

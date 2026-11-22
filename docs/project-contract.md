@@ -88,7 +88,7 @@ effect receipts.
   effects remain in code; uncertain, conflicting, stale, missing-key, malformed,
   and network-error outcomes remain unknown and cannot alter feedback routing,
   retry limits, quarantine, task/adoption state, delivery, or approvals.
-- `[delivery]` — `mode`: `none` (default; leaves changes in the operator's working tree) | `commit` (attempts a commit on the checked-out branch) | `pr` (optionally attempts branch/PR creation and additionally requires the run's `--deliver` flag; never merges the PR)
+- `[delivery]` — `mode`: `none` (default) | `commit` | `pr`. Until M0-P14, the production serial driver still uses the legacy behavior described in the older release notes; these labels do not claim the prepared journal guarantees below are active. P13's prepared `pr` operation requires operator host-policy approval of one GitHub origin and explicit `run --deliver` consent; it does not merge.
 - `[paths]` — `prd` (default `docs/prd.md`), `specs`
 
 NO SECRETS live in config.toml: providers read credentials from the
@@ -235,8 +235,57 @@ mechanically enforced per `docs/api-map.md` (M0-P02).
   default-on skeptic pass adds `verify:skeptic:<verdict>` rows without changing
   the wave-log schema version; existing `verify:<verdict>` rows remain primary
   verdicts, and summing verdict-row usage now accounts for both conversations.
-- Delivery modes matter for upgrade drills: `none` leaves waves in the working
-  tree, so a kit update mid-project is a checkout switch, not a code migration.
+- Delivery modes matter for upgrade drills: before P14, the legacy driver
+  behavior remains active; a kit update is not a transparent activation of the
+  prepared P12/P13 journal operations.
+
+## Prepared PR publication (M0-P13; not active in `run` until P14)
+
+The P13 helper publishes only an already accepted and integrated candidate.
+It is not an auto-merge feature or a claim that a PR is CI-approved code. The
+production serial driver is still on the legacy delivery path until P14 wires
+the prepared operations; do not infer current `run` behavior from this
+contract.
+
+For prepared publication, the operator must put exactly one project entry in
+the private host policy (`~/.config/llm-toolkit-001/host-v1.json`, or the
+platform-equivalent) with an approved canonical HTTPS GitHub `deliveryOrigin`
+for the exact canonical project root. The operation reads that allowlisted
+field only. It never uses the repository's `origin`, a push URL, a task value,
+or a caller-selected destination. There is no default remote. Do not put a
+GitHub token in project config; credentials remain in the trusted host Git/gh
+credential path and never enter a worker.
+
+Before any public branch is created, the pinned candidate and its integration
+parent are checked for tracked private `.orch` runtime state and §2 secret
+paths (`.env`, `.env.*`, `.npmrc`, `.netrc`, `.pypirc`, `.ssh/**`, `.aws/**`,
+`*.pem`, `*.key`). A match blocks publication. The kit does not untrack,
+rewrite, or scrub history; remove sensitive content manually, establish a new
+reviewed base, and replan.
+
+Publication uses a create-only remote-ref CAS for
+`refs/heads/kit/<planRevision>/<taskId>`. If absent, only an empty-expected
+lease may create it. An exact existing head is observed without pushing; a
+different head blocks. An already-attempted ref that later disappears is not
+recreated. Task A's PR targets the reviewed base branch only while it still
+points at the reviewed base commit. A later task's PR targets the unique
+previously published branch whose recorded integration commit is its exact
+parent. The new commit keeps that local integration commit as its single parent;
+publication does not guess at a GitHub merge commit.
+
+The PR host receives explicit repo/base/head identities. `published` is recorded
+only after the host reports exactly one open PR whose repository, base ref and
+OID, head ref and queried head OID, number, and canonical URL all match the
+journal. On retry, the host is queried before create. A matching PR after a
+lost response is acknowledged; an ambiguous/conflicting result, a moved base,
+or an uncertain create without an observable matching PR remains blocking
+`unknown` state. The helper never blindly repeats a possibly completed PR
+create, updates an existing remote ref, force-pushes, checks out a delivery
+branch, auto-merges, or repairs a diverged branch.
+
+`test/pr-publication.test.ts` runs the prepared path against a local bare Git
+remote and an injected fake PR host. It does not contact GitHub or read GitHub
+credentials. Until P14, this is a seam/test guarantee, not active CLI delivery.
 
 ## Repository hygiene — three ownership classes (ADR 04)
 

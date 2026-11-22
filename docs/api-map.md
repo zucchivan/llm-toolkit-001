@@ -374,11 +374,70 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
 ## src/engine/delivery.ts
 
 - The production serial driver still calls the legacy `runDelivery` path until
-  M0-P14: its old `none`/`commit`/`pr` behavior is not the P12 guarantee and
-  must not be described as safe local publication. P12's prepared host APIs
-  are `acceptCandidate`, `integrateAcceptedCandidate`, `publishLocalResult`,
-  and `discardCandidateWorkspace` (contract and replay table above). They are
-  callable under the host lock but deliberately not wired into `waves.ts` yet.
+  M0-P14: its old `none`/`commit`/`pr` behavior is not the prepared P12/P13
+  guarantee and must not be described as safe local publication. P12's
+  prepared host APIs are `acceptCandidate`, `integrateAcceptedCandidate`,
+  `publishLocalResult`, and `discardCandidateWorkspace`; P13 adds
+  `publishPullRequest`. These remain callable under the host lock but are not
+  wired into `waves.ts` yet.
+
+### M0-P13 — verified stacked PR publication (prepared; not driver-active)
+
+- `publishPullRequest(kit, wave, options)` requires a current exact grant,
+  matching acceptance/integration receipts, an integrated commit with the
+  accepted tree and exactly one recorded parent, `delivery.mode = "pr"`, and
+  explicit `deliverExplicit: true` (the CLI's `--deliver` consent). It reads
+  the destination only from the exact-root operator host policy's
+  `projects[].deliveryOrigin`; the optional profile path exists only as a
+  test seam. `src/sandbox/host-profile.ts` rejects insecure/non-regular profile
+  files and accepts only canonical HTTPS `github.com/owner/repo[.git]` URLs.
+  No project config, Git remote, task, or caller-supplied URL can select a
+  destination.
+- Before publication, the pinned candidate and its integration parent are
+  scanned. Any `private` path per `classifyProjectPath` or §2 secret path
+  (`.env*`, `.npmrc`, `.netrc`, `.pypirc`, `.ssh/**`, `.aws/**`, `*.pem`,
+  `*.key`) refuses; the helper never untracks files or scrubs history.
+- The narrow `RemoteGitTransport` only queries an exact fully qualified
+  branch ref and performs a create-only push. The trusted implementation uses
+  the profile-approved URL and an empty-expected `--force-with-lease`; an
+  absent ref may be created, an exact existing OID is observed without push,
+  and any different OID blocks. A previously attempted/published but now
+  absent ref is not recreated. No branch update, checkout, merge, or repair is
+  available.
+- The reviewed base branch must still point at the planned base commit. A
+  later task may target only the unique, already-published PR branch whose
+  integration commit is its exact sole parent; its remote tip must still equal
+  that parent. Thus A targets the reviewed base and B targets A's observed
+  branch, while B's commit still has A's accepted integration commit as its
+  parent.
+- `PullRequestHost` searches all PRs for the explicit repo/head so conflicts
+  are detectable, and creates with explicit `--repo`, `--base`, and `--head`.
+  The trusted `gh` adapter queries reported base/head refs and OIDs. Exactly one
+  open PR with the canonical repo, base ref/OID, head ref/OID, number, and URL
+  must validate before the delivery receipt becomes `published`. Ambiguity or
+  mismatch is `unknown`.
+- Delivery receipts journal the exact accepted commit, fully-qualified head
+  ref, target base ref, and (only after host validation) PR number/URL. Retries
+  re-read the base/head refs and query the PR host first. An exact PR found
+  after a lost create response is acknowledged; a possibly attempted create
+  with no observable PR stays unknown and is never blindly repeated. A lost
+  remote-ref push response is reconciled by exact OID readback.
+- `test/pr-publication.test.ts` exercises the prepared operation with a local
+  bare Git remote and injected fake PR host; it makes no live network call and
+  reads no GitHub credential. The operation remains prepared until P14 wires
+  it into the serial driver.
+
+## src/sandbox/host-profile.ts
+
+- `readApprovedDeliveryOrigin(projectRoot, profilePath?)` finds exactly one
+  canonical-root project entry in the operator-owned version-1 host policy and
+  returns only its validated `deliveryOrigin`; no other host-policy value is
+  exposed to PR publication. Production uses the §2 platform path; the path
+  override is an internal fake-profile test seam.
+- `parseApprovedGitHubOrigin` rejects non-HTTPS, non-GitHub, credentialed,
+  ported, query/fragment, malformed, and multi-path URLs and returns one
+  canonical `https://github.com/owner/repository.git` origin plus the repository
+  identity used to validate PR-host reports.
 
 ## src/views/*.ts + src/cli.ts
 
