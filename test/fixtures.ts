@@ -2,13 +2,14 @@
  * Test fixtures (§7): faux provider (scripted model outputs), configurable
  * MemoryStorage-or-SQLite storage, injectable fake clock, and a tiny demo
  * project scaffold helper that walks the REAL init template set.
+ *
+ * All SDK surface (pi-durable / pi-ai, including the faux subpath) arrives
+ * through ./kit-types.ts — the test-side window into the pinned seam
+ * (M0-P02, enforced by test/kit-seam.test.ts).
  */
-import { createModels } from "@earendil-works/pi-ai/models";
-import type { Models } from "@earendil-works/pi-ai";
-import { fauxProvider, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { FauxProviderHandle, FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
-import { MemoryStorage } from "@earendil-works/pi-durable";
-import type { SetTimer } from "./kit-types.ts";
+import { fauxProvider, MemoryStorage, fauxAssistantMessage, fauxText, fauxToolCall } from "./kit-types.ts";
+import type { FauxProviderHandle, FauxResponseStep, Models, SetTimer } from "./kit-types.ts";
+import { createModels } from "../src/engine/kit.ts";
 
 /** Fresh FakeClock per use (setTimer wiring must match one harness at a time). */
 export function fakeClockFor() {

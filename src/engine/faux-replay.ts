@@ -21,12 +21,12 @@
  *   Per-run process: each role's queue starts at its first chunk (restarts
  *   replay deterministically; restarts mid-wave consume the next chunk).
  *   Missing script: every request answers a fixed stub (paper-trail run).
+ *
+ * All pi-ai surface arrives through `./kit.ts` — the pinned, mechanically
+ * enforced seam (M0-P02). This module never imports the SDK.
  */
-import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
-import { createModels } from "@earendil-works/pi-ai/models";
-import type { Models } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "./kit.ts";
+import type { AssistantMessage, FauxResponseStep, Models } from "./kit.ts";
 import { readFileSync, existsSync } from "node:fs";
 
 export const FAUX_MODELS = ["kit-planner", "kit-impl", "kit-verifier"] as const;

@@ -2,11 +2,21 @@
  * Project config loader: `.orch/config.toml`, simple schema, defaults,
  * errors in plain words. No secrets live here (env provides credentials).
  */
+import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as toml from "smol-toml";
 
-export const KIT_VERSION = "0.1.0";
+const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+
+/**
+ * Kit identity: the PACKAGE version is the single source. init's
+ * `.orch/kit-version` marker, the CLI version header, and every readout
+ * identity read this same value, so package.json, init, and the CLI always
+ * agree. kitVersion values already recorded in durable stores are historical
+ * state and are never rewritten.
+ */
+export const KIT_VERSION = pkg.version;
 
 export type RoleName = "planner" | "implementer" | "verifier";
 export const ROLES: readonly RoleName[] = ["planner", "implementer", "verifier"];

@@ -1,23 +1,36 @@
 /**
- * Project harness: the ONLY module (besides infos.ts) allowed to import
- * `@earendil-works/pi-durable` and `@earendil-works/pi-ai`
- * (API encapsulation, brief §3.10).
- *
- * Responsibilities (brief §3.1): open SQLite storage under `.orch/lock`
- * (single-store-owner rule), wire role→provider models, install the registry
- * with harness-enforced boundaries (§3.6), expose durable settings, atomic
+ * Project harness: opens SQLite storage under `.orch/lock` (single-store-owner
+ * rule), wires role→provider models, installs the registry with
+ * harness-enforced boundaries (§3.6), exposes durable settings, atomic
  * `.orch/status.json` flushing, and the PD version assertion with a fail-fast
  * "see docs/api-map.md before upgrading" message.
+ *
+ * Every pi-durable / pi-ai surface arrives through `./kit.ts` — the pinned,
+ * mechanically enforced seam (M0-P02; test/kit-seam.test.ts). This module is
+ * a caller of the seam, never an SDK importer.
  */
-import { createRequire } from "node:module";
 import { join } from "node:path";
-import { BACKGROUND_CONTEXT, Harness, NodeExecutionEnv, openNodeSqliteStorage, createReadTool, createWriteTool, createEditTool, createBashTool, createRegistry, defineDoc, defineExtension, hook, ToolTask } from "./kit.ts";
-import type { Context, Session, ConversationDocToken, Extension, ToolRegistration, SetTimer } from "./kit.ts";
-import { createModels } from "@earendil-works/pi-ai/models";
-import type { Models, Provider, Usage } from "@earendil-works/pi-ai";
-import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
-import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
-import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
+import {
+	anthropicProvider,
+	BACKGROUND_CONTEXT,
+	createBashTool,
+	createEditTool,
+	createModels,
+	createReadTool,
+	createRegistry,
+	createWriteTool,
+	defineDoc,
+	defineExtension,
+	Harness,
+	hook,
+	NodeExecutionEnv,
+	openaiProvider,
+	openNodeSqliteStorage,
+	openrouterProvider,
+	readInstalledPiDurableVersion,
+	ToolTask,
+} from "./kit.ts";
+import type { Context, ConversationDocToken, Extension, Models, Provider, Session, SetTimer, ToolRegistration, Usage } from "./kit.ts";
 import { LockBusyError, acquireLock } from "../util/lockfile.ts";
 import { GovernorSleep } from "./tasks.ts";
 import { maybeFauxModels } from "./faux-replay.ts";
@@ -42,10 +55,19 @@ export type { Context };
 /** Pinned pi-durable version this kit was written against. */
 export const PD_VERSION = "1.5.0";
 
-export function readInstalledPiDurableVersion(): string {
-	const require = createRequire(import.meta.url);
-	const pkg = require("@earendil-works/pi-durable/package.json") as { version: string };
-	return pkg.version;
+/**
+ * Read-only observation of a project that has never run: `.orch/durable.sqlite`
+ * does not exist, and a view must not create it just to inspect. Callers
+ * expose empty/absent evidence (side-car readout) instead of materializing a
+ * database.
+ */
+export class StoreAbsentError extends Error {
+	readonly database: string;
+	constructor(database: string) {
+		super(`no durable storage at ${database} — this project has never run; there is nothing to observe (empty evidence)`);
+		this.name = "StoreAbsentError";
+		this.database = database;
+	}
 }
 
 /** Fail fast on version mismatch with a pointer at the API map. */
@@ -108,6 +130,8 @@ export type LoopGuardDocValue = {
 	role: "implementer" | "verifier" | "planner";
 	/** Non-empty: write/edit outside these paths are blocked (implementer only). */
 	targetPaths: string[];
+	/** Host-issued execution identity; absent for legacy/prepared compatibility conversations. */
+	execution?: { planRevision: string; taskId: string; leaseId: string };
 }
 
 export const LoopGuardDoc: ConversationDocToken<LoopGuardDocValue> = defineDoc({
@@ -192,15 +216,14 @@ const builtinProviderFactories: Record<string, () => Provider> = {
  * Build the session `Models` from the providers the config roles name.
  * Credentials resolve from env at request time (§ anti-goal: no secrets in config).
  * Tests register the faux provider via `models.setProvider(faux.provider)` themselves.
+ * Observers (readView) never call this: they build no providers at all.
  */
-export function buildModels(needed: Iterable<string>, flags: { fauxOverlay?: boolean; lenient?: boolean } = {}): Models {
+export function buildModels(needed: Iterable<string>, flags: { fauxOverlay?: boolean } = {}): Models {
 	const models = createModels();
 	for (const id of needed) {
 		if (id === "faux" && flags.fauxOverlay) continue; // overlay wired via maybeFauxModels()
-		if (id === "faux" && flags.lenient) continue; // read-only views never send requests; display-only projects may say "faux"
 		const factory = builtinProviderFactories[id];
 		if (!factory) {
-			if (flags.lenient) continue; // visibility commands wire only what they will never call
 			throw new Error(
 				`roles.*.provider = "${id}" is not wired in this kit (supports: ${Object.keys(builtinProviderFactories).join(", ")}) — ` +
 					`see docs/api-map.md; config.toml holds no secrets, credentials come from env as pi-ai expects`,
@@ -265,11 +288,24 @@ export async function openProjectHarness(
 		const config = loadConfig(root, paths.config);
 		assertPinnedPiDurable(config.engine.piDurable);
 
+		// Read-only views must not create storage just to look: a never-run project
+		// has no database, and inspection reports empty/absent evidence (callers
+		// fall back to side-cars) instead of materializing one.
+		if (opts.readView === true && !fileExists(paths.database)) {
+			throw new StoreAbsentError(paths.database);
+		}
+
 		const faux = maybeFauxModels();
+		// Observers never dispatch: a readView open builds NO providers (an empty
+		// Models registry), so inspection never constructs a provider object or
+		// resolves its credentials — even for providers a real run would wire.
+		// Tests still inject their scripted faux overlay via modelsOverride.
 		const models =
 			opts.modelsOverride ??
 			faux?.models ??
-			buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined, lenient: opts.readView === true });
+			(opts.readView === true
+				? createModels()
+				: buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined }));
 
 		const tools: ToolRegistration[] = [createReadTool(), createWriteTool(), createEditTool(), createBashTool()];
 		const registry = createRegistry();
@@ -288,6 +324,10 @@ export async function openProjectHarness(
 			models,
 			registry,
 			...(opts.now || opts.setTimer ? { now: opts.now, setTimer: opts.setTimer } : {}),
+			// Observers open read-only under the SAME host lock: no scheduling, no
+			// admission/recovery writes, no task progress; commits with writes
+			// reject with the SDK's ReadOnlySession (§1 ADR 14).
+			...(opts.readView === true ? { readOnly: true } : {}),
 			env: ({ cwd }) => new NodeExecutionEnv({ cwd: cwd ?? root }),
 			settings: {
 				retry: { enabled: true, maxRetries: opts.retryMax ?? 3, baseDelayMs: 2_000 },
