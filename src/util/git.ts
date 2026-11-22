@@ -5,6 +5,10 @@ import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import { spawn } from "node:child_process";
 
+// Prepared workspace callers use these immutable-tree helpers; the existing
+// checkout-oriented helpers below remain legacy driver plumbing until P14.
+export { diffTrees, readTreeEntries, resolveTree, type GitTreeChange, type GitTreeEntry } from "./git-objects.ts";
+
 export interface GitResult {
 	ok: boolean;
 	stdout: string;
@@ -147,7 +151,11 @@ export async function captureBaselineTree(cwd: string): Promise<string> {
 	const tmpIndex = `${cwd}/.orch/.baseline-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 	const env = { GIT_INDEX_FILE: tmpIndex };
 	try {
-		const add = await exec(["git", "add", "--", ...files], { cwd, timeoutMs: 120_000, env });
+		// -f: the snapshot must cover engine-relevant worktree bytes regardless
+		// of ignore status (router.md is now ignore-by-default paper trail, and
+		// user-ignored dirs like coverage/ were always walked). The throwaway
+		// index never pollutes the project index.
+		const add = await exec(["git", "add", "-f", "--", ...files], { cwd, timeoutMs: 120_000, env });
 		if (add.code !== 0) {
 			throw new Error(`baseline snapshot failed at git add: ${(add.stderr || "").slice(0, 200)}`);
 		}
