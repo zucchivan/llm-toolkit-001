@@ -5,8 +5,7 @@ import { join } from "node:path";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { initProject } from "../src/init.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
-import type { FauxProviderHandle, Models } from "@earendil-works/pi-ai";
-import { readSessionState, commitState } from "../src/engine/state.ts";
+import type { FauxProviderHandle, Models } from "./kit-types.ts";
 
 export interface Baked {
 	project: Awaited<ReturnType<typeof prepareDemoProject>>;
@@ -94,15 +93,16 @@ export async function scripted(kit: Awaited<ReturnType<typeof openProjectHarness
 	faux.appendResponses(responses);
 }
 
-/** Plan from the fixture PRD (already scripted responses) + stamp approval. */
-export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarness>>): Promise<void> {
+/**
+ * Plan from the fixture PRD (already scripted responses) + the ACTUAL approval
+ * function (M0-P05): a revision-qualified grant through `approveGrant` — never
+ * a bare-timestamp stamp. Returns the granted plan revision.
+ */
+export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarness>>): Promise<string> {
 	const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
+	const { approveGrant } = await import("../src/engine/waves.ts");
 	const prd = await loadPrd(kit);
-	await runPlan(kit, "docs/prd.md", prd);
-	await commitState(kit, {
-		runStatus: (d) => {
-			d.humanApprovedAt = Date.now();
-		},
-	});
-	void readSessionState;
+	const outcome = await runPlan(kit, "docs/prd.md", prd);
+	await approveGrant(kit, { planRevision: outcome.planRevision });
+	return outcome.planRevision;
 }

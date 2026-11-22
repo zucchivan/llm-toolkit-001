@@ -49,7 +49,9 @@ describe("plan review guidance", () => {
 		const { stdout } = await runCli(process.cwd(), ["--help"]);
 
 		expect(stdout).toContain("plan [--prd path]");
-		expect(stdout).toContain("run [--approve]");
+		// M0-P05: approval names the plan revision (no hidden default revision).
+		expect(stdout).toContain("run --approve --revision <uuid>");
+		expect(stdout).toContain("resume the stored grant");
 		expect(stdout).not.toContain("plan --approve");
 	}, 40_000);
 });

@@ -12,13 +12,18 @@ import { atomicWriteJson, readJson } from "../util/fsx.ts";
 import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock } from "./harness.ts";
-import { commitState, readSessionState } from "./state.ts";
+import {
+	commitState, readSessionState, grantRefusal, readGrant, approvalMirrorRefusal, resolveGrantSelection,
+} from "./state.ts";
+import type { Grant, SessionState } from "./state.ts";
 import type { RouterTask, RouterDocValue, WaveRow, TaskFeedback } from "./infos.ts";
 import { runGates } from "./gates.ts";
 import { renderRouterMd } from "./infos.ts";
 import type { GateOutcome } from "./gates.ts";
 import { runVerify, gateSummaryText } from "./verifier.ts";
 import type { VerifyResult } from "./verifier.ts";
+import { gateCheckFromResult, gateReceiptEvent, passReceiptEvent } from "./receipts.ts";
+import type { GateCheck } from "./receipts.ts";
 import {
 	assessFailureTriage, persistFailureTriageAssessment, type FailureTriageEvidence,
 } from "./failure-triage.ts";
@@ -28,6 +33,7 @@ import type { DisplayDiffStats } from "../util/git.ts";
 import { runDelivery } from "./delivery.ts";
 import type { ProgressEvent } from "./driver-events.ts";
 import type { JudgmentClient } from "../judgment/types.ts";
+import { trustedCompatibilityContext } from "./workspace.ts";
 
 export class DriverStateError extends Error {}
 
@@ -45,13 +51,25 @@ Discipline:
 // ---------------------------------------------------------------------------
 
 export function pickNextTask(tasks: readonly RouterTask[]): RouterTask | undefined {
+	return pickNextTaskInSelection(tasks, tasks.map((t) => t.id));
+}
+
+/**
+ * Candidate selection INSIDE a grant (M0-P05): candidates come only from the
+ * granted ids, while dependency satisfaction is looked up against ALL plan
+ * tasks (a dependency done outside the grant counts as satisfied; a selected
+ * task's unsatisfied dependency outside the selection was already refused at
+ * approval). Priority then id breaks ties.
+ */
+export function pickNextTaskInSelection(tasks: readonly RouterTask[], selected: readonly string[]): RouterTask | undefined {
+	const selectedSet = new Set(selected);
 	const doneOrGone = new Set(tasks.filter((t) => t.status === "done").map((t) => t.id));
 	// UI seam A.1: waves set their task in_progress while running (and reset it at
 	// every wave end), so a run killed mid-wave leaves exactly one in_progress
-	// task behind. Resuming it is durability as before — `run --approve` picks it
+	// task behind. Resuming it is durability as before — the grant's run picks it
 	// up; omitting in_progress here would turn every crashed wave into a dead end.
 	const candidates = tasks.filter(
-		(t) => (t.status === "todo" || t.status === "in_progress") && t.dependsOn.every((d) => doneOrGone.has(d)),
+		(t) => selectedSet.has(t.id) && (t.status === "todo" || t.status === "in_progress") && t.dependsOn.every((d) => doneOrGone.has(d)),
 	);
 	if (candidates.length === 0) return undefined;
 	candidates.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
@@ -62,31 +80,148 @@ export function pickNextTaskForOrder(tasks: readonly RouterTask[]): RouterTask |
 	return pickNextTask(tasks);
 }
 
+/** Snapshot of one grant's position in the plan (selection facts, M0-P05). */
+export interface SelectionFacts {
+	/** Granted tasks still owed work (todo or in_progress). */
+	outstanding: RouterTask[];
+	/** Granted tasks that ended quarantined. */
+	quarantined: string[];
+	/** Plan task ids not done (inside or outside the grant). */
+	remainingPlanIds: string[];
+	/** True iff EVERY plan task is done (whole-plan fulfillment). */
+	allDone: boolean;
+}
+
+export function selectionFacts(tasks: readonly RouterTask[], selected: readonly string[]): SelectionFacts {
+	const selectedSet = new Set(selected);
+	const selectedTasks = tasks.filter((t) => selectedSet.has(t.id));
+	return {
+		outstanding: selectedTasks.filter((t) => t.status === "todo" || t.status === "in_progress"),
+		quarantined: selectedTasks.filter((t) => t.status === "quarantined").map((t) => t.id),
+		remainingPlanIds: tasks.filter((t) => t.status !== "done").map((t) => t.id),
+		allDone: tasks.length > 0 && tasks.every((t) => t.status === "done"),
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
 export interface RunOptions {
-	approve: boolean;
+	/** A NEW grant (the review point): approve exactly this plan revision —
+	 *  the CLI's `run --approve --revision <uuid>`. Validation (revision,
+	 *  subset, mirror) happens in `approveGrant` before any dispatch.
+	 *  Absent approve = bare resume of the stored grant. */
+	approve?: { planRevision: string };
+	/** The `--tasks` ids, repeated once per id. With `approve`: the granted
+	 *  subset (absent/empty = every plan id, stored explicitly — the full list
+	 *  is not a wildcard). Without `approve`: an explicit set that must EQUAL
+	 *  the stored grant (a bare resume inherits it unchanged). */
+	tasksFilter?: string[];
 	deliverExplicit?: boolean;
-	/** Task ids to run instead of the whole queue (empty = all). */
-	tasksFilter: string[];
 	/** Optional Jev injection for tests/embedders; disabled unless explicitly configured. */
 	judgmentClient?: JudgmentClient;
 }
 
-export type DriverExit = "complete" | "budget" | "sleeping" | "arrived-blocked" | "error";
+/**
+ * §3 transition-5 exits: `plan-complete`/`selection-complete` are the two
+ * distinct fulfillment strings (both exit 0); `blocked` (quarantine or
+ * unsatisfiable selection), `budget` are policy stops (exit 2); `sleeping`
+ * is the rate-limit wait (exit 42). Hard errors throw (exit 1); SIGINT is
+ * the CLI's 130.
+ */
+export type DriverExit = "plan-complete" | "selection-complete" | "blocked" | "budget" | "sleeping";
 
 export interface RunSummaryInfo {
 	exit: DriverExit;
 	ranWaves: number[];
+	/** True iff EVERY plan task is done (whole-plan fulfillment — the only
+	 *  thing that flips the router phase to complete). A satisfied subset is
+	 *  selection-complete with complete=false. */
 	complete: boolean;
-	/** Arrived-stop extra: task ids that ended "quarantined" when the queue
-	 *  drained. Non-empty means the run stopped short of a clean complete —
-	 *  i.e. exit "complete" with complete=false (never a plain success);
-	 *  empty means the only terminal stop (or a non-terminal exit). */
+	/** The exact grant this run executed (ADR 01). */
+	grant: Grant;
+	/** Plan task ids not done when the run ended. */
+	remainingPlanIds: string[];
+	/** Granted task ids that ended quarantined at the stop. */
 	quarantined: string[];
+	/** Granted task ids the run stopped on (quarantined, or outstanding and
+	 *  blocked by quarantined dependencies). */
+	blockedIds: string[];
 	alert?: string;
+}
+
+/**
+ * M0-P05 anticipation (§3 transition 5): a new grant must not be minted
+ * while a different active checkpoint is unresolved (recovery blocks the
+ * queue, and a disjoint grant is possible only after pending effects are
+ * reconciled). No checkpoint records exist in this milestone's state model
+ * yet (they arrive with the wave-keyed checkpoint/receipt packets), so this
+ * refusal is a documented no-op today; it returns the named conflict once
+ * durable checkpoints exist.
+ */
+function activeCheckpointConflict(state: SessionState): string | undefined {
+	void state;
+	return undefined;
+}
+
+export interface ApprovalRequest {
+	/** The plan revision being approved (the CLI's --revision). */
+	planRevision: string;
+	/** Explicit subset (repeated --tasks); absent or empty = every plan id. */
+	tasks?: string[];
+}
+
+/**
+ * ADR 01's approval act — the ONLY path that mints a grant. Validates the
+ * request against the durable state and the canonical router.md mirror
+ * under the host lock, then persists the grant `{planRevision, selected,
+ * humanApprovedAt}` + the phase flip + the review row in ONE state commit.
+ * The CLI's `run --approve --revision`, the in-process driver and the test
+ * fixtures all go through it, so no stamp can exist without a
+ * revision-qualified, mirror-matched human review.
+ */
+export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest): Promise<Grant> {
+	const state = await readSessionState(kit.loop.harness);
+	if (!state.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
+	const refusal = grantRefusal(state, { approve: { planRevision: request.planRevision, tasks: request.tasks } });
+	if (refusal) throw new DriverStateError(refusal);
+	const checkpointConflict = activeCheckpointConflict(state);
+	if (checkpointConflict) throw new DriverStateError(checkpointConflict);
+	// The grant binds the human to what they reviewed: the mirror must exist
+	// and match the canonical durable render (edited/missing → replan).
+	const mirrorRefusal = await approvalMirrorRefusal(kit, state);
+	if (mirrorRefusal) throw new DriverStateError(mirrorRefusal);
+	const selected = resolveGrantSelection(state, request.tasks);
+	const at = Date.now();
+	await commitState(kit, {
+		router: (d) => {
+			if (d.phase === "planned") d.phase = "running";
+		},
+		runStatus: (d) => {
+			d.approvedPlanRevision = request.planRevision;
+			d.approvedSelected = selected;
+			d.humanApprovedAt = at;
+		},
+		rows: [{
+			ts: at,
+			kind: "wave",
+			task: "session",
+			verb: "approved",
+			detail: `plan revision ${request.planRevision} — grant: ${selected.join(", ")}`,
+		}],
+		statusPhase: { phase: "idle", message: `plan revision ${request.planRevision} approved — grant: ${selected.join(", ")}` },
+	});
+	return { planRevision: request.planRevision, selected, humanApprovedAt: at };
+}
+
+/** The committed stop-short row: the paper trail names the policy stop. */
+function stoppedRow(detail: string): WaveRow {
+	return { ts: Date.now(), kind: "wave", task: "session", verb: "stopped", detail };
+}
+
+function stopShortStatus(facts: SelectionFacts): { phase: "idle"; message: string } {
+	return { phase: "idle", message: `stopped short — ${facts.quarantined.length} task(s) quarantined: ${facts.quarantined.join(", ")}` };
 }
 
 export async function runWaves(
@@ -95,25 +230,21 @@ export async function runWaves(
 	onProgress?: (event: ProgressEvent) => void,
 ): Promise<RunSummaryInfo> {
 	const emit = (event: ProgressEvent) => onProgress?.(event);
-	const state = await readSessionState(kit.loop.harness);
+	const initial = await readSessionState(kit.loop.harness);
 
-	// Human approval gate (§4.1): plan refuses to start waves until approved.
-	if (!state.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
-	if (state.runStatus.humanApprovedAt !== undefined || options.approve) {
-		await commitState(kit, {
-			router: (d) => {
-				if (d.phase === "planned") d.phase = "running";
-			},
-			rows: state.router.phase === "planned" && state.runStatus.humanApprovedAt === undefined
-				? [{ ts: Date.now(), kind: "wave", task: "session", verb: "approved", detail: "--approve stamped the router" }]
-				: [],
-		});
-	}
-	const approvedByStamp = state.runStatus.humanApprovedAt !== undefined;
-	if (!options.approve && !approvedByStamp) {
-		throw new DriverStateError(
-			'router doc is PLANNED but not human-approved — rerun with --approve after reviewing router.md (this is the plan review point)',
-		);
+	// Grant admission (M0-P05, ADR 01) — BEFORE any handoff ingestion, sleep
+	// wait, budget read or wave: no tool/model dispatch happens on an
+	// unvalidated grant, and a refusal never mutates state.
+	if (!initial.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
+	// An empty tasksFilter means "no explicit set" (never an empty grant).
+	const explicitTasks = options.tasksFilter?.length ? options.tasksFilter : undefined;
+	let grant: Grant;
+	if (options.approve) {
+		grant = await approveGrant(kit, { planRevision: options.approve.planRevision, tasks: explicitTasks });
+	} else {
+		const refusal = grantRefusal(initial, { tasks: explicitTasks });
+		if (refusal) throw new DriverStateError(refusal);
+		grant = readGrant(initial.runStatus)!; // grantRefusal refuses an incomplete grant
 	}
 
 	// Ingest a queued user handoff note (§3.1) before the next wave starts.
@@ -129,49 +260,67 @@ export async function runWaves(
 		await import("node:fs/promises").then((fs) => fs.rm(kit.loop.paths.pendingHandoff, { force: true }));
 	}
 
-		// Resume a live rate-limit sleep from a previous run, if any.
+	// Resume a live rate-limit sleep from a previous run, if any.
 	await recomputeSpent(kit);
 	const slept = await waitOutSleep(kit);
 	if (slept) await recomputeSpent(kit);
 
-	const summary: RunSummaryInfo = { exit: "complete", ranWaves: [], complete: false, quarantined: [] };
+	const summary: RunSummaryInfo = {
+		exit: "plan-complete",
+		ranWaves: [],
+		complete: false,
+		grant,
+		remainingPlanIds: [],
+		quarantined: [],
+		blockedIds: [],
+	};
 
 	for (;;) {
+		// Latest state before every selection (§3 transition 5); the selection
+		// facts are recomputed against the durable doc, never a stale array.
 		const stateNow = await readSessionState(kit.loop.harness);
-		const routerTasks = stateNow.router.tasks;
-		if (!options.tasksFilter.length) {
-			const done = routerTasks.every((t) => t.status !== "todo" && t.status !== "in_progress");
-			if (done) {
-				// "quarantined" is terminal and rides the check above — a drained
-				// queue that still has quarantined members is NOT a plain success:
-				// stop short instead, mirroring "arrived-blocked" (no router phase
-				// change; exit stays "complete" while complete=false + the ids
-				// below carry the truth).
-				const quarantinedIds = routerTasks.filter((t) => t.status === "quarantined").map((t) => t.id);
-				if (quarantinedIds.length) {
-					summary.complete = false;
-					summary.quarantined = quarantinedIds;
-					const quarantinedText = `${quarantinedIds.length} task(s) quarantined: ${quarantinedIds.join(", ")}`;
-					emit({ kind: "quarantine-stop", quarantined: quarantinedIds, message: `the task queue drained with ${quarantinedText}` });
+		const facts = selectionFacts(stateNow.router.tasks, grant.selected);
+		summary.quarantined = facts.quarantined;
+		summary.remainingPlanIds = facts.remainingPlanIds;
+
+		if (facts.outstanding.length === 0) {
+			if (facts.allDone) {
+				// Whole-plan fulfillment: the ONLY thing that flips the router phase
+				// to complete — recorded once (a re-run on a complete plan writes
+				// nothing and does no additional work).
+				if (stateNow.router.phase !== "complete") {
 					await commitState(kit, {
-						// no router phase change: only a clean (quarantine-free) drain is "complete"
-						statusPhase: { phase: "idle", message: `complete — ${quarantinedText}` },
-						rows: [{ ts: Date.now(), kind: "wave", task: "session", verb: "complete", detail: `queue empty; quarantined: ${quarantinedIds.join(", ")}` }],
+						router: (d) => {
+							d.phase = "complete";
+						},
+						statusPhase: { phase: "idle", message: "complete — every task in the plan is done" },
+						rows: [{ ts: Date.now(), kind: "wave", task: "session", verb: "complete", detail: "whole plan fulfilled: every task done" }],
 					});
-					break;
 				}
+				summary.exit = "plan-complete";
 				summary.complete = true;
-				summary.exit = "complete";
-				emit({ kind: "complete", message: "STATUS: COMPLETE — the task queue is empty" });
-				await commitState(kit, {
-					router: (d) => {
-						d.phase = "complete";
-					},
-					statusPhase: { phase: "idle", message: "complete" },
-					rows: [{ ts: Date.now(), kind: "wave", task: "session", verb: "complete", detail: "queue empty" }],
-				});
+				emit({ kind: "complete", message: "STATUS: COMPLETE — every task in the plan is done" });
 				break;
 			}
+			if (facts.quarantined.length) {
+				// A quarantined member stops the selection: policy stop with ids,
+				// never 0/complete (also the reopen path after an earlier stop).
+				summary.exit = "blocked";
+				summary.blockedIds = facts.quarantined;
+				emit({ kind: "quarantine-stop", quarantined: facts.quarantined, message: `selection stopped short: ${facts.quarantined.length} task(s) quarantined: ${facts.quarantined.join(", ")}` });
+				await commitState(kit, { statusPhase: stopShortStatus(facts), rows: [stoppedRow(`quarantined: ${facts.quarantined.join(", ")}`)] });
+				break;
+			}
+			// The granted subset is fulfilled while the plan still has work
+			// OUTSIDE the grant: selection success, phase stays open.
+			summary.exit = "selection-complete";
+			emit({
+				kind: "selection-complete",
+				selected: grant.selected,
+				remainingPlanIds: facts.remainingPlanIds,
+				message: `selection complete — the granted task(s) are fulfilled; ${facts.remainingPlanIds.length} plan task(s) remain outside the grant`,
+			});
+			break;
 		}
 
 		// Budget ceiling first (§4.5): stop the loop before starting another wave.
@@ -187,22 +336,27 @@ export async function runWaves(
 			break;
 		}
 
-		const task = pickNextTask(routerTasks);
+		const task = pickNextTaskInSelection(stateNow.router.tasks, grant.selected);
 		if (!task) {
-			summary.exit = "arrived-blocked";
-			emit({ kind: "blocked", message: "remaining tasks are blocked by quarantined dependencies — no runnable task" });
+			// Outstanding granted tasks are blocked: their dependencies ended
+			// quarantined (this run or a previous one). Policy stop with ids.
+			summary.exit = "blocked";
+			summary.blockedIds = [...new Set([...facts.quarantined, ...facts.outstanding.map((t) => t.id)])];
+			emit({ kind: "blocked", message: `remaining granted tasks are blocked by quarantined dependencies — no runnable task (blocked: ${summary.blockedIds.join(", ")})`, blockedIds: summary.blockedIds });
 			await commitState(kit, {
-				statusPhase: { phase: "idle", message: "blocked by quarantined dependencies" },
+				statusPhase: { phase: "idle", message: `blocked by quarantined dependencies: ${summary.blockedIds.join(", ")}` },
+				rows: [stoppedRow(`blocked by quarantined dependencies: ${summary.blockedIds.join(", ")}`)],
 			});
 			break;
 		}
-	
+
 		// ---- Per-task wave loop
 		const outcome = await driveTaskWaves(kit, task, {
 			handoffNote: handoff?.note,
 			onEvent: emit,
 			deliverExplicit: options.deliverExplicit,
 			judgmentClient: options.judgmentClient,
+			planRevision: grant.planRevision,
 		});
 		if (outcome === "sleeping") {
 			summary.exit = "sleeping";
@@ -212,16 +366,18 @@ export async function runWaves(
 			summary.exit = "budget";
 			break;
 		}
-		if (options.tasksFilter.length && routerTasks.length) {
-			// filtered mode: stop when the filter set is drained
-			const remaining = options.tasksFilter.filter((id) => {
-				const t = routerTasks.find((x) => x.id === id);
-				return t && t.status === "todo";
-			}).length;
-			if (remaining === 0) {
-				summary.complete = true;
-				break;
-			}
+		if (outcome === "quarantined") {
+			// §3 transition 5: stop the selection on its first quarantine — a
+			// policy stop with ids, never a drained-queue success.
+			const stopped = await readSessionState(kit.loop.harness);
+			const stopFacts = selectionFacts(stopped.router.tasks, grant.selected);
+			summary.quarantined = stopFacts.quarantined;
+			summary.remainingPlanIds = stopFacts.remainingPlanIds;
+			summary.exit = "blocked";
+			summary.blockedIds = [...new Set([task.id, ...stopFacts.quarantined])];
+			emit({ kind: "quarantine-stop", quarantined: stopFacts.quarantined, message: `selection stopped short: ${task.id} quarantined` });
+			await commitState(kit, { statusPhase: stopShortStatus(stopFacts), rows: [stoppedRow(`selection stopped on quarantined: ${stopFacts.quarantined.join(", ")}`)] });
+			break;
 		}
 		summary.ranWaves.push(task.waveCount);
 	}
@@ -245,6 +401,9 @@ export interface TaskWavesOptions {
 	onEvent?: (e: ProgressEvent) => void;
 	deliverExplicit?: boolean;
 	judgmentClient?: JudgmentClient;
+	/** The granted plan revision (M0-P11): wave-keyed gate/pass receipts bind
+	 *  to the authorized revision this run executes. */
+	planRevision: string;
 }
 
 export interface TaskWavesResult {
@@ -259,6 +418,9 @@ export async function driveTaskWaves(
 	const paths = kit.loop.paths;
 	const emit = (e: ProgressEvent) => opts.onEvent?.(e);
 	const convKit = new ConversationKit(kit, kit.loop.toolBox);
+	// Explicit pre-cutover bridge: the serial driver still runs trusted fixtures
+	// against the operator root until P14; prepared task contexts are not active.
+	const executionContext = trustedCompatibilityContext(paths);
 
 	for (;;) {
 		const state = await readSessionState(kit.loop.harness);
@@ -287,7 +449,7 @@ export async function driveTaskWaves(
 		// Conversation lifecycle (§4.2.4).
 		let conv = current.convId !== undefined ? await convKit.find(current.convId) : undefined;
 		if (!conv) {
-			conv = await openTaskConversation(kit, convKit, current);
+			conv = await openTaskConversation(kit, convKit, current, executionContext);
 			current.convId = conv.id as unknown as number;
 			await commitState(kit, {
 				router: (d) => {
@@ -371,8 +533,34 @@ export async function driveTaskWaves(
 		// Gates (§4.3). Router.md is engine-synced: the expected bytes render from
 		// the doc AS OF NOW (the loop-top read is stale across baseline commits).
 		const stateAtGate = await readSessionState(kit.loop.harness);
-		const mirrorText = renderRouterMd(stateAtGate.router.tasks, stateAtGate.router.phase, stateAtGate.runStatus.prdPath);
-		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths, baselineTreeSha: baseline }, { "router.md": mirrorText });
+		// Expected mirror bytes render from the durable doc INCLUDING its plan
+		// identity — byte-identical to what syncSideCars writes (M0-P04).
+		const mirrorText = renderRouterMd(
+			stateAtGate.router.tasks,
+			stateAtGate.router.phase,
+			stateAtGate.runStatus.prdPath,
+			stateAtGate.router.identity,
+			stateAtGate.router.archived,
+		);
+		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths, baselineTreeSha: baseline }, { "router.md": mirrorText }, { context: executionContext });
+
+		// M0-P11: the gate receipt binds the checked tree and every check outcome
+		// (skipped included) as a durable `loop.receipts` event. The trusted
+		// compatibility path captures the wave content the gates just inspected
+		// (prepared contexts check the frozen candidate — activated at P14). Pass
+		// receipts reference this receipt by id, so a pass can never claim
+		// evidence from another tree.
+		const checkedTree = await captureBaselineTree(paths.root);
+		const gateChecks: GateCheck[] = gate.results.map(gateCheckFromResult);
+		const gateReceipt = gateReceiptEvent(
+			{ planRevision: opts.planRevision, taskId: task.id, wave },
+			{
+				tree: checkedTree,
+				...(stateAtGate.router.identity?.controlsSha256 !== undefined ? { controlsSha256: stateAtGate.router.identity.controlsSha256 } : {}),
+				checks: gateChecks,
+			},
+		);
+		await commitState(kit, { receipts: [gateReceipt] });
 
 		if (gate.failHash && gate.failHash === current.lastGateHash) {
 			await commitState(kit, {
@@ -422,7 +610,9 @@ export async function driveTaskWaves(
 			continue;
 		}
 
-		// Verifier (§4.4).
+		// Verifier (§4.4). Both read-only passes receive the checked tree, the gate
+		// receipt id and the non-skipped outcomes independently; each pass is
+		// validated against the checked tree and committed before the next runs.
 		const verdict = await runVerify(kit, {
 			id: current.id,
 			title: current.title,
@@ -433,6 +623,9 @@ export async function driveTaskWaves(
 		}, gateSummaryText(gate.results), {
 			skepticSecondPass: kit.loop.config.gates.skepticSecondPass,
 			jevShadow: { enabled: kit.loop.config.gates.jevVerifierShadow, client: opts.judgmentClient },
+			executionContext,
+			gateEvidence: { tree: checkedTree, gateId: gateReceipt.value.id, checks: gateChecks },
+			waveIdentity: { planRevision: opts.planRevision, wave },
 		});
 
 		if (verdict.verdict === "approve") {
@@ -525,7 +718,7 @@ async function runFailureTriageShadow(
 }
 
 /** Open the implementer conversation with role config + guard doc. */
-async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, task: RouterTask) {
+async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, task: RouterTask, executionContext: ReturnType<typeof trustedCompatibilityContext>) {
 	const role = kit.loop.config.roles.implementer;
 	return convKit.createUnit({
 		instructions: `${IMPLEMENTER_BRIEF}\n\nKit: ${kit.loop.config.engine.piDurable} · project ${kit.loop.paths.root}`,
@@ -533,6 +726,7 @@ async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, 
 		tools: "coding",
 		model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
 		maxTurns: kit.loop.config.engine.maxTurns,
+		executionContext,
 	});
 }
 

@@ -9,10 +9,16 @@ Pull-request creation never merges code.
 
 - Runtime: [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable) **1.5.0** (pinned exact) on Node ≥ 22.19 (Node 24 LTS preferred).
 - One provider/model per ROLE (planner / implementer / verifier) from project config — subscription-budgeted, sequential v1, no parallel agent fan-out.
-- Durable SQLite storage is **local-only and git-ignored**. `router.md`,
-  `.orch/wave-log.jsonl`, gate artifacts, verifier verdicts, and run summaries
-  are local mirrors/artifacts, not guaranteed committed evidence; Git writes
-  occur only through the configured delivery path or explicit operator action.
+- Three-class repository hygiene (ADR 04): durable storage, locks, projections,
+  assessments, exports, and UI jobs under `.orch/` are **private** and
+  git-ignored by default; `router.md`, `.orch/wave-log.jsonl`, and
+  `.orch/kit-version` are the **optional local paper trail** — also ignored by
+  default, explicitly retainable after review (`git add -f`); the three
+  reviewable kit controls (`.orch/config.toml`, `.orch/gate-decisions.json`,
+  `.orch/gate-remediations.json`) stay committable but are never auto-staged.
+  These mirrors/artifacts are local evidence, not guaranteed committed
+  evidence; Git writes occur only through the configured delivery path or
+  explicit operator action.
 - Gates (recipes), a read-only verifier with a default-on adversarial second
   pass, and a budget governor (estimated session USD ceiling,
   zero-progress/duplicate-failure breakers, rate-limit durable sleep with exit
@@ -34,8 +40,11 @@ npx llm-toolkit-001 init . --with-demo     # in the repo root of your project
 llm-toolkit-001 plan --prd docs/prd.md     # writes RouterDoc + router.md, stops
 
 # 4. REVIEW router.md, the generated mirror. To change the graph, revise the
-#    PRD and rerun plan; do not edit router.md as plan input. Then approve:
-llm-toolkit-001 run --approve              # 0 ended (check stopped-short) · 42 sleeping · 1 busy/error
+#    PRD and rerun plan; do not edit router.md as plan input. Then approve by
+#    naming the revision `plan` printed (all tasks) or a subset (--tasks per id):
+llm-toolkit-001 run --approve --revision <uuid>            # 0 fulfilled · 2 stopped short · 42 sleeping · 1 busy/error
+llm-toolkit-001 run --approve --revision <uuid> --tasks one-task --tasks other-task
+llm-toolkit-001 run                        # resume the stored grant bare (no re-approval)
 llm-toolkit-001 status --follow            # live panel (reads .orch/status.json)
 
 # 5. paper trail: router.md (mirror), .orch/wave-log.jsonl (rows),
@@ -52,26 +61,39 @@ llm-toolkit-001 verify --task some-task-id  # one-off read-only verification
 
 `KIT_FAUX=1` runs every conversation on an in-package faux provider
 (`kit-planner` / `kit-impl` / `kit-verifier` model ids). `examples/demo-prd`
-ships the replay + gate script for the full plan→wave→gate→verify arc (task 2
-fails its gate on wave 1, the driver resets the conversation, wave 2 fixes it):
+ships the replay, the recipe file and the gate script for the full
+plan→wave→gate→verify arc — and the demo is falsifiable at runtime: three
+behavioral gates execute the product (parser + renderer, the case-insensitive
+query, and the real CLI invocation). Task 2's first scripted wave ships a
+CASE-SENSITIVE `queryList` that the executed gate rejects; the driver resets
+the conversation and wave 2 repairs it from the gate feedback — a retry proven
+by behavior, not by a BROKEN token:
 
 ```bash
-cp -r examples/demo-prd /tmp/demo && cd /tmp/demo
+cp -r examples/demo-prd /tmp/demo && cp examples/demo-prd/smoke-gate.cjs /tmp/demo/evals/ && cd /tmp/demo
 npm i <the kit repo>            # or install the kit globally / via npx
 
 llm-toolkit-001 init . --with-demo
 # point [roles.*] at provider "faux" + modelId kit-planner|kit-impl|kit-verifier
 #   (or KIT_FAUX=1 keeps probe-vs-credentials decoupled from real providers)
-# evals/recipes.toml: [broken-gate]\ncmd = "node smoke-gate.cjs"
+# evals/recipes.toml (shipped with the fixture) wires gate-list / gate-query /
+#   gate-cli to evals/smoke-gate.cjs — no hand-editing. The extra cp above is
+#   the demo setup: the reviewed gate bytes go to evals/ for execution.
 
 git init -q && git add -A && git commit -qm base   # the loop needs a repo
 KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 plan
-KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve   # → STATUS: COMPLETE
+KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve --revision <uuid>   # → STATUS: COMPLETE
+# <uuid> is the `plan revision` the plan command printed (or read from router.md).
+
+node bin/render.js '/a/-b'      # the completed program prints exactly `a b`
 ```
 
-The replay demonstrates loop transitions, not by itself a working generated
-product. At this baseline the demo's final CLI invocation has known renderer and
-parser defects; M0-P08 owns the behavioral gate for that invocation.
+The replay demonstrates loop transitions WITH an outcome test: after the run,
+the independent `node bin/render.js '/a/-b'` invocation must exit 0 and print
+exactly `a b` — a missing `renderList` export, a case-sensitive query, or the
+old parser defect (dropping `-b` instead of stripping its dash) all fail the
+gates. The demo requires Node ≥ 23.6: the product's `src/*.ts` modules run
+through Node's default TypeScript type-stripping.
 
 Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 `---` separated chunks; a chunk is one model request's answer — plain text
@@ -89,7 +111,8 @@ primary approval followed by adversarial approval.
 | `gates refresh [--accept recommended \| --skip-gates]` | interactively select/defer findings, preview generated diffs, approve writes; never probes |
 | `gates probe [--yes]` | separately consented baseline recipe execution; reports pre-existing failures |
 | `plan [--prd path]` | PRD + approved gap remediations → RouterDoc + router.md; STOP for human approval |
-| `run [--approve] [--tasks id…] [--deliver]` | the sequential wave cycle (resumable) |
+| `run --approve --revision <uuid> [--tasks id…] [--deliver]` | NEW grant: the sequential wave cycle over exactly that reviewed plan revision; omit `--tasks` for every task, repeat `--tasks` once per subset id |
+| `run [--tasks id…]` | resume the stored grant bare (no re-approval); an explicitly supplied set must equal the grant exactly |
 | `status [--follow]` | task graph + budgets from `.orch/status.json` (when a run is locked) or storage |
 | `inspect [--json] [--health] [section…]` | full visibility snapshot: tasks, usage splits, wave timeline, conversations, artifacts, health; degrades to side-cars while a run holds the lock |
 | `verify --task id` | one-off read-only verification incl. your manual edits |
@@ -97,24 +120,57 @@ primary approval followed by adversarial approval.
 | `handoff "note"` | queue a note the driver ingests at the start of the next wave |
 | `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
-Exit codes: `0` run ended, including stopped-short/quarantined outcomes (read the output) · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` error or lock busy.
+Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) or `selection complete` (the granted subset is done; the plan's remaining work is named, the router phase stays open) · `2` policy stop — quarantined/blocked members or the budget ceiling, always with the task ids (rerun to resume) · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` invalid input, refused grant, lock busy or error · `130` SIGINT.
 
 ### Current behavior and limits
 
-- `run --approve` approves the durable RouterDoc. `router.md` is a rewritten
+- A grant approves ONE exact plan revision with an EXPLICIT task list:
+  `run --approve --revision <uuid>` (omit `--tasks` for all ids — stored
+  explicitly, not as a wildcard; repeat `--tasks` per subset id). The grant,
+  the phase flip and the review row commit atomically; dependencies are
+  never auto-included (an unsatisfied dependency outside the selection is
+  refused at approval with the named culprit). A bare `run` resumes exactly
+  the stored grant — mirror edits are never imported — and an explicitly
+  supplied set without `--approve` must equal it. A new grant is refused
+  while `router.md` is missing or differs from the durable render (replan to
+  refresh). A satisfied subset reports selection-complete and the router
+  phase stays open; only whole-plan fulfillment flips the phase to complete,
+  and it is recorded once. Quarantined/blocked selected tasks stop the run
+  with exit 2 and the ids — never 0/complete. `router.md` is a rewritten
   review mirror, not editable plan input; revise the PRD and rerun `plan`.
 - `delivery.mode = "none"` leaves accepted changes in the operator's working
   tree. `commit` attempts a commit on the checked-out branch. `pr` additionally requires
   `--deliver` and may create a branch and pull request; it never merges one.
 - Implementer tools, gates, probes, and delivery run on the host. Write/edit
   guards, target-path checks, and `shell: false`-style process spawning are not
-  OS containment; use trusted projects and fixtures only.
+  OS containment; use trusted projects and fixtures only. Gate and probe
+  recipes also inherit the CLI's environment (PATH/HOME included) until the
+  M1 sandbox boundary lands.
 - Budget stops use recorded provider/catalog costs or configured rate estimates.
   They are not a hard provider-bill cap and cannot prevent an already admitted
   in-flight request from exceeding the ceiling.
 - Quarantine attempts to save display evidence and restore the working-tree
   baseline. Artifact capture and restoration can fail; a quarantine row or patch
   is not proof that rollback succeeded.
+- Read-only views (`status`, `inspect`, `export`, and the web UI's reads) open
+  durable storage with the harness's `readOnly` option while still holding
+  `.orch/lock`: zero model/tool calls, no scheduling, no task progress, and
+  commits with writes refuse. A project that has never run has no
+  `.orch/durable.sqlite` — observation never creates one; it reports
+  empty/absent evidence from the side-cars instead.
+- The kit version is the package version (`package.json`, read once in
+  `src/config.ts`): the CLI header, the `.orch/kit-version` init marker, and
+  readout identities all name the same value. Kit identities recorded by older
+  kits in existing stores are historical and are never rewritten.
+- `init` installs the hygiene defaults as ONE bounded, idempotent `.gitignore`
+  block and reports conflicts instead of repairing them: a pre-existing rule
+  that excludes `.orch/` itself defeats the reviewable exceptions, and a
+  private file that is already tracked stays tracked (ignore rules do not
+  apply to tracked files). The kit never modifies your git index or history —
+  no forced `git rm --cached`, no history cleanup, no retention daemon. To
+  stop tracking a private file, run `git rm --cached -- <path>` yourself after
+  saving anything you need; a tracked paper-trail file is simply manual
+  retention. See `docs/project-contract.md` for the exact classes and defaults.
 
 ## Adopting an existing project
 
@@ -349,10 +405,25 @@ next reviewed plan. None of these analyses executes the underlying command.
 - **Available choices:** answer `y` to execute sequentially, or decline. In a
   non-interactive shell, `gates probe --yes` is required; without it, probe exits
   without running commands.
-- **Write/execution effects:** consent executes the commands with the normal
-  timeout and no shell. Probe writes no adoption config. It prints PASS/FAIL and
+- **Write/execution effects:** consent executes the commands with the SAME
+  runner and `[gates] timeoutSec` deadline the wave gates use — no shell, so
+  wave and probe observe identical literal tokens and match results. Probe
+  writes no adoption config. It prints PASS/FAIL and
   labels failures as **pre-existing baseline failures**; it does not weaken,
   remove, or mark a failing gate as passed.
+- **Recipe compatibility (M0-P07):** each recipe sets EXACTLY ONE command
+  form — legacy `cmd` (split on whitespace only; quotes, `$`/backtick
+  expansions, globs, pipes, redirections and shell operators are refused with
+  a pointer at argv) or literal `argv` tokens (spaces, empty values and
+  metacharacters are data, 1–128 tokens, ≤32 KiB, no NUL). ALL `match`
+  regexes must match captured stdout (empty list vacuously true; this tightens
+  the previous any-match behavior — split either-or checks into separate
+  recipes), regexes compile before any recipe runs, stdout past the 256 KiB
+  capture cap with `match` present fails `output_capped` instead of matching
+  a truncated tail, and match evaluation runs in a bounded worker under the
+  recipe deadline. Recipe `cwd` must stay inside the real project root —
+  symlink escapes refuse. An invalid recipe fails BEFORE any recipe command
+  starts, in waves and in probes alike.
 
 ```bash
 llm-toolkit-001 gates probe       # TTY: review commands, then separately confirm
@@ -434,17 +505,21 @@ the run owns the lock.
 
 ```
 PRD →[plan, one conversation, read-only]→ RouterDoc + router.md (planned)
-      │ human approval (--approve / humanApprovedAt)             ← review point
-      ▼ [run]
-  per task (topological, priority, id tie-break):
+      │ human grant (--approve --revision / {planRevision, selected, humanApprovedAt})   ← review point
+      ▼ [run — exactly the granted revision + task list]
+  per granted task (topological, priority, id tie-break; deps seen across ALL tasks):
     baseline tree capture → implementer wave (conversation per task)
       → gates (scope check + recipes) → primary verifier (read-only, strict JSON)
-      → approving verdict ⇒ fresh adversarial verifier (default on; read-only)
-      → both approve ⇒ done, or feedback ⇒ next wave (context reset between waves)
+      → evidence-backed approval ⇒ fresh adversarial verifier (default on; read-only)
+      → both approve with per-criterion evidence ⇒ done, or feedback ⇒ next wave
+        (context reset between waves)
       → exhausted/blocked ⇒ quarantine: patch capture + baseline restore attempted
-  budgets/breakers: session USD ceiling, wave warn, zero-change quarantine,
-  duplicate gate-failure hash, consecutive-error cap, rate-limit durable sleep.
-  malformed/inconclusive adversarial verdicts ⇒ needs_human (never approval)
+      → first quarantine in the selection ⇒ run stops (exit 2, ids named)
+  fulfillment: whole plan done ⇒ phase complete (recorded once); granted subset
+  done with plan work remaining ⇒ selection-complete, phase stays open.
+  budgets/breakers: session USD ceiling (exit 2), wave warn, zero-change quarantine,
+  duplicate gate-failure hash, consecutive-error cap, rate-limit durable sleep (exit 42).
+  malformed/inconclusive/unproven verdicts ⇒ needs_human (never approval)
 delivery: none (working tree; default) | commit (current branch) | pr (optional; needs --deliver; never merges)
 ```
 
@@ -456,6 +531,26 @@ status; gates and verifier passes determine the loop's outcome.
 for the explicit single-verifier opt-out. Each pass appends its own verdict,
 token, and USD usage row to `.orch/wave-log.jsonl` (`verify:*` and
 `verify:skeptic:*`).
+
+### Criterion evidence and reviewed passes (M0-P11)
+
+Approval is enforced SYMMETRICALLY on both verifier passes: every reviewed
+criterion must be marked pass and cite valid evidence against the checked tree —
+an executed, non-scope, non-skipped passing gate, or a line that exists in a
+regular text blob of that tree (`{"kind":"gate","id":…}` /
+`{"kind":"line","path":…,"line":…}`; see `template/evals/checklist.md`).
+Missing, malformed, duplicated, or unknown criterion ids, missing proof,
+malformed JSON, prose around the JSON, or an inconclusive answer refuse the
+approval as `needs_human`; a well-formed explicit `reject` stays reject. No
+skeptic runs after an invalid or nonapproving primary, and each pass commits its
+`loop.receipts` pass receipt — criteria, effective verdict, checked tree, gate
+receipt id, policy — BEFORE the next pass is dispatched. The wave's gate outcome
+commits a gate receipt binding the checked tree and every check outcome. The
+one-off `verify --task` diagnostic records no wave-keyed pass receipts, and
+without gate receipts a gate reference is never evidence there. None of this
+claims the model received every file or the complete diff: the verifier input
+stays the diff stat + changed-file list + gate outcomes, and a line reference is
+review evidence, labeled as such.
 
 ### Optional Jev shadow verifier assessment
 
@@ -538,4 +633,7 @@ npm run build   # tsc → dist/cli.js (the bin)
 ```
 
 `examples/demo-prd` is the fixture repo (mini PRD, three toy tasks) that the
-e2e smoke and the `--with-demo` scaffold share. Do **not** publish (`private: true`).
+e2e smoke, the demo-behavior tests and the UI demo mode bake share; the
+`--with-demo` scaffold writes a placeholder PRD describing it, never a baked
+project, and the generic scaffolds install no active demo gates. Do **not**
+publish (`private: true`).

@@ -7,9 +7,12 @@ export type ProgressEvent =
 	| { kind: "task-quarantined"; taskId: string; wave: number; message: string }
 	| { kind: "sleeping"; taskId: string; wave: number; message: string }
 	| { kind: "budget-stop"; message: string }
-	| { kind: "blocked"; message: string }
+	| { kind: "blocked"; message: string; blockedIds?: string[] }
 	// Arrived at a drained queue that still has quarantined tasks — not a plain
 	// success; `quarantined` names the task ids that ended in quarantine.
 	| { kind: "quarantine-stop"; quarantined: string[]; message: string }
+	// M0-P05: the granted subset is fulfilled while the plan still has work
+	// outside the grant — selection success, never whole-plan completion.
+	| { kind: "selection-complete"; selected: string[]; remainingPlanIds: string[]; message: string }
 	| { kind: "complete"; message: string }
 	| { kind: "info"; message: string };

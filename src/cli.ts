@@ -2,9 +2,10 @@
 /**
  * llm-toolkit-001 — durable agent implementation loop CLI.
  * Commands: init · gates · plan · run · status · verify · export · handoff.
- * Arg parsing: node:util parseArgs — no heavy framework.
- * Process exit codes: 0 done/complete · 1 error (incl. lock busy) ·
- * 42 "sleeping until provider reset" (rerun `run` to resume).
+ * Arg parsing: node:util parseArgs (strict) — no heavy framework.
+ * Process exit codes (run): 0 fulfilled (whole plan or granted subset) ·
+ * 2 policy stop (quarantine/budget) · 42 sleeping until provider reset ·
+ * 1 error (incl. lock busy / invalid grant) · 130 SIGINT.
  */
 import { parseArgs } from "node:util";
 import { dirname, delimiter, join, resolve } from "node:path";
@@ -14,8 +15,8 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 const pjson = createRequire(import.meta.url)("../package.json") as { name?: string; version: string };
 import { initProject } from "./init.ts";
-import { KIT_VERSION, ConfigError } from "./config.ts";
-import { openProjectHarness, projectPaths, flushStated, LockBusyError } from "./engine/harness.ts";
+import { KIT_VERSION, ConfigError, loadConfig } from "./config.ts";
+import { openProjectHarness, projectPaths, flushStated, LockBusyError, StoreAbsentError } from "./engine/harness.ts";
 import { readout, INSPECT_SECTIONS } from "./engine/inspector.ts";
 import { readSessionState } from "./engine/state.ts";
 import { loadPrd, runPlan, PlanParseError } from "./engine/planner.ts";
@@ -97,7 +98,8 @@ async function cmdInit(argv: string[]): Promise<void> {
 		we.log(`${c.green}init ok${RESET} in ${root}`);
 		we.log(`  written: ${report.written.length ? report.written.join(", ") : "(nothing missing)"}`);
 		if (report.skipped.length) we.log(`  ${c.yellow}kept existing (not clobbered):${RESET} ${report.skipped.join(", ")}`);
-		if (report.appended.length) we.log(`  gitignore: ${report.appended.length} lines appended`);
+		if (report.appended.length) we.log(`  gitignore: ${report.appended.length} entries appended (${report.appended.join(", ")})`);
+		for (const warning of report.warnings) we.log(`  ${c.yellow}warning:${RESET} ${warning}`);
 		we.log(`\nnext (existing projects): ${c.cyan}${CLI_NAME} gates list${RESET}, then optionally ${c.cyan}${CLI_NAME} gates refresh${RESET}`);
 		we.log(`then: write ${c.cyan}docs/prd.md${RESET}, then ${c.cyan}${CLI_NAME} plan${RESET}`);
 	} catch (err) {
@@ -131,8 +133,12 @@ async function cmdPlan(argv: string[]): Promise<void> {
 		const prdText = await loadPrd(kit, prdPath);
 		const outcome = await runPlan(kit, prdPath, prdText);
 		we.log(`${c.green}PLANNED${RESET} — ${outcome.tasks.length} task(s) written to router.md`);
+		// The durable review identity (M0-P04): fresh per plan, echoed here and
+		// mirrored in router.md. A replan names the replaced plan.
+		we.log(`  ${c.cyan}plan revision:${RESET} ${outcome.planRevision}`);
+		if (outcome.replacedRevision) we.log(`  replaced: ${outcome.replacedRevision} (archived; prior approval invalidated)`);
 		for (const t of outcome.tasks) we.log(`  [${t.id}] ${t.title}`);
-		we.log(`\nreview router.md (a generated mirror, not editable plan input). To change the plan, revise the PRD and rerun ${c.cyan}${CLI_NAME} plan${RESET}, then: ${c.cyan}${CLI_NAME} run --approve${RESET}`);
+		we.log(`\nreview router.md (a generated mirror, not editable plan input). To change the plan, revise the PRD and rerun ${c.cyan}${CLI_NAME} plan${RESET}, then: ${c.cyan}${CLI_NAME} run --approve --revision ${outcome.planRevision}${RESET} (--tasks <id> once per task for a subset)`);
 		await kit.loop.close();
 		kit.lock.release();
 	} catch (err) {
@@ -146,19 +152,43 @@ async function cmdPlan(argv: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function cmdRun(argv: string[]): Promise<void> {
-	const { values } = parseArgs({
-		args: argv,
-		options: {
-			approve: { type: "boolean", default: false },
-			deliver: { type: "boolean", default: false },
-			tasks: { type: "string", multiple: true },
-		},
-		strict: false,
-	});
+	// Strict parse (M0-P05): no swallowed positionals, no unknown flags — an
+	// unrecognized argument is a refusal (exit 1), never silent scope.
+	let values: {
+		approve?: boolean;
+		deliver?: boolean;
+		revision?: string;
+		tasks?: string[];
+	};
+	try {
+		({ values } = parseArgs({
+			args: argv,
+			options: {
+				approve: { type: "boolean", default: false },
+				deliver: { type: "boolean", default: false },
+				revision: { type: "string" },
+				tasks: { type: "string", multiple: true },
+			},
+			strict: true,
+			allowPositionals: false,
+		}));
+	} catch (err) {
+		we.error(`${c.red}run refused${RESET}: ${(err as Error).message}\n${RUN_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
+	if (values["approve"] === true && !values["revision"]) {
+		we.error(`${c.red}run refused${RESET}: --approve needs --revision <uuid> — the plan revision \`plan\` printed and router.md shows; there is no hidden default revision\n${RUN_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
 	try {
 		const root = resolve(procCwd());
 		kit = await openProjectHarness(root, "run");
+		// Grant admission (M0-P05) happens inside the driver, BEFORE any wave or
+		// model dispatch: legacy plans, stamps that do not name the current plan
+		// revision, revision/subset/dependency/mirror violations refuse there.
 		// SIGINT = user abort: clean close (durable state stays; waves resume on the next run).
 		const onInterrupt = () => {
 			void kit!.loop
@@ -174,35 +204,56 @@ async function cmdRun(argv: string[]): Promise<void> {
 		const summary = await runWaves(
 			kit,
 			{
-				approve: values["approve"] === true,
+				approve: values["approve"] === true ? { planRevision: values["revision"]! } : undefined,
 				deliverExplicit: values["deliver"] === true,
-				tasksFilter: (values["tasks"] as unknown as string[] | undefined) ?? [],
+				tasksFilter: values["tasks"] ?? [],
 			},
 			printProgress,
 		);
 		process.off("SIGINT", onInterrupt);
 		await kit.loop.close();
 		kit.lock.release();
+		const paperTrail = " Paper trail: router.md · .orch/wave-log.jsonl";
 		if (summary.exit === "sleeping") {
 			we.log(`\n${c.yellow}⏾ sleeping${RESET} until the provider reset — rerun ${c.cyan}${CLI_NAME} run${RESET} to resume`);
 			process.exitCode = 42;
 			return;
 		}
-		if (summary.quarantined.length) {
-			// Arrived-stop like arrived-blocked: exit code stays 0, but never read
-			// as plain success — the message names the quarantined task ids.
-			we.log(`\n${c.yellow}run stopped short${RESET} — ${summary.quarantined.length} task(s) quarantined: ${summary.quarantined.join(", ")}. Paper trail: router.md · .orch/wave-log.jsonl`);
-		} else {
-			we.log(
-				summary.complete
-					? `\n${c.green}STATUS: COMPLETE${RESET} — task queue drained. Paper trail: router.md · .orch/wave-log.jsonl`
-					: `\n${c.yellow}run stopped: ${summary.exit}${RESET} — rerun to resume`,
-			);
+		if (summary.exit === "plan-complete") {
+			we.log(`\n${c.green}STATUS: COMPLETE${RESET} — every task in the plan is done; whole plan fulfilled.${paperTrail}`);
+			process.exitCode = 0;
+			return;
 		}
+		if (summary.exit === "selection-complete") {
+			we.log(
+				`\n${c.green}selection complete${RESET} — the granted task(s) are fulfilled (${summary.grant.selected.join(", ")}); ` +
+					`${summary.remainingPlanIds.length} plan task(s) remain outside the grant: ${summary.remainingPlanIds.join(", ") || "(none)"}. ` +
+					`Approve a wider set to continue (${c.cyan}${CLI_NAME} run --approve --revision <uuid>${RESET}).${paperTrail}`,
+			);
+			process.exitCode = 0;
+			return;
+		}
+		if (summary.exit === "blocked") {
+			// Policy stop (exit 2), never a plain success: the ids carry the truth.
+			we.log(
+				`\n${c.yellow}run stopped short${RESET} — quarantined: ${summary.quarantined.join(", ") || "(none)"}` +
+					(summary.blockedIds.length ? `; stopped on: ${summary.blockedIds.join(", ")}` : "") +
+					`.${paperTrail}`,
+			);
+			process.exitCode = 2;
+			return;
+		}
+		we.log(`\n${c.yellow}run stopped: ${summary.exit}${RESET} — rerun to resume.${paperTrail}`);
+		process.exitCode = 2;
 	} catch (err) {
 		kit?.lock.release();
 		fail(err, "run");
 	}
+}
+
+function RUN_USAGE(): string {
+	return `  ${CLI_NAME} run --approve --revision <uuid> [--tasks id]… [--deliver]   # new grant
+  ${CLI_NAME} run [--tasks id]…                                          # resume the stored grant`;
 }
 
 function printProgress(event: ProgressEvent): void {
@@ -288,6 +339,24 @@ async function cmdStatus(argv: string[]): Promise<void> {
 		await kit.loop.close();
 		kit.lock.release();
 	} catch (err) {
+		if (err instanceof StoreAbsentError) {
+			// A never-run project has no storage to read — and none is created
+			// just to inspect. Render the empty/absent truth straight from config.
+			const config = loadConfig(root);
+			we.log(
+				renderStatusPanel({
+					kit: KIT_VERSION,
+					piDurable: config.engine.piDurable,
+					ts: Date.now(),
+					root,
+					lockedByPid: process.pid,
+					phase: "empty",
+					budget: { spentUsd: 0, sessionCeilingUsd: config.budgets.sessionUsd, waveWarnUsd: config.budgets.waveUsdWarn },
+					tasks: [],
+				} as never),
+			);
+			return;
+		}
 		kit?.lock.release();
 		fail(err, "status");
 	}
@@ -326,6 +395,13 @@ async function cmdInspect(argv: string[]): Promise<void> {
 	} catch (err) {
 		if (err instanceof LockBusyError) {
 			const read = await readout(paths);
+			await showReadout(read, { json, healthOnly, sections });
+			return;
+		}
+		if (err instanceof StoreAbsentError) {
+			// Never-run project: refuse to create storage; show empty/absent
+			// evidence from the side-cars instead (nothing has run — nothing to show).
+			const read = await readout(paths, { sidecarReason: "no durable storage — this project has never run (empty evidence)" });
 			await showReadout(read, { json, healthOnly, sections });
 			return;
 		}
@@ -406,8 +482,8 @@ async function cmdVerify(argv: string[]): Promise<void> {
 
 async function cmdExport(): Promise<void> {
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
+	const root = resolve(procCwd());
 	try {
-		const root = resolve(procCwd());
 		kit = await openProjectHarness(root, "export", { readView: true });
 		const read = await readout(kit.loop.paths, { loop: kit });
 		const out = await writeExports(kit.loop.paths, { readout: read });
@@ -415,6 +491,15 @@ async function cmdExport(): Promise<void> {
 		await kit.loop.close();
 		kit.lock.release();
 	} catch (err) {
+		if (err instanceof StoreAbsentError) {
+			// Never-run project: export the empty/absent side-car evidence instead
+			// of creating a database to read.
+			const paths = projectPaths(root);
+			const read = await readout(paths, { sidecarReason: "no durable storage — this project has never run (empty evidence)" });
+			const out = await writeExports(paths, { readout: read });
+			we.log(`exported: ${out.jsonFile}\n          ${out.htmlFile}`);
+			return;
+		}
 		kit?.lock.release();
 		fail(err, "export");
 	}
@@ -534,9 +619,19 @@ function HELP(): string {
   ${CLI_NAME} gates refresh [--accept recommended | --skip-gates]
                                           # approve generated gates; no execution
   ${CLI_NAME} gates probe [--yes]           # separately consented baseline probe
+                                          # recipes: one command form each — legacy
+                                          # "cmd" (whitespace-split, no shell syntax)
+                                          # or literal "argv" tokens; ALL "match"
+                                          # regexes must match stdout; probe shares
+                                          # the [gates] timeoutSec deadline with waves
   ${CLI_NAME} plan [--prd path]           # PRD → RouterDoc + router.md; stops for human approval
-  ${CLI_NAME} run [--approve] [--tasks id] [--deliver]
-                                          # the cycle; exit 0 done · 42 sleeping · 1 error/busy
+  ${CLI_NAME} run --approve --revision <uuid> [--tasks id]… [--deliver]
+                                          # NEW grant: approve exactly that plan revision
+                                          # (plan prints it; repeat --tasks per subset id,
+                                          # omit it for every task — the full list is explicit)
+  ${CLI_NAME} run [--tasks id]…            # resume the stored grant bare (no re-approval);
+                                          # an explicit set must equal the grant
+                                          # exit 0 fulfilled · 2 stopped short · 42 sleeping · 1 error/busy · 130 SIGINT
   ${CLI_NAME} status [--follow]           # task graph + budgets from side-cars or storage
   ${CLI_NAME} inspect [--json] [--health] [section…]
                                           # full visibility: tasks, usage, conversations,
@@ -549,6 +644,8 @@ function HELP(): string {
 kit ${RUN_VERSION_HEADER()} · run inside the target project (its .orch/config.toml)`;
 }
 
-const RUN_VERSION_HEADER = (): string => `${CLI_NAME} ${pjson.version} · kit ${KIT_VERSION}`;
+// Kit identity IS the package version (config.ts reads package.json): one
+// source, so the CLI header, init markers, and readouts always agree.
+const RUN_VERSION_HEADER = (): string => `${CLI_NAME} ${KIT_VERSION}`;
 
 main();

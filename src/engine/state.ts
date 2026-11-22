@@ -4,12 +4,18 @@
  * router.md (human mirror), .orch/wave-log.jsonl (append-only JSONL mirror),
  * and .orch/status.json (atomic cross-process status payload).
  */
+import { readFile } from "node:fs/promises";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
-import { RouterDoc, RunStatusDoc, WaveLogDoc, syncSideCars } from "./infos.ts";
+import { RouterDoc, RunStatusDoc, WaveLogDoc, syncSideCars, renderRouterMd } from "./infos.ts";
+import { ReceiptsDoc } from "./receipts.ts";
+import type { ReceiptEvent, ReceiptsDocValue } from "./receipts.ts";
+import type { ArchivedPlanRef, PlanIdentity } from "./plans.ts";
+import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
+import type { LoopAndLock } from "./harness.ts";
 import type { RouterDocValue, RouterTask, RunStatusDocValue, WaveRow } from "./infos.ts";
 import { flushStated } from "./harness.ts";
-import type { LoopAndLock, ProjectPaths, ReportRow, StatusPayloads } from "./harness.ts";
+import type { ProjectPaths, ReportRow, StatusPayloads } from "./harness.ts";
 import type { Session, Draft } from "./kit.ts";
 import type { Draft as ChordDraft } from "@earendil-works/chord";
 
@@ -26,20 +32,228 @@ export async function readSessionState(kit: Session): Promise<SessionState> {
 		kit.snapshot(WaveLogDoc, BACKGROUND_CONTEXT),
 	]);
 	return {
-		router: { ...(router ?? { version: 1, phase: "empty", tasks: [] }) },
+		router: { ...(router ?? emptyRouter()) },
 		runStatus: { ...(runStatus ?? defaultRunStatus()) },
 		rows: wavelog?.rows ?? [],
 	};
 }
 
+/** v2 empty-router fallback for a doc that has not been written yet. */
+function emptyRouter(): RouterDocValue {
+	return { version: 2, phase: "empty", tasks: [], archived: [] };
+}
+
 function defaultRunStatus(): RunStatusDocValue {
 	return {
-		version: 1,
+		version: 2,
 		budgetSpentUsd: 0,
 		sleepCycleCount: 0,
 		consecutiveErrors: 0,
-		kitVersion: "0.1.0",
+		// Fallback identity for a doc not yet written: the CURRENT kit version
+		// (package.json); a recorded kitVersion is historical and never rewritten.
+		kitVersion: KIT_VERSION,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Plan-authorization gate (M0-P04) + exact grants (M0-P05, ADR 01)
+// ---------------------------------------------------------------------------
+
+/**
+ * The grant a human approval writes (ADR 01): approval atomically records
+ * exactly `{planRevision, selected, humanApprovedAt}`. `selected` is the
+ * EXACT granted id list — sorted, unique, never a wildcard: absent `--tasks`
+ * on the approving command stores every plan id explicitly, and a bare
+ * `run` resumes exactly this list (mirror edits are never imported).
+ */
+export interface Grant {
+	/** The reviewed plan revision this grant belongs to. */
+	planRevision: string;
+	/** Granted task ids, sorted unique. */
+	selected: string[];
+	/** Epoch ms of the human approval stamp. */
+	humanApprovedAt: number;
+}
+
+/**
+ * The stored grant, or undefined when the stamp is incomplete. A stamp
+ * authorizes a run only when all three grant fields are present AND the
+ * revision names the RouterDoc's CURRENT planRevision: pre-grant v2 stamps
+ * (revision + timestamp, no selection) and migrated v1 stamps authorize
+ * nothing — fail old clients closed until the UI packet carries the tuple.
+ */
+export function readGrant(runStatus: RunStatusDocValue): Grant | undefined {
+	const { approvedPlanRevision, approvedSelected, humanApprovedAt } = runStatus;
+	if (approvedPlanRevision === undefined || approvedSelected === undefined || humanApprovedAt === undefined) return undefined;
+	return { planRevision: approvedPlanRevision, selected: approvedSelected, humanApprovedAt };
+}
+
+/**
+ * Why a mutating run may not proceed against this state, or undefined when it
+ * may. Enforced on the CLI path (the engine/automation interface; the UI
+ * spawns the same CLI):
+ *
+ *  - A plan WITHOUT an identity is an unmigrated v1 plan. Old rows stay
+ *    readable, but a mutating run NEVER executes one — not even with
+ *    `--approve`. The documented v1 upgrade is: reconcile any operator edits
+ *    manually, commit the intended base, `plan` again (this archives the old
+ *    plan and clears stamps), review router.md, then approve.
+ *  - A stamped approval authorizes a run only when it NAMES the current plan
+ *    revision (`approvedPlanRevision` matching RouterDoc.identity). A
+ *    timestamp alone — v1 legacy stamps included — authorizes nothing.
+ *
+ * This is the M0-P04 layer. The M0-P05 grant rules (revision-qualified
+ * `--revision` on new grants, the selected-set triple, mirror matching and
+ * resume equality) live in `grantRefusal` below, which the driver enforces
+ * before any wave or model dispatch.
+ */
+export function planRunRefusal(state: SessionState, opts: { approve?: boolean }): string | undefined {
+	const legacy = legacyPlanRefusal(state);
+	if (legacy) return legacy;
+	const approved =
+		state.runStatus.humanApprovedAt !== undefined &&
+		state.runStatus.approvedPlanRevision !== undefined &&
+		state.runStatus.approvedPlanRevision === state.router.identity?.planRevision;
+	// The approval check applies to real graphs; a task-less store lets the
+	// driver's own "no tasks — run plan first" refusal surface unchanged.
+	if (!opts.approve && !approved && state.router.tasks.length) {
+		return "router doc is PLANNED but not human-approved for its current plan revision — rerun with `run --approve --revision <uuid>` after reviewing router.md (this is the plan review point)";
+	}
+	return undefined;
+}
+
+/** The unmigrated-legacy-plan refusal (v1 storage), shared by both gates. */
+export function legacyPlanRefusal(state: SessionState): string | undefined {
+	if (state.router.tasks.length && !state.router.identity) {
+		return (
+			"this project's plan has no plan revision (v1 storage, created before plan identity existed) — a mutating run never executes unmigrated plans: " +
+			"reconcile any operator edits manually, commit the intended base, run `plan` again (it archives the old plan and clears old approvals), " +
+			"review router.md, then `run --approve --revision <uuid>`"
+		);
+	}
+	return undefined;
+}
+
+/** A run request as the driver receives it (M0-P05). */
+export interface RunRequest {
+	/** A NEW grant (the review point): the plan revision it approves (the
+	 *  CLI's --revision) plus the optional explicit task subset. */
+	approve?: { planRevision?: string; tasks?: string[] };
+	/** Explicit task ids on a bare resume: must equal the stored grant. */
+	tasks?: string[];
+}
+
+/**
+ * The M0-P05 grant gate: why THIS run request may not proceed against this
+ * state, or undefined when it may. Pure (no filesystem): the mirror check
+ * for new grants is `approvalMirrorRefusal`, enforced by the approval path
+ * under the host lock.
+ *
+ *  - A new grant (`--approve`) requires an explicit `--revision` naming the
+ *    CURRENT plan revision — there is no hidden default revision, and a
+ *    stale/old revision refuses with the grant untouched.
+ *  - The granted subset must name planned ids, without duplicates; every
+ *    selected task's dependencies must be done or inside the selection —
+ *    dependencies are never auto-included (no automatic closure).
+ *  - A bare resume inherits the EXACT stored grant; an explicitly supplied
+ *    set must equal it. A missing/incomplete/stale stamp authorizes nothing.
+ */
+export function grantRefusal(state: SessionState, req: RunRequest = {}): string | undefined {
+	const legacy = legacyPlanRefusal(state);
+	if (legacy) return legacy;
+	const identity = state.router.identity;
+	if (req.approve) {
+		const requested = req.approve.planRevision;
+		if (!requested) {
+			return "a new grant requires --revision <uuid> — the plan revision `plan` printed and the router.md mirror shows (there is no hidden default revision)";
+		}
+		if (requested !== identity?.planRevision) {
+			return `--revision ${requested} does not name the current plan revision ${identity?.planRevision ?? "(none)"} — a grant approves exactly the reviewed revision; replan to mint a new one`;
+		}
+		return selectionRefusal(state, req.approve.tasks);
+	}
+	// Bare resume: the stored grant governs; the mirror is never consulted.
+	if (!state.router.tasks.length) return undefined; // the driver's own "no tasks" refusal surfaces
+	const grant = readGrant(state.runStatus);
+	if (!grant || grant.planRevision !== identity?.planRevision) {
+		return "router doc is not human-approved for its current plan revision — rerun with `run --approve --revision <uuid>` after reviewing router.md (this is the plan review point)";
+	}
+	if (req.tasks !== undefined) {
+		const requested = [...req.tasks].sort();
+		const equalsGrant = requested.length === grant.selected.length && requested.every((id, i) => id === grant.selected[i]);
+		if (!equalsGrant) {
+			return `explicit --tasks (${req.tasks.join(", ")}) does not equal the stored grant (${grant.selected.join(", ")}) — bare resume inherits the exact grant; approve a changed grant with --approve --revision to admit different work`;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * New-grant subset validation: known planned ids, no duplicates, and every
+ * selected task's dependencies done or inside the selection. Empty set is
+ * not a subset (omit --tasks for all ids).
+ */
+function selectionRefusal(state: SessionState, tasks: string[] | undefined): string | undefined {
+	if (tasks === undefined) return undefined; // absent --tasks on the approving run = all ids
+	if (tasks.length === 0) {
+		return "an empty --tasks set is not a grant — omit --tasks for every task, or name at least one task id";
+	}
+	const seen = new Set<string>();
+	for (const id of tasks) {
+		if (seen.has(id)) return `duplicate --tasks entry "${id}" — repeat --tasks once per id; duplicates refuse without broadening`;
+		seen.add(id);
+	}
+	const ids = new Set(state.router.tasks.map((t) => t.id));
+	for (const id of tasks) {
+		if (!ids.has(id)) {
+			return `--tasks "${id}" is not a task in the current plan — the grant selects only planned ids; dependencies are never auto-included`;
+		}
+	}
+	const status = new Map(state.router.tasks.map((t) => [t.id, t.status] as const));
+	for (const task of state.router.tasks) {
+		if (!seen.has(task.id)) continue;
+		for (const dep of task.dependsOn) {
+			if (seen.has(dep) || status.get(dep) === "done") continue;
+			return `task "${task.id}" depends on "${dep}", which is outside this grant and not done — select "${dep}" too or approve all ids; dependencies are never auto-included`;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The exact granted set a validated request resolves to: every plan id
+ * (explicitly — the full list is not a wildcard), or the given subset.
+ */
+export function resolveGrantSelection(state: SessionState, tasks: string[] | undefined): string[] {
+	if (tasks === undefined) return state.router.tasks.map((t) => t.id).sort();
+	return [...tasks].sort();
+}
+
+/**
+ * M0-P05: a NEW grant binds the human to what they reviewed. Under the host
+ * lock, the router.md mirror must exist and match the canonical durable
+ * render (renderRouterMd with identity). A missing or edited mirror means
+ * the reviewed text is not the durable plan — refuse and replan to refresh;
+ * mirror edits are never imported into the grant. Bare resume never calls
+ * this: the stored grant governs.
+ */
+export async function approvalMirrorRefusal(loopAndLock: LoopAndLock, state: SessionState): Promise<string | undefined> {
+	const paths: ProjectPaths = loopAndLock.loop.paths;
+	const disk = await readFile(paths.routerMd, "utf8").catch(() => undefined);
+	if (disk === undefined) {
+		return `router.md is missing — a new grant approves the reviewed mirror, and the mirror must match the durable plan; rerun \`plan\` to refresh it`;
+	}
+	const canonical = renderRouterMd(
+		state.router.tasks,
+		state.router.phase,
+		state.runStatus.prdPath,
+		state.router.identity,
+		state.router.archived,
+	);
+	if (disk !== canonical) {
+		return `router.md differs from the durable plan render — a new grant binds the approval to the reviewed bytes, and edited mirror text is never plan input; rerun \`plan\` to refresh the mirror, then approve`;
+	}
+	return undefined;
 }
 
 export interface StateInput {
@@ -47,6 +261,10 @@ export interface StateInput {
 	router?: RouterDocValue | ((d: ChordDraft<RouterDocValue>) => void);
 	/** Mutate the RunStatus draft inside the commit. */
 	runStatus?: RunStatusDocValue | ((d: ChordDraft<RunStatusDocValue>) => void);
+	/** Receipt events (M0-P11) appended to `loop.receipts` in the SAME commit as
+	 *  the Router/Run mutation they authorize. An array APPENDS; a mutator gets
+	 *  the draft. Authoritative observations/intents ride one harness.commit. */
+	receipts?: ReceiptEvent[] | ((d: ChordDraft<ReceiptsDocValue>) => void);
 	/** Wave-log rows appended inside the commit (then mirrored to JSONL). */
 	rows?: WaveRow[];
 	/** What status.json should show after this commit. */
@@ -62,8 +280,6 @@ export type StatusPhase =
 	| { phase: "wave-running"; task?: string; wave?: number; startedAt?: number }
 	| { phase: "idle"; message?: string }
 	| { phase: "closed" };
-
-const EMPTY_ROUTER: RouterDocValue = { version: 1, phase: "empty", tasks: [] };
 
 /**
  * Flush the status side-car WITHOUT a storage commit (visibility-only snapshot).
@@ -153,6 +369,11 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 				const wlDraft = await tx.doc(WaveLogDoc);
 				wlDraft.rows.push(...input.rows);
 			}
+			if (input.receipts) {
+				const recDraft = await tx.doc(ReceiptsDoc);
+				if (typeof input.receipts === "function") input.receipts(recDraft);
+				else recDraft.events.push(...input.receipts);
+			}
 		},
 		BACKGROUND_CONTEXT,
 	);
@@ -164,7 +385,7 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 	]);
 	const wlRead = await harness.snapshot(WaveLogDoc, BACKGROUND_CONTEXT);
 	await postCommit(loopAndLock, {
-		routerAfter: { ...(routerAfter ?? { version: 1, phase: "empty", tasks: [] }) },
+		routerAfter: { ...(routerAfter ?? emptyRouter()) },
 		statusAfter: { ...(statusAfter ?? defaultRunStatus()) },
 		rowsAfter: wlRead?.rows ?? [],
 		input,
@@ -190,8 +411,12 @@ async function postCommit(
 	},
 ): Promise<void> {
 	const paths: ProjectPaths = loopAndLock.loop.paths;
+	// The mirror renders the durable doc INCLUDING its plan identity, so the
+	// router.md parity checks (gates, inspect --health) compare like with like.
+	const identity: PlanIdentity | undefined = calculated.routerAfter.identity;
+	const archived: readonly ArchivedPlanRef[] = calculated.routerAfter.archived ?? [];
 	await syncSideCars(
-		{ tasks: calculated.routerAfter.tasks, phase: calculated.routerAfter.phase, rows: calculated.rowsAfter },
+		{ tasks: calculated.routerAfter.tasks, phase: calculated.routerAfter.phase, rows: calculated.rowsAfter, identity, archived },
 		{ routerMd: paths.routerMd, waveLogJsonl: paths.waveLog },
 		calculated.statusAfter.prdPath,
 	);
