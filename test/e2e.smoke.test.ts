@@ -7,8 +7,9 @@
  * wave 2 — the completed program then satisfies the §0 invocation.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { initProject } from "../src/init.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
 import { readSessionState } from "../src/engine/state.ts";
@@ -78,8 +79,23 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		// evals/, committed before planning (initProject skips the existing file).
 		await installDemoGates(project.root);
 		await writeConfig(project.root, demoConfigToml());
-		await gitInit(project.root);
 		await initProject(project.root);
+		await writeFile(join(project.root, "operator-note.md"), "committed operator base\n", "utf8");
+		await writeFile(join(project.root, ".gitignore"), `${await readFile(join(project.root, ".gitignore"), "utf8")}\ncoverage/\n`, "utf8");
+		await gitInit(project.root);
+		// Dirty, unrelated operator state must not enter the task lease or move
+		// when the serial driver freezes/publishes candidate trees.
+		await writeFile(join(project.root, "operator-staged.txt"), "staged operator bytes\n", "utf8");
+		await exec(["git", "add", "--", "operator-staged.txt"], { cwd: project.root, timeoutMs: 10_000 });
+		await writeFile(join(project.root, "operator-note.md"), "unstaged operator bytes\n", "utf8");
+		await mkdir(join(project.root, "coverage"), { recursive: true });
+		await writeFile(join(project.root, "coverage", "sentinel.bin"), Buffer.from([0, 4, 8, 255]));
+		expect((await exec(["git", "check-ignore", "coverage/sentinel.bin"], { cwd: project.root, timeoutMs: 10_000 })).code).toBe(0);
+		const operatorHeadBefore = (await exec(["git", "rev-parse", "HEAD"], { cwd: project.root, timeoutMs: 10_000 })).stdout.trim();
+		const operatorIndexBefore = (await exec(["git", "write-tree"], { cwd: project.root, timeoutMs: 10_000 })).stdout.trim();
+		const stagedDiffBefore = (await exec(["git", "diff", "--cached", "--binary"], { cwd: project.root, timeoutMs: 10_000 })).stdout;
+		const unstagedDiffBefore = (await exec(["git", "diff", "--binary"], { cwd: project.root, timeoutMs: 10_000 })).stdout;
+		const ignoredBytesBefore = await readFile(join(project.root, "coverage", "sentinel.bin"));
 
 		const { models, faux } = buildFauxModels([]);
 		faux.appendResponses([
@@ -165,17 +181,39 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		const status = await readJson<{ tasks: { id: string; status: string }[] }>(join(project.root, ".orch", "status.json"));
 		expect(status?.tasks.filter((t) => t.status === "done").length).toBe(3);
 
-		// implementer artifacts actually landed
-		expect(await readFile(join(project.root, "src", "list.ts"), "utf8")).toContain("parseList");
-		expect(await readFile(join(project.root, "src", "query.ts"), "utf8")).toContain("queryList");
-		expect(await readFile(join(project.root, "bin", "render.js"), "utf8")).toContain("renderList");
-		// the wave-1 defect was BEHAVIORAL: the repaired query is case-insensitive
-		expect(await readFile(join(project.root, "src", "query.ts"), "utf8")).toContain("toLowerCase()");
+		// The operator checkout is not the result location. Inspect the accepted
+		// ref through a detached worktree and run the independent product check there.
+		const resultParent = await mkdtemp(join(tmpdir(), "kit-accepted-result-"));
+		const resultRoot = join(resultParent, "accepted");
+		try {
+			const addResult = await exec(["git", "worktree", "add", "--detach", resultRoot, `refs/kit/${planOutcome.planRevision}/accepted`], { cwd: project.root, timeoutMs: 15_000 });
+			expect(addResult.code).toBe(0);
+			const acceptedHead = (await exec(["git", "rev-parse", "HEAD"], { cwd: resultRoot, timeoutMs: 10_000 })).stdout.trim();
+			expect(acceptedHead).toMatch(/^[0-9a-f]{40}$/);
+			expect(await readFile(join(resultRoot, "src", "list.ts"), "utf8")).toContain("parseList");
+			expect(await readFile(join(resultRoot, "src", "query.ts"), "utf8")).toContain("queryList");
+			expect(await readFile(join(resultRoot, "bin", "render.js"), "utf8")).toContain("renderList");
+			// The wave-1 defect was BEHAVIORAL: the repaired query is case-insensitive.
+			expect(await readFile(join(resultRoot, "src", "query.ts"), "utf8")).toContain("toLowerCase()");
 
-		// §0 outcome test (M0-P08): the completed program, invoked independently.
-		const render = await exec(["node", "bin/render.js", "/a/-b"], { cwd: project.root, timeoutMs: 15_000 });
-		expect(render.code).toBe(0);
-		expect(render.stdout).toBe("a b\n");
+			// §0 outcome test (M0-P08): independent Node invocation in the accepted view.
+			const render = await exec(["node", "bin/render.js", "/a/-b"], { cwd: resultRoot, timeoutMs: 15_000 });
+			expect(render.code).toBe(0);
+			expect(render.stdout).toBe("a b\n");
+		} finally {
+			await exec(["git", "worktree", "remove", "--force", resultRoot], { cwd: project.root, timeoutMs: 15_000 });
+			await rm(resultParent, { recursive: true, force: true });
+		}
+
+		// Accepted publication and detached inspection preserve the operator data.
+		expect((await exec(["git", "rev-parse", "HEAD"], { cwd: project.root, timeoutMs: 10_000 })).stdout.trim()).toBe(operatorHeadBefore);
+		expect((await exec(["git", "write-tree"], { cwd: project.root, timeoutMs: 10_000 })).stdout.trim()).toBe(operatorIndexBefore);
+		expect((await exec(["git", "diff", "--cached", "--binary"], { cwd: project.root, timeoutMs: 10_000 })).stdout).toBe(stagedDiffBefore);
+		expect((await exec(["git", "diff", "--binary"], { cwd: project.root, timeoutMs: 10_000 })).stdout).toBe(unstagedDiffBefore);
+		expect(await readFile(join(project.root, "operator-note.md"), "utf8")).toBe("unstaged operator bytes\n");
+		expect(await readFile(join(project.root, "operator-staged.txt"), "utf8")).toBe("staged operator bytes\n");
+		expect(await readFile(join(project.root, "coverage", "sentinel.bin"))).toEqual(ignoredBytesBefore);
+		expect(await readFile(join(project.root, "src", "list.ts"), "utf8").catch(() => "<absent>")).toBe("<absent>");
 
 		await kit.loop.close();
 		kit.lock.release();
@@ -184,11 +222,11 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 	it("handoff note queued by another process is ingested at the next wave and the file is removed", async () => {
 		const project = await prepareDemoProject();
 		await writeConfig(project.root, demoConfigToml());
-		await gitInit(project.root);
 		await mkdir(join(project.root, "bin"), { recursive: true });
 		await writeFile(join(project.root, "eval-gate.cjs"), "process.exit(0);\n", "utf8");
 		await writeFile(join(project.root, "evals", "recipes.toml"), "[never-fails]\ncmd = \"node eval-gate.cjs\"\n", "utf8");
 		await initProject(project.root);
+		await gitInit(project.root);
 
 		const { models, faux } = buildFauxModels([]);
 		// planner | impl write | impl answer | 1 verifier approve (cites the executed

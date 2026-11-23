@@ -236,7 +236,9 @@ describe("verifier integration remains authoritative", () => {
 		expect(state.rows.filter((row) => row.kind === "verdict").map((row) => row.verb)).toEqual([
 			"verify:approve", "verify:skeptic:approve",
 		]);
-		expect(state.rows.filter((row) => row.kind === "delivery")).toEqual([]);
+		expect(state.rows.filter((row) => row.kind === "delivery")).toMatchObject([
+			expect.objectContaining({ task: TASK.id, wave: 1, verb: "not_requested", planRevision: expect.any(String) }),
+		]);
 		const stored = JSON.parse(await readFile(join(kit.loop.paths.root, VERIFIER_ASSESSMENT_FILE), "utf8")) as Awaited<ReturnType<typeof assessVerifier>>;
 		expect(stored).toMatchObject({ status: "assessed", outcome: "supports-rejection" });
 		await kit.loop.close();

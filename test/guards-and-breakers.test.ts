@@ -16,6 +16,7 @@ import { runGates } from "../src/engine/gates.ts";
 import { writeGateFile } from "./helpers2.ts";
 import { bakeProject, scripted, accomplish } from "./fixtures2.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
+import { demoConfigToml } from "./demo-project.ts";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readJson } from "../src/util/fsx.ts";
@@ -33,8 +34,8 @@ describe("beforeTool role boundaries (harness-enforced)", () => {
 			fauxAssistantMessage([fauxToolCall("write", { path: ".orch/evil.txt", content: "hijack" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: BLOCKED engine blocked my writes", { stopReason: "stop" }),
 		], models.faux);
-		await accomplish(kit);
-		await writeGateFile(project.root); // the BLOCKED wave leaves a scope violation → gate fail → quarantine
+		await writeGateFile(project.root);
+		await accomplish(kit); // seal the gate bytes into the reviewed base before planning
 		await runWaves(kit, { tasksFilter: [] });
 		await kit.loop.close();
 		kit.lock.release();
@@ -68,6 +69,33 @@ describe("breakers (§4.5)", () => {
 		void project;
 	});
 
+	it("wave 2 with no edit quarantines against its own start tree despite cumulative task changes", async () => {
+		const { project, kit, models } = await bakeProject({ buildFauxModels, configToml: demoConfigToml().replace("retryLimit = 2", "retryLimit = 1") });
+		await scripted(kit, [
+			fauxAssistantMessage(JSON.stringify({ tasks: [{ id: "t1", title: "x", spec: "first candidate fails; second wave makes no edit", dependsOn: [], acceptance: ["crit"], targetPaths: ["src/"], priority: 1 }] }), { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/a.ts", content: "export const BROKEN = true;\n" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			// Wave 2 deliberately produces no file edit; its start tree already
+			// contains wave 1's cumulative BROKEN file.
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+		], models.faux);
+		await writeGateFile(project.root);
+		await accomplish(kit);
+
+		const summary = await runWaves(kit, { tasksFilter: [] });
+		expect(summary.exit).toBe("blocked");
+		const state = await readSessionState(kit.loop.harness);
+		expect(state.router.tasks[0]).toMatchObject({ status: "quarantined", waveCount: 2 });
+		expect(state.rows.some((row) => row.kind === "governor" && row.verb === "zero-progress-quarantine" && row.wave === 2)).toBe(true);
+		const waveRows = state.rows.filter((row) => row.kind === "wave" && row.task === "t1");
+		const firstCandidate = waveRows.find((row) => row.wave === 1 && row.verb === "end")?.treeSha;
+		const secondStart = waveRows.find((row) => row.wave === 2 && row.verb === "start")?.treeSha;
+		const secondEnd = waveRows.find((row) => row.wave === 2 && row.verb === "end")?.treeSha;
+		expect(firstCandidate).toBe(secondStart);
+		expect(firstCandidate).not.toBe(state.router.tasks[0]!.baselineTreeSha);
+		expect(secondEnd).toBe(secondStart);
+	});
+
 	it("duplicate gate-failure hash two waves running → immediate quarantine", async () => {
 		const { project, kit, models } = await bakeProject({ buildFauxModels, retryMax: 0 });
 		await scripted(kit, [
@@ -75,12 +103,13 @@ describe("breakers (§4.5)", () => {
 			// wave 1: write a file BREAKING the gate
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/a.ts", content: "export const BROKEN = true;\n" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
-			// wave 2: same broken file again (identical gate output ⇒ hash matches)
+			// wave 2 changes another file but preserves the same gate failure output.
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/b.ts", content: "export const BROKEN = true;\n" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
 		], models.faux);
-		await accomplish(kit);
-		// gate recipe guaranteed to fail while BROKEN exists
+		// Gate bytes are part of the committed plan base, never read from a later checkout edit.
 		await writeGateFile(project.root);
+		await accomplish(kit);
 
 		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.exit).toBe("blocked");

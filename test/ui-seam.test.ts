@@ -139,8 +139,8 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 			verifyApprove("fixed on wave 2"),
 			verifySkepticApprove(),
 		], models.faux);
-		await accomplish(kit);
 		await writeGateFile(project.root);
+		await accomplish(kit);
 
 		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);
@@ -186,15 +186,15 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 		// engine.retryLimit = 0: wave 1's gate failure quarantines right away.
 		const project = await prepareDemoProject();
 		await writeConfig(project.root, demoConfigToml().replace("retryLimit = 2", "retryLimit = 0"));
-		await gitInit(project.root);
+		await writeGateFile(project.root);
 		await initProject(project.root);
+		await gitInit(project.root);
 		const models = buildFauxModels([]);
 		models.faux.appendResponses([
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
 			// wave 1: writes broken file; gates fail; retryLimit 0 → immediate quarantine
 			...implWrites([{ path: "src/one.ts", content: "export const BROKEN = true;\n" }]),
 		]);
-		await writeGateFile(project.root);
 		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models });
 		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
 		await approveGrant(kit, { planRevision: planOutcome.planRevision });
@@ -222,8 +222,8 @@ describe("wave-end rows (A.1): retry vs terminal outcomes", () => {
 	});
 });
 
-describe("resumability keeps working with the seam (pickNextTask on in_progress)", () => {
-	it("a task left in_progress by a killed run is picked up by the next run and completes", async () => {
+describe("P14 refuses checkpointless legacy in-progress work", () => {
+	it("does not replay an in-progress task without a submission checkpoint", async () => {
 		const { kit, models } = await bakeProject({ buildFauxModels });
 		await scripted(kit, [
 			fauxAssistantMessage(JSON.stringify(ONE_TASK), { stopReason: "stop" }),
@@ -240,10 +240,13 @@ describe("resumability keeps working with the seam (pickNextTask on in_progress)
 		});
 		expect(pickNextTask((await readSessionState(kit.loop.harness)).router.tasks)?.id).toBe("t1");
 
+		const pendingResponses = models.faux.getPendingResponseCount();
 		const summary = await runWaves(kit, { tasksFilter: [] });
-		expect(summary.complete).toBe(true);
+		expect(summary.exit).toBe("recovery-required");
+		expect(summary.blockedIds).toEqual(["t1"]);
+		expect(models.faux.getPendingResponseCount()).toBe(pendingResponses);
 		const state = await readSessionState(kit.loop.harness);
-		expect(state.router.tasks[0]!.status).toBe("done");
+		expect(state.router.tasks[0]!.status).toBe("in_progress");
 		await kit.loop.close();
 		kit.lock.release();
 	});
@@ -547,9 +550,8 @@ it("flushStatusSnapshot writes the side-car without a commit (visibility-only)",
 
 describe("delivery truth (A.6): readout surfaces the mode + outcome rows, read-only", () => {
 	it("a commit-mode run's readout echoes the configured mode and the delivered rows", async () => {
-		// the demo config with delivery flipped to commit: the delivery path
-		// runs for real (git add/commit in the fixture repo) and the wave log
-		// gains kind:"delivery" rows the readout must echo verbatim
+		// The local commit mode publishes the integration commit to a named
+		// result ref; it never stages or commits from the fixture worktree.
 		const { kit, models } = await bakeProject({
 			buildFauxModels,
 			configToml: demoConfigToml().replace('[delivery]\nmode = "none"', '[delivery]\nmode = "commit"'),
@@ -568,10 +570,10 @@ describe("delivery truth (A.6): readout surfaces the mode + outcome rows, read-o
 		expect(read.delivery).toBeDefined();
 		expect(read.delivery.mode).toBe("commit");
 		expect(read.delivery.rows.length).toBeGreaterThanOrEqual(1);
-		const delivered = read.delivery.rows.find((r) => r.verb === "delivered");
+		const delivered = read.delivery.rows.find((r) => r.verb === "published");
 		expect(delivered).toBeDefined();
 		expect(delivered!.task).toBe("t1");
-		expect(delivered!.detail).toContain("committed:");
+		expect(delivered!.detail).toMatch(/^refs\/heads\/kit\/[0-9a-f-]+\/result$/);
 		// plain JSON shapes (no engine row types across the boundary)
 		expect(() => JSON.parse(JSON.stringify(read.delivery))).not.toThrow();
 		for (const row of read.delivery.rows) {
@@ -641,8 +643,8 @@ describe("per-wave isolated diffs (A.7): wave rows carry treeSha; trees diff tre
 			verifyApprove("fixed on wave 2"),
 			verifySkepticApprove(),
 		], models.faux);
-		await accomplish(kit);
 		await writeGateFile(project.root);
+		await accomplish(kit);
 
 		const summary = await runWaves(kit, { tasksFilter: [] });
 		expect(summary.complete).toBe(true);

@@ -188,11 +188,12 @@ export interface GateResult {
 
 /**
  * Run the scope check, then the recipes (sequential; no parallel shell storms).
- * `targetPaths` enforcement uses the working tree status vs. the task baseline.
+ * Task contexts compare immutable integration-parent and candidate trees; the
+ * separately consented legacy probe path supplies its own baseline context.
  */
 export async function runGates(
 	kit: LoopAndLock,
-	task: { id: string; targetPaths: string[]; baselineTreeSha: string },
+	task: { id: string; targetPaths: string[]; baselineTreeSha: string; planRevision?: string; wave?: number },
 	engineFiles: Record<string, string> = {},
 	options: { capability?: ExecArgvCapability; context?: ExecutionContext } = {},
 ): Promise<GateOutcome> {
@@ -201,10 +202,14 @@ export async function runGates(
 	if (context && paths.root !== kit.loop.paths.root) throw new Error("execution context control root does not match the open project harness");
 	const taskContext = context?.kind === "task-execution" ? context : undefined;
 	if (taskContext && taskContext.taskId !== task.id) throw new Error(`gate task ${task.id} does not match execution context task ${taskContext.taskId}`);
-	const executionRoot = taskContext?.frozenReadView.viewPath ?? (context?.kind === "trusted-compatibility" ? context.executionRoot : paths.root);
+	const executionRoot = taskContext?.frozenReadView.viewPath ?? paths.root;
 	const capability = taskContext?.execArgv ?? options.capability;
 	const now = Date.now();
-	const logFile = join(paths.artifacts, `gate-${task.id}-${now}.log`);
+	if ((task.planRevision === undefined) !== (task.wave === undefined)) throw new Error("gate log identity requires both planRevision and wave");
+	const logName = task.planRevision !== undefined
+		? `gate-${task.planRevision}-${task.id}-w${task.wave}-${now}.log`
+		: `gate-${task.id}-${now}.log`;
+	const logFile = join(paths.artifacts, logName);
 
 	// --- Scope check first (§4.3): git facts, no model inference. Empty
 	// targetPaths means no restriction beyond the protected files.
@@ -221,7 +226,9 @@ export async function runGates(
 	// out entirely: .orch/** churns every run, PROMPT.md is user-edited, and a
 	// correctly synced router.md equals the mirror bytes.
 	const changed = taskContext
-		? (await diffTaskTrees({ root: paths.root, oid: taskContext.parentOid }, taskContext.startOid, taskContext.candidateOid)).map((change) => change.path)
+		// Scope is cumulative from the unchanged integration parent; progress and
+		// verifier summaries use startOid → candidateOid separately.
+		? (await diffTaskTrees({ root: paths.root, oid: taskContext.parentOid }, taskContext.parentOid, taskContext.candidateOid)).map((change) => change.path)
 		: await changedFilesVsTree(paths.root, task.baselineTreeSha);
 	const statusFiles = changed.filter((f) => taskContext
 		? f !== ".orch" && !f.startsWith(".orch/") && f !== "router.md" && f !== "PROMPT.md" && !engineSynced(f)

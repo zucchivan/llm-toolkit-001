@@ -216,8 +216,8 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		});
 		expect(kit.loop.config.gates.jevFailureTriageShadow).toBe(false);
 		await scripted(kit, [planResponse(), ...implWrite("export const BROKEN = true;\n")], models.faux);
-		await accomplish(kit);
 		await writeGateFile(project.root);
+		await accomplish(kit);
 		const client = new FakeJudgmentClient();
 
 		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
@@ -239,8 +239,8 @@ describe("failure-triage wave integration remains shadow-only", () => {
 			verdict("approve", "primary approval"),
 			verdict("approve", "skeptic approval"),
 		], models.faux);
-		await accomplish(kit);
 		await writeGateFile(project.root);
+		await accomplish(kit);
 		const client = semanticClient("human");
 
 		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });
@@ -266,10 +266,11 @@ describe("failure-triage wave integration remains shadow-only", () => {
 		await scripted(kit, [
 			planResponse(),
 			...implWrite("export const BROKEN = true;\n"),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/two.ts", content: "export const BROKEN = true;\n" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
 		], models.faux);
-		await accomplish(kit);
 		await writeGateFile(project.root);
+		await accomplish(kit);
 		const client = new FakeJudgmentClient(async () => { throw new Error("offline"); });
 
 		const summary = await runWaves(kit, { tasksFilter: [], judgmentClient: client });

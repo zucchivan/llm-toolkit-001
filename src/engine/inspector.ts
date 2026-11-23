@@ -26,6 +26,8 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { readSessionState } from "./state.ts";
+import { latestFrozenCheckpoint, latestReceiptStates, ReceiptsDoc } from "./receipts.ts";
+import type { FrozenCheckpointView, ReceiptEvent, ReceiptStateView } from "./receipts.ts";
 import { renderRouterMd, renderWaveLogJsonl } from "./infos.ts";
 import type { RouterTask, RouterDocValue, RunStatusDocValue, TaskStatus, WaveRow } from "./infos.ts";
 import {
@@ -209,7 +211,7 @@ export interface ConversationEntriesOptions {
 /** A.3: where a task's viewable diff lives (artifact NAMES, not content). */
 export interface DiffArtifactRef {
 	task: string;
-	/** Stored patch artifact name: task-<id>.patch (done) or quarantined-<id>-w<N>.patch (quarantined). */
+	/** Revision-qualified candidate artifact name: candidate-<revision>-<task>-w<N>.patch. */
 	patch: string;
 	/** Stats side-car artifact name when present (written alongside by A.2). */
 	stats?: string;
@@ -258,6 +260,12 @@ export interface StorageReadout {
 
 export interface KitReadout {
 	at: number;
+	/** Latest reviewed plan identity, when one exists. */
+	planRevision?: string;
+	/** Latest receipt outcomes for one wave; the journal remains authoritative. */
+	receiptStates?: ReceiptStateView;
+	/** Latest frozen candidate point for this plan. */
+	checkpoint?: FrozenCheckpointView;
 	/** UI seam version (Appendix A). Present in both modes; M0 ships A.1. */
 	seam: 1;
 	degraded: boolean;
@@ -351,7 +359,12 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 	// The side-car is still the freshest source for live elapsed time even when
 	// storage is open (A.3) — the wave-start flush happens before the request is
 	// submitted, so it carries startedAt while the run is mid-wave.
-	const [state, sessionUsage, payload] = await Promise.all([readSessionState(harness), loop.loop.sessionUsage(), readJson<StatusPayloads>(paths.status)]);
+	const [state, sessionUsage, payload, receiptDoc] = await Promise.all([
+		readSessionState(harness),
+		loop.loop.sessionUsage(),
+		readJson<StatusPayloads>(paths.status),
+		harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT),
+	]);
 
 	const rates = buildRateMap(config);
 	const conversations = await collectConversations(harness, state.router.tasks, rates);
@@ -370,15 +383,28 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 	const byTask = buildByTask(conversations, timeline);
 	const wavesExecuted = timeline.length;
 	const current = state.router.tasks.find((t) => t.status === "in_progress");
+	const revision = state.router.identity?.planRevision;
+	const receiptValues = receiptDoc ?? { version: 1 as const, events: [] };
+	const currentCheckpoint = current && revision
+		? receiptValues.events.filter((event): event is Extract<ReceiptEvent, { kind: "checkpoint" }> =>
+			event.kind === "checkpoint" && event.value.planRevision === revision && event.value.taskId === current.id,
+		).at(-1)?.value
+		: undefined;
+	const currentWave = current
+		? currentCheckpoint && currentCheckpoint.stage !== "terminal" ? currentCheckpoint.wave : current.waveCount + 1
+		: undefined;
 
 	const readout: KitReadout = {
 		at,
+		...(revision ? { planRevision: revision } : {}),
+		...(revision ? { receiptStates: latestReceiptStates(receiptValues, revision) } : {}),
+		...(revision ? { checkpoint: latestFrozenCheckpoint(receiptValues, revision) } : {}),
 		seam: 1,
 		live: liveFromPayload(payload),
 		degraded: false,
 		identity: { kit: state.runStatus.kitVersion || KIT_VERSION, piDurable: config.engine.piDurable, root: paths.root, lockedByPid: process.pid, at },
 		phase: state.router.phase,
-		current: current ? { task: current.id, wave: current.waveCount + 1 } : undefined,
+		current: current && currentWave !== undefined ? { task: current.id, wave: currentWave } : undefined,
 		tasks: taskViews(state.router.tasks, (t) => ({
 			dependsOn: t.dependsOn,
 			targetPaths: t.targetPaths,
@@ -405,7 +431,7 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 		health: [],
 		storage: { router: state.router, runStatus: state.runStatus, conversations, reports: loop.loop.reports.slice(-20) },
 	};
-	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts);
+	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts, revision);
 	readout.health = await healthChecks(paths, {
 		degraded: false,
 		state,
@@ -468,6 +494,9 @@ async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<Kit
 
 	const readout: KitReadout = {
 		at,
+		...(payload?.planRevision ? { planRevision: payload.planRevision } : {}),
+		...(payload?.receiptStates ? { receiptStates: payload.receiptStates } : {}),
+		...(payload?.checkpoint ? { checkpoint: payload.checkpoint } : {}),
 		seam: 1,
 		live: liveFromPayload(payload),
 		degraded: true,
@@ -481,7 +510,11 @@ async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<Kit
 		},
 		phase: payload?.phase ?? "unknown",
 		current:
-			payload?.phase === "wave-running" && payload?.task ? { task: payload.task.id, wave: payload.task.wave } : undefined,
+			payload?.phase === "wave-running" && payload.task
+				? { task: payload.task.id, wave: payload.task.wave }
+				: payload?.receiptStates && payload.tasks.some((task) => task.id === payload.receiptStates!.taskId && task.status === "in_progress")
+					? { task: payload.receiptStates.taskId, wave: payload.receiptStates.wave }
+					: undefined,
 		tasks: (payload?.tasks ?? []).map((t) => ({
 			id: t.id,
 			title: t.title,
@@ -509,7 +542,7 @@ async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<Kit
 		artifacts,
 		health: [],
 	};
-	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts);
+	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts, payload?.planRevision);
 	readout.health = await healthChecks(paths, { degraded: true, payload, artifacts, rows, config: undefined, harness: undefined });
 	return readout;
 }
@@ -574,8 +607,11 @@ async function collectConversations(harness: HarnessType, tasks: RouterTask[], r
 		for (const record of Object.values(usageState?.tools ?? {})) {
 			totalTokens += Number((record as { totalTokens?: number }).totalTokens ?? 0);
 		}
-		const task = tasks.find((t) => t.convId === scan.id);
-		const role = task ? ("implementer" as const) : (guard?.role ?? "none");
+		const task = guard?.role === "implementer"
+			? tasks.find((entry) => entry.convId === scan.id)
+				?? (guard.execution ? tasks.find((candidate) => candidate.id === guard.execution!.taskId) : undefined)
+			: tasks.find((entry) => entry.convId === scan.id);
+		const role = guard?.role === "verifier" ? "verifier" as const : task ? "implementer" as const : (guard?.role ?? "none");
 		summaries.push({
 			id: scan.id,
 			role,
@@ -797,27 +833,22 @@ function taskViews(tasks: RouterTask[], extra: (t: RouterTask) => Pick<KitTaskVi
 // ---------------------------------------------------------------------------
 
 /**
- * A.3: per-task diff refs over the artifacts listing — done tasks read
- * `task-<id>.patch` (+ `.json` stats side-car), quarantined ones the newest
- * `quarantined-<id>-w<N>.patch`. Both modes use it: the names + bytes come
- * from the listing; `truncated` reads the small stats side-car when present.
+ * Revision-qualified per-wave candidate patches are display only. A terminal
+ * task points at its newest candidate artifact for the current plan revision.
  */
-async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifacts: readonly ArtifactFile[]): Promise<KitTaskView[]> {
+async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifacts: readonly ArtifactFile[], revision?: string): Promise<KitTaskView[]> {
 	const byName = new Map(artifacts.map((a) => [a.name, a]));
 	return Promise.all(
 		tasks.map(async (task) => {
 			let patchName: string | undefined;
-			if (task.status === "done") {
-				patchName = `task-${task.id}.patch`;
-			} else if (task.status === "quarantined") {
-				// One task quarantines at most once (terminal); the newest saved wave
-				// wins in case artifacts from older runs with the same ids linger.
+			if (revision && (task.status === "done" || task.status === "quarantined")) {
+				const prefix = `candidate-${revision}-${task.id}-w`;
 				const waves = artifacts
-					.filter((a) => a.name.startsWith(`quarantined-${task.id}-w`) && a.name.endsWith(".patch"))
-					.map((a) => Number(/-w(\d+)\.patch$/.exec(a.name)?.[1]))
-					.filter((n): n is number => Number.isInteger(n) && n > 0);
+					.filter((artifact) => artifact.name.startsWith(prefix) && artifact.name.endsWith(".patch"))
+					.map((artifact) => Number(/-w(\d+)\.patch$/.exec(artifact.name)?.[1]))
+					.filter((wave): wave is number => Number.isSafeInteger(wave) && wave > 0);
 				const wave = Math.max(...waves, 0);
-				patchName = wave > 0 ? `quarantined-${task.id}-w${wave}.patch` : undefined;
+				patchName = wave > 0 ? `${prefix}${wave}.patch` : undefined;
 			}
 			if (!patchName) return task;
 			const patchMeta = byName.get(patchName);
@@ -849,7 +880,7 @@ async function listArtifacts(paths: ProjectPaths): Promise<ArtifactFile[]> {
 			names.map(async (name) => {
 				const st = await stat(join(paths.artifacts, name)).catch(() => undefined);
 				if (!st || !st.isFile()) return undefined;
-				const kind: ArtifactFile["kind"] = name.startsWith("gate-") ? "gate" : name.startsWith("quarantined-") ? "quarantine" : name.startsWith("task-") ? "diff" : "other";
+				const kind: ArtifactFile["kind"] = name.startsWith("gate-") ? "gate" : name.startsWith("quarantined-") ? "quarantine" : name.startsWith("task-") || name.startsWith("candidate-") ? "diff" : "other";
 				return { name, bytes: st.size, mtimeMs: st.mtimeMs, kind } satisfies ArtifactFile;
 			}),
 		);

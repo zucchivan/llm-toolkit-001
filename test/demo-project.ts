@@ -89,7 +89,7 @@ specs = "specs/"
 `;
 }
 
-/** git init + first commit in the fixture so baseline tree capture works. */
+/** git init + immutable fixture base commit; callers add reviewed controls before planning. */
 export async function gitInit(root: string): Promise<void> {
 	const a = async (argv: string[]) => await exec(argv, { cwd: root, timeoutMs: 15_000 });
 	await a(["git", "init"]);

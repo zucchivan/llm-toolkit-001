@@ -1,7 +1,8 @@
 /**
- * Prepared immutable task-tree plumbing (M0-P09). This module is deliberately
- * not wired into the serial driver: callers supply committed Git objects and
- * explicitly attest that workspace writers are fenced before freezing.
+ * Immutable task-tree workspace plumbing (M0-P09, activated for the serial
+ * driver in M0-P14). Callers supply committed Git objects and explicitly
+ * attest that workspace writers are fenced before freezing; this is not a
+ * process-kill implementation or an OS sandbox.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, readdir, chmod, writeFile, rm } from "node:fs/promises";
@@ -11,20 +12,37 @@ import type { ProjectPaths } from "./harness.ts";
 import type { ExecArgvCapability } from "./recipe-runner.ts";
 import { assertAdmissiblePath, createTaskControls, isDeniedPath, isReadOnlyPath, type TaskControls } from "./controls.ts";
 import {
-	assertGitOid, diffTrees, gitText, hashBlob, pinObject, readBlob,
+	assertGitOid, diffTrees, gitText, hashBlob, pinObject, readBlob, readRef,
 	readTreeEntries, resolveTree, writeTreeFromChanges, type GitOid, type GitTreeChange, type GitTreeEntry,
 } from "../util/git-objects.ts";
 
 export type GitTreeSource = Readonly<{ root: string; oid: GitOid }>;
-type WorkspaceData = { root: string; parentTree: GitOid; privateRoot: string; projected: Map<string, { mode: "100644" | "100755"; oid: GitOid }>; excluded: string[]; refBase: string; disposed: boolean; frozen: boolean };
+type WorkspaceData = { root: string; parentTree: GitOid; scopeBaseTree: GitOid; privateRoot: string; projected: Map<string, { mode: "100644" | "100755"; oid: GitOid }>; excluded: string[]; refBase: string; disposed: boolean; frozen: boolean };
 type ReadViewData = { root: string; privateRoot: string; projected: string[]; excluded: string[]; tree: GitOid; disposed: boolean };
 
 /** Opaque, host-created handle; its filesystem path is intentionally not an input to discard. */
 export type OwnedLease = Readonly<{ id: string; kind: "task" | "read"; projectedParentPaths: readonly string[]; excludedParentPaths: readonly string[] }>;
-export type TaskWorkspaceLease = OwnedLease & Readonly<{ kind: "task"; root: string; parentTree: GitOid; workspacePath: string }>;
+export type TaskWorkspaceLease = OwnedLease & Readonly<{
+	kind: "task";
+	root: string;
+	/** Start-of-this-wave tree; progress is measured from here. */
+	parentTree: GitOid;
+	/** Tree of the integration parent; full candidate scope is measured from here. */
+	scopeBaseTree: GitOid;
+	workspacePath: string;
+	/** Set only when resumeTask observes this lease's pinned frozen candidate. */
+	frozenCandidateTree?: GitOid;
+}>;
 export type ReadWorkspace = OwnedLease & Readonly<{ kind: "read"; root: string; tree: GitOid; viewPath: string }>;
 export type FencedWorkspace = Readonly<{ lease: TaskWorkspaceLease; controls: TaskControls }>;
-export type FrozenTree = Readonly<{ parentTree: GitOid; tree: GitOid; changes: readonly GitTreeChange[]; projectedParentPaths: readonly string[] }>;
+export type FrozenTree = Readonly<{
+	parentTree: GitOid;
+	scopeBaseTree: GitOid;
+	tree: GitOid;
+	/** Per-wave progress: start-of-wave tree → candidate. */
+	changes: readonly GitTreeChange[];
+	projectedParentPaths: readonly string[];
+}>;
 
 /** Reviewed recipe bytes are captured once; callers cannot re-read mutable evals/ files mid-run. */
 export type ImmutableRecipeBundle = Readonly<{
@@ -49,14 +67,18 @@ export type TaskExecutionContext = Readonly<{
 	execArgv: ExecArgvCapability;
 }>;
 
-/** Pre-cutover bridge for trusted fixtures/current serial driver only. Removed at P14. */
-export type TrustedCompatibilityContext = Readonly<{
-	kind: "trusted-compatibility";
+/** Candidate-only context used by diagnostic verification; it has no write lease. */
+export type TaskReadContext = Readonly<{
+	kind: "task-read";
 	controlPaths: ProjectPaths;
-	executionRoot: string;
-	readRoot: string;
+	taskId: string;
+	startOid: GitOid;
+	candidateOid: GitOid;
+	frozenReadView: ReadWorkspace;
+	recipeBundle: ImmutableRecipeBundle;
 }>;
-export type ExecutionContext = TaskExecutionContext | TrustedCompatibilityContext;
+
+export type ExecutionContext = TaskExecutionContext | TaskReadContext;
 
 export async function createTaskExecutionContext(input: Omit<TaskExecutionContext, "kind">): Promise<TaskExecutionContext> {
 	const parentOid = assertGitOid(input.parentOid);
@@ -66,6 +88,7 @@ export async function createTaskExecutionContext(input: Omit<TaskExecutionContex
 	if (input.writableWorkspace.kind !== "task" || input.frozenReadView.kind !== "read") throw new Error("execution context requires an owned writable task workspace and frozen read view");
 	if (input.writableWorkspace.root !== input.controlPaths.root || input.frozenReadView.root !== input.controlPaths.root) throw new Error("execution roots must share the project control root");
 	if (input.writableWorkspace.parentTree !== startOid) throw new Error("writable task workspace must start at the execution context start OID");
+	if (input.writableWorkspace.scopeBaseTree !== await resolveTree(input.controlPaths.root, parentOid)) throw new Error("writable task workspace scope base must be the integration parent tree");
 	if (input.frozenReadView.tree !== candidateOid) throw new Error("frozen read view must materialize the candidate OID");
 	assertGitOid(input.recipeBundle.sourceTree);
 	const reviewedTree = await resolveTree(input.controlPaths.root, startOid);
@@ -98,8 +121,44 @@ export async function createTaskExecutionContext(input: Omit<TaskExecutionContex
 	});
 }
 
-export function trustedCompatibilityContext(controlPaths: ProjectPaths): TrustedCompatibilityContext {
-	return Object.freeze({ kind: "trusted-compatibility", controlPaths, executionRoot: controlPaths.root, readRoot: controlPaths.root });
+export async function createTaskReadContext(input: Omit<TaskReadContext, "kind">): Promise<TaskReadContext> {
+	const startOid = assertGitOid(input.startOid);
+	const candidateOid = assertGitOid(input.candidateOid);
+	if (input.frozenReadView.kind !== "read" || input.frozenReadView.root !== input.controlPaths.root) {
+		throw new Error("diagnostic verification requires an owned frozen read view in the control project");
+	}
+	if (input.frozenReadView.tree !== candidateOid) throw new Error("diagnostic read view does not match the retained candidate OID");
+	const reviewedTree = await resolveTree(input.controlPaths.root, startOid);
+	if (input.recipeBundle.sourceTree !== reviewedTree) throw new Error("diagnostic recipe bundle must come from the wave start tree");
+	if (!/^[0-9a-f]{64}$/.test(input.recipeBundle.sha256)) throw new Error("recipe bundle requires a full SHA256 digest");
+	const files = input.recipeBundle.files.map((file) => {
+		if (file.path !== "evals/recipes.toml" && file.path !== "evals/recipes.auto.toml") throw new Error(`unexpected reviewed recipe path ${JSON.stringify(file.path)}`);
+		if (file.contents !== null && typeof file.contents !== "string") throw new Error("reviewed recipe contents must be UTF-8 text or absent");
+		return Object.freeze({ ...file });
+	});
+	if (new Set(files.map((file) => file.path)).size !== files.length) throw new Error("recipe bundle contains a duplicate path");
+	if (createHash("sha256").update(JSON.stringify(files)).digest("hex") !== input.recipeBundle.sha256) {
+		throw new Error("recipe bundle SHA256 does not match its captured bytes");
+	}
+	const treeEntries = await readTreeEntries(input.controlPaths.root, reviewedTree);
+	for (const file of files) {
+		const entry = treeEntries.find((row) => row.path === file.path);
+		let contents: string | null = null;
+		if (entry) {
+			if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) throw new Error(`${file.path} in the reviewed tree is not a regular file`);
+			const bytes = await readBlob(input.controlPaths.root, entry.oid);
+			contents = bytes.toString("utf8");
+			if (!Buffer.from(contents, "utf8").equals(bytes)) throw new Error(`${file.path} in the reviewed tree is not valid UTF-8`);
+		}
+		if (contents !== file.contents) throw new Error(`recipe bundle bytes for ${file.path} do not match the immutable wave start tree`);
+	}
+	return Object.freeze({
+		...input,
+		kind: "task-read",
+		startOid,
+		candidateOid,
+		recipeBundle: Object.freeze({ sourceTree: input.recipeBundle.sourceTree, sha256: input.recipeBundle.sha256, files: Object.freeze(files) }),
+	});
 }
 
 const owned = new WeakMap<object, WorkspaceData | ReadViewData>();
@@ -230,9 +289,15 @@ async function canonicalRoot(root: string): Promise<string> {
  * Create a private writable copy of one immutable parent. `parent` is a
  * committed object/tree reference, never the checked-out index or filesystem.
  */
-export async function openTask(parent: GitTreeSource, identity: PlanIdentity, id: string): Promise<TaskWorkspaceLease> {
+export async function openTask(
+	parent: GitTreeSource,
+	identity: PlanIdentity,
+	id: string,
+	options: { scopeBaseOid?: string } = {},
+): Promise<TaskWorkspaceLease> {
 	const root = await canonicalRoot(parent.root);
 	const parentTree = await resolveTree(root, assertGitOid(parent.oid));
+	const scopeBaseTree = await resolveTree(root, assertGitOid(options.scopeBaseOid ?? parent.oid));
 	const leaseId = randomUUID();
 	const refBase = workspaceRef(identity, id, leaseId);
 	await pinObject(root, `${refBase}/parent`, parentTree);
@@ -246,16 +311,78 @@ export async function openTask(parent: GitTreeSource, identity: PlanIdentity, id
 	assertInside(state, privateRoot);
 	const defaultControls = createTaskControls({ root, targetPaths: [] });
 	const captured = await materializeTree(root, parentTree, defaultControls, privateRoot, false);
-	const data: WorkspaceData = { root, parentTree, privateRoot, projected: captured.projected, excluded: captured.excluded, refBase, disposed: false, frozen: false };
+	const data: WorkspaceData = { root, parentTree, scopeBaseTree, privateRoot, projected: captured.projected, excluded: captured.excluded, refBase, disposed: false, frozen: false };
 	const lease = Object.freeze({
 		id: leaseId,
 		kind: "task" as const,
 		root,
 		parentTree,
+		scopeBaseTree,
 		workspacePath: privateRoot,
 		projectedParentPaths: Object.freeze([...captured.projected.keys()].sort()),
 		excludedParentPaths: Object.freeze([...captured.excluded]),
 	});
+	owned.set(lease, data);
+	return lease;
+}
+
+/** Reattach a checkpointed lease after reopen without recreating or recapturing its tree. */
+export async function resumeTask(
+	parent: GitTreeSource,
+	identity: PlanIdentity,
+	id: string,
+	leaseId: string,
+	options: { scopeBaseOid?: string } = {},
+): Promise<TaskWorkspaceLease> {
+	if (!UUID_RE.test(leaseId)) throw new Error("resumeTask requires the checkpointed lowercase lease UUID");
+	const root = await canonicalRoot(parent.root);
+	const parentTree = await resolveTree(root, assertGitOid(parent.oid));
+	const scopeBaseTree = await resolveTree(root, assertGitOid(options.scopeBaseOid ?? parent.oid));
+	const refBase = workspaceRef(identity, id, leaseId);
+	const state = await privateWorkRoot(root);
+	const privateRoot = join(state, identity.planRevision, id, leaseId);
+	assertInside(state, privateRoot);
+	for (const directory of [join(state, identity.planRevision), join(state, identity.planRevision, id)]) {
+		const info = await lstat(directory).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+		if (info && (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0)) {
+			throw new Error(`checkpointed workspace parent is not a private real directory: ${directory}`);
+		}
+	}
+	const privateInfo = await lstat(privateRoot).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+	if (privateInfo && (!privateInfo.isDirectory() || privateInfo.isSymbolicLink() || (privateInfo.mode & 0o077) !== 0)) {
+		throw new Error(`checkpointed workspace is not a private real directory: ${privateRoot}`);
+	}
+	const pinnedParent = await readRef(root, `${refBase}/parent`);
+	if (pinnedParent !== parentTree) throw new Error(`checkpointed workspace parent pin is ${pinnedParent ?? "absent"}, not ${parentTree}`);
+	const candidate = await readRef(root, `${refBase}/candidate`);
+	if (!privateInfo && !candidate) throw new Error("checkpointed workspace and frozen candidate are both absent; recovery is required");
+	const defaultControls = createTaskControls({ root, targetPaths: [] });
+	const entries = await readTreeEntries(root, parentTree);
+	const projected = new Map<string, { mode: "100644" | "100755"; oid: GitOid }>();
+	const excluded: string[] = [];
+	for (const entry of entries) {
+		if (isDeniedPath(entry.path, defaultControls)) {
+			excluded.push(entry.path);
+			continue;
+		}
+		if (!isRegularEntry(entry)) throw new Error(`unsupported checkpointed parent entry ${JSON.stringify(entry.path)}`);
+		projected.set(entry.path, { mode: entry.mode, oid: entry.oid });
+	}
+	const lease = Object.freeze({
+		id: leaseId,
+		kind: "task" as const,
+		root,
+		parentTree,
+		scopeBaseTree,
+		workspacePath: privateRoot,
+		...(candidate ? { frozenCandidateTree: await resolveTree(root, candidate) } : {}),
+		projectedParentPaths: Object.freeze([...projected.keys()].sort()),
+		excludedParentPaths: Object.freeze(excluded.sort()),
+	});
+	const data: WorkspaceData = {
+		root, parentTree, scopeBaseTree, privateRoot, projected, excluded, refBase,
+		disposed: false, frozen: candidate !== undefined,
+	};
 	owned.set(lease, data);
 	return lease;
 }
@@ -266,7 +393,7 @@ export async function openTask(parent: GitTreeSource, identity: PlanIdentity, id
  */
 export function fenceWorkspace(lease: TaskWorkspaceLease, controls: TaskControls): FencedWorkspace {
 	const data = owned.get(lease);
-	if (!data || !("parentTree" in data) || data.disposed || data.frozen) throw new Error("cannot fence an unowned, frozen, or disposed task workspace");
+	if (!data || !("parentTree" in data) || data.disposed) throw new Error("cannot fence an unowned or disposed task workspace");
 	if (resolve(controls.root) !== data.root) throw new Error("task controls root does not match the workspace root");
 	// Validate targets/denies now, before any candidate filesystem scan.
 	const normalized = createTaskControls(controls);
@@ -318,12 +445,16 @@ export async function freeze(fencedWorkspace: FencedWorkspace): Promise<FrozenTr
 	changes.sort((a, b) => (a.mode === "0" ? 0 : 1) - (b.mode === "0" ? 0 : 1) || a.path.localeCompare(b.path));
 	const tree = await writeTreeFromChanges(data.root, data.parentTree, changes);
 	const treeChanges = await diffTrees(data.root, data.parentTree, tree);
-	// Independently validate the tree-level delta, not just the filesystem walk.
+	// Independently validate the per-wave tree delta, not just the filesystem walk.
 	for (const change of treeChanges) assertAdmissiblePath(change.path, controls);
+	// Scope is cumulative from the unchanged integration parent, while progress
+	// above is measured from this wave's start tree.
+	for (const change of await diffTrees(data.root, data.scopeBaseTree, tree)) assertAdmissiblePath(change.path, controls);
 	await pinObject(data.root, `${data.refBase}/candidate`, tree);
 	data.frozen = true;
 	return Object.freeze({
 		parentTree: data.parentTree,
+		scopeBaseTree: data.scopeBaseTree,
 		tree,
 		changes: Object.freeze(treeChanges),
 		projectedParentPaths: Object.freeze([...data.projected.keys()].sort()),

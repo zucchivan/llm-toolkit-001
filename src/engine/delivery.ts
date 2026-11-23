@@ -1,9 +1,8 @@
 /**
- * Delivery host operations. M0-P12 adds prepared journaled local integration,
- * discard, and local-publication helpers; M0-P13 adds prepared verified PR
- * publication. They are not wired into the serial driver until P14. The legacy
- * `runDelivery` implementation below intentionally
- * remains unchanged for the pre-cutover driver and is not the P12 guarantee.
+ * Delivery host operations. M0-P12 provides journaled local integration,
+ * workspace disposal, and local publication; M0-P13 provides verified stacked
+ * PR publication. M0-P14's serial driver calls these operations instead of
+ * staging, restoring, checking out, or delivering from the operator worktree.
  */
 import { exec } from "../util/exec.ts";
 import type { LoopAndLock } from "./harness.ts";
@@ -12,7 +11,6 @@ import { parseApprovedGitHubOrigin, readApprovedDeliveryOrigin } from "../sandbo
 import type { ApprovedGitHubOrigin } from "../sandbox/host-profile.ts";
 import { commitState, readGrant, readSessionState } from "./state.ts";
 import type { ReceiptAttempt } from "./state.ts";
-import type { WaveRow } from "./infos.ts";
 import {
 	latestJournalEvent, receiptKey,
 } from "./receipts.ts";
@@ -277,6 +275,16 @@ export async function integrateAcceptedCandidate(
 	if (prior?.value.state === "integrated") {
 		const recorded = await readCommit(root, prior.value.commit);
 		assertJournalCommit(recorded, candidate, parent);
+		let observed: string | undefined;
+		try { observed = await readRef(root, acceptedName); }
+		catch (error) {
+			await recordIntegrationState(kit, wave, prior.value, "unknown", "accepted-ref-unreadable", options);
+			throw new RecoveryRequiredError(`cannot re-confirm integrated accepted ref: ${(error as Error).message}`);
+		}
+		if (observed !== prior.value.commit) {
+			await recordIntegrationState(kit, wave, prior.value, "unknown", "accepted-ref-conflict", options);
+			throw new RecoveryRequiredError(`integrated accepted ref is ${observed ?? "absent"}, not the recorded commit ${prior.value.commit}`);
+		}
 		return { receipt: prior.value, event: prior };
 	}
 
@@ -381,9 +389,6 @@ export async function publishLocalResult(
 	if (existing && existing.value.mode !== mode) {
 		throw new RecoveryRequiredError(`delivery retry changed mode from ${existing.value.mode} to ${mode} for the same wave`);
 	}
-	if (existing && existing.value.commit === commit && (existing.value.state === "published" || existing.value.state === "not_requested")) {
-		return { receipt: existing.value, event: existing };
-	}
 	if (mode === "none") {
 		let acceptedHead: string | undefined;
 		try { acceptedHead = await readRef(root, acceptedRef(wave.planRevision)); }
@@ -405,6 +410,7 @@ export async function publishLocalResult(
 			}), options, "delivery-result");
 			throw new RecoveryRequiredError(`none acknowledgment requires accepted ref ${commit}, observed ${acceptedHead ?? "absent"} (${unknown.value.code})`);
 		}
+		if (existing?.value.state === "not_requested") return { receipt: existing.value, event: existing };
 		const event = await appendJournal(kit, wave, "delivery", (meta) => ({
 			kind: "delivery", ...meta, value: {
 				...wave, id: meta.opId, acceptedId: accepted.value.id, commit, mode, state: "not_requested", checkedAt: meta.at,
@@ -437,6 +443,30 @@ export async function publishLocalResult(
 			},
 		}), options, "delivery-result");
 		throw new RecoveryRequiredError(`cannot determine whether result branch ${ref} is checked out: ${(error as Error).message}`);
+	}
+	if (current === commit) {
+		assertJournalCommit(await readCommit(root, commit), accepted.value.tree, expected);
+		if (existing?.value.state === "published") return { receipt: existing.value, event: existing };
+		if (existing && (existing.value.state === "pending" || existing.value.state === "unknown")) {
+			const retryIntent = await appendJournal(kit, wave, "delivery", (meta) => ({
+				kind: "delivery", ...meta, value: {
+					...wave, id: meta.opId, acceptedId: accepted.value.id, commit, mode, state: "pending", ref,
+					baseRef: expected, checkedAt: meta.at, code: "reconcile-local-result-ref",
+				},
+			}), options, "delivery-intent");
+			return await recordDeliveryState(kit, wave, retryIntent.value, "published", options);
+		}
+		await appendJournal(kit, wave, "delivery", (meta) => ({
+			kind: "delivery", ...meta, value: {
+				...wave, id: meta.opId, acceptedId: accepted.value.id, commit, mode, state: "unknown", ref,
+				baseRef: expected, checkedAt: meta.at, code: "result-ref-without-intent",
+			},
+		}), options, "delivery-result");
+		throw new RecoveryRequiredError(`local result ref ${ref} already names ${commit} without a matching publication intent`);
+	}
+	if (existing?.value.state === "published") {
+		await recordDeliveryState(kit, wave, existing.value, "unknown", options, "result-ref-conflict");
+		throw new RecoveryRequiredError(`previously published result branch ${ref} now reads ${current ?? "absent"}, not ${commit}`);
 	}
 	if (checkedOut) {
 		const failed = await appendJournal(kit, wave, "delivery", (meta) => ({
@@ -504,9 +534,9 @@ async function recordDeliveryState(
 }
 
 // ---------------------------------------------------------------------------
-// Prepared PR publication (M0-P13). This is intentionally not driver-active
-// until P14. The only destination authority is host-v1.json; callers inject
-// narrow transport/host interfaces in tests and may not supply an origin.
+// Verified stacked PR publication (M0-P13, activated by P14). The only
+// destination authority is host-v1.json; tests inject narrow transport/host
+// interfaces and no caller may supply an origin.
 // ---------------------------------------------------------------------------
 
 export type RemotePullRequest = {
@@ -646,6 +676,25 @@ async function publicationBase(
  * validated GitHub PR. Retries first reconcile both effects; remote branches
  * are never updated, and an uncertain PR-create attempt is never repeated.
  */
+/** Validate consent, the host-approved destination, and reviewed base branch without network effects. */
+export async function preflightPullRequest(
+	kit: LoopAndLock,
+	options: { deliverExplicit: boolean; profilePath?: string },
+): Promise<void> {
+	if (!options.deliverExplicit) throw new Error('delivery.mode="pr" requires explicit --deliver consent before implementation starts');
+	if (kit.loop.config.delivery.mode !== "pr") throw new Error("PR preflight requires reviewed delivery.mode = pr");
+	const state = await readSessionState(kit.loop.harness);
+	const plan = state.router.identity;
+	if (!plan?.baseCommit) throw new Error("PR delivery requires a reviewed base commit; create the project seed commit and replan first");
+	if (!plan.baseBranch || plan.baseBranch.startsWith("(") || plan.baseBranch.startsWith("refs/")) {
+		throw new Error("PR delivery requires the reviewed base branch captured by the plan; detached-base plans cannot publish");
+	}
+	await readApprovedDeliveryOrigin(kit.loop.paths.root, options.profilePath);
+	const baseRef = assertBranchRef(`refs/heads/${plan.baseBranch}`);
+	const check = await exec(["git", "check-ref-format", baseRef], { cwd: kit.loop.paths.root, timeoutMs: 10_000 });
+	if (check.code !== 0) throw new Error(`reviewed base branch ${JSON.stringify(plan.baseBranch)} is not a valid Git branch`);
+}
+
 export async function publishPullRequest(
 	kit: LoopAndLock,
 	wave: WaveKey,
@@ -1058,112 +1107,4 @@ async function appendRollback(
 		},
 	}), options, boundary);
 	return { receipt: event.value, event };
-}
-
-export interface DeliveryOutcome {
-	mode: string;
-	performed: boolean;
-	ref?: string;
-	detail?: string;
-}
-
-export async function runDelivery(
-	kit: LoopAndLock,
-	taskId: string,
-	wave: number,
-	options: { deliverExplicit?: boolean } = {},
-): Promise<DeliveryOutcome> {
-	const mode = kit.loop.config.delivery.mode;
-	if (mode === "none") return { mode, performed: false };
-
-	if (mode === "pr" && !options.deliverExplicit) {
-		await commitState(kit, {
-			rows: [
-				{ ts: Date.now(), kind: "delivery", task: taskId, verb: "pr-skip", detail: 'delivery.mode="pr" requires the --deliver flag on the run command' },
-			],
-		});
-		return { mode, performed: false, detail: "needs --deliver" };
-	}
-
-	if (mode === "commit") {
-		return commitMode(kit, taskId, wave);
-	}
-
-	// mode === "pr"
-	return prMode(kit, taskId, wave);
-}
-
-async function commitMode(kit: LoopAndLock, taskId: string, wave: number): Promise<DeliveryOutcome> {
-	const root = kit.loop.paths.root;
-	const message = `${projectName(kit)}: ${taskId} (wave ${wave})`;
-	const add = await exec(["git", "add", "-A"], { cwd: root, timeoutMs: 30_000 });
-	if (add.code !== 0) {
-		await commitState(kit, { rows: rows(kit, taskId, "commit-failed", add.stderr.slice(0, 200)) });
-		return { mode: "commit", performed: false, detail: "git add failed" };
-	}
-	const commit = await exec(["git", "commit", "-m", message], { cwd: root, timeoutMs: 60_000 });
-	if (commit.code !== 0) {
-		await commitState(kit, { rows: rows(kit, taskId, "commit-failed", commit.stderr.slice(0, 200)) });
-		return { mode: "commit", performed: false, detail: "git commit failed (nothing to commit?)" };
-	}
-	return finish(kit, taskId, undefined, `committed: ${message}`);
-}
-
-async function prMode(kit: LoopAndLock, taskId: string, wave: number): Promise<DeliveryOutcome> {
-	const root = kit.loop.paths.root;
-	const branch = `kit/${taskId}-w${wave}`;
-	const message = `${projectName(kit)}: ${taskId} (wave ${wave})`;
-
-	const head = await exec(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: root, timeoutMs: 15_000 });
-	const previous = (head.stdout || "main").trim();
-	const checkout = await exec(["git", "checkout", "-b", branch], { cwd: root, timeoutMs: 30_000 }); // keeps working tree
-	if (checkout.code !== 0) {
-		await commitState(kit, { rows: rows(kit, taskId, "pr-failed", checkout.stderr.slice(0, 200)) });
-		return { mode: "pr", performed: false, detail: "branch creation failed" };
-	}
-	await exec(["git", "add", "-A"], { cwd: root, timeoutMs: 30_000 });
-	const commit = await exec(["git", "commit", "-m", message], { cwd: root, timeoutMs: 60_000 });
-	if (commit.code !== 0) {
-		await exec(["git", "checkout", previous], { cwd: root, timeoutMs: 30_000 });
-		await commitState(kit, { rows: rows(kit, taskId, "pr-failed", commit.stderr.slice(0, 200)) });
-		return { mode: "pr", performed: false, detail: "commit failed" };
-	}
-	const push = await exec(["git", "push", "-u", "origin", branch], { cwd: root, timeoutMs: 120_000 });
-	if (push.code !== 0) {
-		await exec(["git", "checkout", previous], { cwd: root, timeoutMs: 30_000 });
-		await commitState(kit, { rows: rows(kit, taskId, "pr-failed", push.stderr.slice(0, 200)) });
-		return { mode: "pr", performed: false, detail: "push failed" };
-	}
-	const pr = await exec(["gh", "pr", "create", "--fill", "--head", branch], { cwd: root, timeoutMs: 60_000 });
-	if (pr.code !== 0) {
-		await exec(["git", "checkout", previous], { cwd: root, timeoutMs: 30_000 });
-		await commitState(kit, { rows: rows(kit, taskId, "pr-failed", (pr.stderr || pr.stdout).slice(0, 200)) });
-		return { mode: "pr", performed: false, detail: "gh pr create failed" };
-	}
-	const ref = (pr.stdout || "").trim();
-	await exec(["git", "checkout", previous], { cwd: root, timeoutMs: 30_000 });
-	return finish(kit, taskId, branch, `${ref} (back on ${previous})`);
-}
-
-async function finish(kit: LoopAndLock, taskId: string, branch: string | undefined, detail: string): Promise<DeliveryOutcome> {
-	await commitState(kit, {
-		rows: [{ ts: Date.now(), kind: "delivery", task: taskId, verb: "delivered", detail }],
-	});
-	return { mode: kit.loop.config.delivery.mode, performed: true, ref: branch, detail };
-}
-
-function rows(kit: LoopAndLock, taskId: string, verb: string, detail: string): WaveRow[] {
-	return [{ ts: Date.now(), kind: "delivery", task: taskId, verb, detail }];
-}
-
-/** Use the project name recorded at init (package.json / cwd basename). */
-function projectName(kit: LoopAndLock): string {
-	const name = (kit.loop.config as unknown as { name?: string }).name;
-	if (name) return name;
-	return basename(kit.loop.paths.root);
-}
-
-function basename(path: string): string {
-	const parts = path.split("/");
-	return parts[parts.length - 1] ?? path;
 }

@@ -8,6 +8,7 @@ export type ProgressEvent =
 	| { kind: "sleeping"; taskId: string; wave: number; message: string }
 	| { kind: "budget-stop"; message: string }
 	| { kind: "blocked"; message: string; blockedIds?: string[] }
+	| { kind: "recovery-required"; taskId?: string; message: string }
 	// Arrived at a drained queue that still has quarantined tasks — not a plain
 	// success; `quarantined` names the task ids that ended in quarantine.
 	| { kind: "quarantine-stop"; quarantined: string[]; message: string }

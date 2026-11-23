@@ -4,8 +4,8 @@
  * they authorize, each with a stable operation ID and timestamp. P11 adds GATE
  * and PASS events; P12 adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY
  * journal events with stable per-stage keys, attempt ordinals, and latest
- * pointers. P11 event shapes remain unchanged; later packets may add
- * resolution/checkpoint kinds additively.
+ * pointers. P11 event shapes remain unchanged; M0-P14 adds per-wave/stage
+ * checkpoint events and pointers without storing prompts, patches, or raw output.
  *
  * Bindings: receipts reference the candidate (checked tree), the gate receipt,
  * the effective verification policy, and the plan's reviewed controls digest.
@@ -63,6 +63,8 @@ export type GateReceipt = WaveKey & {
 	tree: string;
 	/** Digest of the reviewed control bundle; ABSENT when the plan has no approved control input (distinct from empty). */
 	controlsSha256?: string;
+	/** Optional digest of bounded failure summaries for the duplicate-gate breaker; never raw output. */
+	failureHash?: string;
 	checks: GateCheck[];
 };
 
@@ -130,8 +132,20 @@ export type DeliveryReceipt = WaveKey & {
 };
 
 export type Resolution = WaveKey & { action: "retry" | "accept-tree"; reason: string; evidenceSha256?: string; tree?: string };
+export type CheckpointStage = "implement" | "gates" | "primary" | "skeptic" | "integrate" | "publish" | "rollback" | "terminal";
+export type CheckpointState = "pending" | "complete" | "failed" | "unknown";
+export type CheckpointOutcome =
+	| "submitted" | "answered" | "unanswered-retry" | "unanswered-quarantine"
+	| "zero-progress" | "gate-pass" | "gate-fail" | "gate-duplicate"
+	| "approve" | "reject" | "needs_human" | "accepted" | "integrated"
+	| "not-requested" | "published" | "discarded" | "retry" | "quarantined";
+
+/** Latest recoverable point for one wave/stage. Candidate OIDs are retained
+ *  under private refs; submission identity is persisted before dispatch. */
 export type Checkpoint = WaveKey & {
-	stage: "implement" | "gates" | "primary" | "skeptic" | "integrate" | "publish" | "rollback" | "terminal";
+	stage: CheckpointStage;
+	state: CheckpointState;
+	outcome?: CheckpointOutcome;
 	parent: string;
 	startTree: string;
 	candidate?: string;
@@ -139,7 +153,26 @@ export type Checkpoint = WaveKey & {
 	submissionKey?: string;
 	leaseId?: string;
 	grantedFeedbackIds: string[];
+	code?: string;
 };
+
+export type CheckpointEvent = { kind: "checkpoint"; opId: string; at: number; ordinal: number; value: Checkpoint };
+export type CheckpointLatest = { opId: string; ordinal: number };
+export type CheckpointIdentity = WaveKey & { stage: CheckpointStage };
+
+/** Additive status/readout summary; it contains receipt outcomes, never raw logs. */
+export type ReceiptStateView = WaveKey & {
+	gate?: "pass" | "fail";
+	primary?: ReviewPass["verdict"];
+	skeptic?: ReviewPass["verdict"];
+	acceptance?: "accepted";
+	integration?: IntegrationReceipt["state"];
+	rollback?: RollbackReceipt["state"];
+	delivery?: DeliveryReceipt["state"];
+};
+
+/** Last frozen wave candidate exposed to status/readout consumers. */
+export type FrozenCheckpointView = { wave: number; baseTree: string; candidateTree: string; asOf: number };
 
 export type ReceiptPayloads = {
 	gate: GateReceipt;
@@ -161,22 +194,113 @@ export type JournalReceiptEvent = {
 export type ReceiptEvent =
 	| { kind: "gate"; opId: string; at: number; value: GateReceipt }
 	| { kind: "pass"; opId: string; at: number; value: PassReceipt }
+	| CheckpointEvent
 	| JournalReceiptEvent;
 
 export type ReceiptStage = JournalReceiptKind;
 export type ReceiptIdentity = WaveKey & { stage: ReceiptStage };
 export type ReceiptLatest = { opId: string; ordinal: number };
-export type ReceiptsDocValue = { version: 1; events: ReceiptEvent[]; latest?: Record<string, ReceiptLatest> };
+export type ReceiptsDocValue = {
+	version: 1;
+	events: ReceiptEvent[];
+	latest?: Record<string, ReceiptLatest>;
+	latestCheckpoints?: Record<string, CheckpointLatest>;
+};
 
 const REVISION_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TASK_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-/** Stable journal address: the key is independent of attempts and timestamps. */
-export function receiptKey(identity: ReceiptIdentity): string {
+function validateWaveKey(identity: WaveKey): void {
 	if (!REVISION_RE.test(identity.planRevision)) throw new Error("receipt key requires a lowercase planRevision UUIDv4");
 	if (!TASK_RE.test(identity.taskId)) throw new Error(`receipt key has an invalid task id ${JSON.stringify(identity.taskId)}`);
 	if (!Number.isSafeInteger(identity.wave) || identity.wave < 1) throw new Error("receipt key requires a positive safe-integer wave");
+}
+
+/** Stable journal address: the key is independent of attempts and timestamps. */
+export function receiptKey(identity: ReceiptIdentity): string {
+	validateWaveKey(identity);
 	return `${identity.planRevision}/${identity.taskId}/${identity.wave}/${identity.stage}`;
+}
+
+/** Checkpoint pointers are per wave AND stage; updates never erase history. */
+export function checkpointKey(identity: CheckpointIdentity): string {
+	validateWaveKey(identity);
+	return `${identity.planRevision}/${identity.taskId}/${identity.wave}/checkpoint/${identity.stage}`;
+}
+
+export function latestCheckpoint(doc: ReceiptsDocValue, identity: CheckpointIdentity): CheckpointEvent | undefined {
+	const key = checkpointKey(identity);
+	const pointer = doc.latestCheckpoints?.[key];
+	if (pointer) {
+		const event = doc.events.find((candidate): candidate is CheckpointEvent =>
+			candidate.kind === "checkpoint" && candidate.opId === pointer.opId && candidate.ordinal === pointer.ordinal
+				&& checkpointKey(candidate.value) === key,
+		);
+		if (event) return event;
+	}
+	return doc.events.filter((event): event is CheckpointEvent =>
+		event.kind === "checkpoint" && checkpointKey(event.value) === key,
+	).at(-1);
+}
+
+export function latestCheckpointForWave(doc: ReceiptsDocValue, wave: WaveKey): CheckpointEvent | undefined {
+	return doc.events.filter((event): event is CheckpointEvent =>
+		event.kind === "checkpoint" && event.value.planRevision === wave.planRevision
+			&& event.value.taskId === wave.taskId && event.value.wave === wave.wave,
+	).at(-1);
+}
+
+export function latestCheckpointForRevision(doc: ReceiptsDocValue, planRevision: string): CheckpointEvent | undefined {
+	return doc.events.filter((event): event is CheckpointEvent =>
+		event.kind === "checkpoint" && event.value.planRevision === planRevision,
+	).at(-1);
+}
+
+export function latestFrozenCheckpoint(doc: ReceiptsDocValue, planRevision: string): FrozenCheckpointView | undefined {
+	const event = doc.events.filter((candidate): candidate is CheckpointEvent =>
+		candidate.kind === "checkpoint" && candidate.value.planRevision === planRevision && candidate.value.candidate !== undefined,
+	).at(-1);
+	if (!event?.value.candidate) return undefined;
+	return {
+		wave: event.value.wave,
+		baseTree: event.value.startTree,
+		candidateTree: event.value.candidate,
+		asOf: event.at,
+	};
+}
+
+export function receiptStatesForWave(doc: ReceiptsDocValue, wave: WaveKey): ReceiptStateView {
+	const view: ReceiptStateView = { ...wave };
+	const gate = doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "gate" }> =>
+		event.kind === "gate" && event.value.planRevision === wave.planRevision
+			&& event.value.taskId === wave.taskId && event.value.wave === wave.wave,
+	).at(-1);
+	if (gate) view.gate = gate.value.checks.some((check) => check.outcome === "fail" || check.outcome === "error") ? "fail" : "pass";
+	for (const pass of ["primary", "skeptic"] as const) {
+		const event = doc.events.filter((candidate): candidate is Extract<ReceiptEvent, { kind: "pass" }> =>
+			candidate.kind === "pass" && candidate.value.planRevision === wave.planRevision
+				&& candidate.value.taskId === wave.taskId && candidate.value.wave === wave.wave
+				&& candidate.value.review.pass === pass,
+		).at(-1);
+		if (event) view[pass] = event.value.review.verdict;
+	}
+	const acceptance = latestJournalEvent(doc, receiptKey({ ...wave, stage: "acceptance" }));
+	if (acceptance?.kind === "acceptance") view.acceptance = "accepted";
+	const integration = latestJournalEvent(doc, receiptKey({ ...wave, stage: "integrate" }));
+	if (integration?.kind === "integrate") view.integration = integration.value.state;
+	const rollback = latestJournalEvent(doc, receiptKey({ ...wave, stage: "rollback" }));
+	if (rollback?.kind === "rollback") view.rollback = rollback.value.state;
+	const delivery = latestJournalEvent(doc, receiptKey({ ...wave, stage: "delivery" }));
+	if (delivery?.kind === "delivery") view.delivery = delivery.value.state;
+	return view;
+}
+
+export function latestReceiptStates(doc: ReceiptsDocValue, planRevision: string): ReceiptStateView | undefined {
+	const checkpoint = latestCheckpointForRevision(doc, planRevision);
+	if (checkpoint) return receiptStatesForWave(doc, checkpoint.value);
+	const event = doc.events.filter((candidate) => "value" in candidate && candidate.value.planRevision === planRevision).at(-1);
+	if (!event || !("taskId" in event.value) || !Number.isSafeInteger(event.value.wave)) return undefined;
+	return receiptStatesForWave(doc, event.value as WaveKey);
 }
 
 /** Latest event by journal key, falling back to event history for pre-index docs. */
@@ -204,13 +328,18 @@ export const ReceiptsDoc = defineDoc({
 /** One receipt = one operation: the receipt id IS the event's operation id. */
 export function gateReceiptEvent(
 	waveKey: WaveKey,
-	value: { tree: string; controlsSha256?: string; checks: GateCheck[] },
+	value: { tree: string; controlsSha256?: string; failureHash?: string; checks: GateCheck[] },
 ): Extract<ReceiptEvent, { kind: "gate" }> {
 	const id = randomUUID();
 	// Optional means omit: a plan without approved controls records no digest.
-	const receipt: GateReceipt = value.controlsSha256 === undefined
-		? { ...waveKey, id, tree: value.tree, checks: [...value.checks] }
-		: { ...waveKey, id, tree: value.tree, controlsSha256: value.controlsSha256, checks: [...value.checks] };
+	const receipt: GateReceipt = {
+		...waveKey,
+		id,
+		tree: value.tree,
+		...(value.controlsSha256 !== undefined ? { controlsSha256: value.controlsSha256 } : {}),
+		...(value.failureHash !== undefined ? { failureHash: value.failureHash } : {}),
+		checks: [...value.checks],
+	};
 	return { kind: "gate", opId: id, at: Date.now(), value: receipt };
 }
 

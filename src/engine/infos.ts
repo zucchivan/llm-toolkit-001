@@ -20,6 +20,7 @@ import { KIT_VERSION } from "../config.ts";
 import { shasum } from "../util/git.ts";
 import { atomicWrite, atomicWriteJson } from "../util/fsx.ts";
 import type { ArchivedPlanRef, PlanIdentity } from "./plans.ts";
+import type { FrozenCheckpointView, ReceiptStateView } from "./receipts.ts";
 
 // ---------------------------------------------------------------------------
 // RouterDoc
@@ -128,6 +129,12 @@ export type WaveRow = {
 	provider?: string;
 	modelId?: string;
 	reason?: string;
+	/** Latest reviewed plan identity for rows emitted by the serial driver. */
+	planRevision?: string;
+	/** Receipt projection for this row's wave; the journal remains authoritative. */
+	receiptStates?: ReceiptStateView;
+	/** Frozen candidate point for this row when one exists. */
+	checkpoint?: FrozenCheckpointView;
 	/** M0-P11 (additive): the `loop.receipts` pass receipt id this verdict row
 	 *  was committed with. Journal-stage latest pointers live in ReceiptsDoc,
 	 *  not in display rows. Absent on legacy rows and diagnostic verifies. */

@@ -21,7 +21,7 @@ import type { LoopAndLock } from "./harness.ts";
 import { commitState } from "./state.ts";
 import type { GateResult } from "./gates.ts";
 import { passReceiptEvent } from "./receipts.ts";
-import type { GateCheck, VerifierPolicy } from "./receipts.ts";
+import type { Checkpoint, GateCheck, ReviewPass, VerifierPolicy } from "./receipts.ts";
 import {
 	citableGateIds, enforceCriterionEvidence, reviewPass,
 	type CriterionEvidenceContext, type CriterionReply,
@@ -31,7 +31,7 @@ import {
 	assessVerifier, persistVerifierAssessment,
 	type AssessVerifierOptions, type VerifierObservation,
 } from "./verifier-assessment.ts";
-import type { ExecutionContext, TaskExecutionContext } from "./workspace.ts";
+import type { ExecutionContext, TaskExecutionContext, TaskReadContext } from "./workspace.ts";
 
 export type Verdict = "approve" | "reject" | "needs_human";
 
@@ -98,7 +98,7 @@ async function diffVsBaseline(root: string, baseline: string): Promise<{ stat: s
 	return { stat, files: (list.stdout || "").trim().split("\n").filter(Boolean) };
 }
 
-async function diffForTaskContext(context: TaskExecutionContext): Promise<{ stat: string; files: string[]; display: Awaited<ReturnType<typeof diffDisplayTrees>> }> {
+async function diffForTaskContext(context: TaskExecutionContext | TaskReadContext): Promise<{ stat: string; files: string[]; display: Awaited<ReturnType<typeof diffDisplayTrees>> }> {
 	const display = await diffDisplayTrees(context.controlPaths.root, context.startOid, context.candidateOid);
 	return {
 		stat: display.stats.files.map((file) => `${file.path} (+${file.insertions}/-${file.deletions}${file.binary ? ", binary" : ""})`).join("\n"),
@@ -109,16 +109,19 @@ async function diffForTaskContext(context: TaskExecutionContext): Promise<{ stat
 
 /** The checked tree + gate receipt binding both read-only passes receive. */
 export interface GateEvidenceInput {
-	/** The tree the gate receipt recorded (the candidate on prepared contexts). */
+	/** The tree the gate receipt recorded (the frozen candidate in the serial driver). */
 	tree: string;
 	/** The gate receipt id the pass receipts bind to. */
 	gateId: string;
 	checks: readonly GateCheck[];
 }
 
+export type VerifyPassName = "primary" | "skeptic";
+export type VerifySubmissionRecovery = { conversationId: number; submissionKey: string };
+
 export interface VerifyOptions {
 	skepticSecondPass?: boolean;
-	/** Host-issued roots and immutable candidate; omitted only on the trusted compatibility path. */
+	/** Host-issued roots and immutable candidate; omitted only by legacy direct unit callers. */
 	executionContext?: ExecutionContext;
 	/** The gate receipt's checked tree + checks; omitted on the one-off diagnostic
 	 *  path, where no gate receipts exist and no gate reference can be evidence. */
@@ -126,6 +129,18 @@ export interface VerifyOptions {
 	/** Wave identity for durable pass receipts (M0-P11). The one-off diagnostic
 	 *  verify owns its operation key and never records a fictitious wave. */
 	waveIdentity?: { planRevision: string; wave: number };
+	/** Previously committed pass receipts for this exact candidate; these are never dispatched again. */
+	existingPasses?: Partial<Record<VerifyPassName, ReviewPass>>;
+	/** Checkpointed conversation/request tuples used to reconcile an interrupted submission. */
+	submissionRecovery?: Partial<Record<VerifyPassName, VerifySubmissionRecovery>>;
+	/** Stable request identities for a new pass; required wave callers derive these from the checkpoint key. */
+	submissionKeys?: Partial<Record<VerifyPassName, string>>;
+	/** Persist the conversation/request tuple before the first submit call. */
+	onSubmissionPrepared?: (pass: VerifyPassName, conversationId: number, submissionKey: string) => Promise<void>;
+	/** Atomically checkpoint a committed pass receipt with its reviewed outcome. */
+	checkpointForPass?: (pass: VerifyPassName, conversationId: number, submissionKey: string, result: VerifyResult) => Checkpoint;
+	/** Runs after the pass receipt commits and before another pass is dispatched. */
+	afterPassCommitted?: (pass: VerifyPassName) => Promise<void>;
 	/** Optional injection seam; config supplies the default opt-in and env supplies credentials. */
 	jevShadow?: Omit<AssessVerifierOptions, "enabled"> & { enabled?: boolean };
 }
@@ -133,7 +148,7 @@ export interface VerifyOptions {
 export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: VerifyOptions = {}): Promise<VerifyResult> {
 	const executionContext = options.executionContext;
 	if (executionContext && executionContext.controlPaths.root !== kit.loop.paths.root) throw new Error("execution context control root does not match the open project harness");
-	const taskContext = executionContext?.kind === "task-execution" ? executionContext : undefined;
+	const taskContext = executionContext?.kind === "task-execution" || executionContext?.kind === "task-read" ? executionContext : undefined;
 	if (taskContext && taskContext.taskId !== task.id) throw new Error(`verifier task ${task.id} does not match execution context task ${taskContext.taskId}`);
 	if (options.waveIdentity && !options.gateEvidence) throw new Error("wave verification requires the gate receipt binding — pass receipts bind to the checked tree and gate");
 	const controlRoot = executionContext?.controlPaths.root ?? kit.loop.paths.root;
@@ -143,8 +158,8 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 	const policy: VerifierPolicy = skepticSecondPass ? "always" : "never";
 
 	// The checked tree both passes receive independently: the frozen candidate on
-	// prepared contexts, the gate receipt's tree on the wave loop, and a fresh
-	// capture for the one-off diagnostic verify (trusted pre-cutover behavior).
+	// task execution/read contexts, the gate receipt's tree on wave callers, or an
+	// explicit capture only for legacy direct unit callers.
 	const checkedTree = taskContext
 		? taskContext.candidateOid
 		: options.gateEvidence?.tree ?? (await captureBaselineTree(controlRoot));
@@ -182,28 +197,24 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 
 	const kitConv = new ConversationKit(kit, kit.loop.toolBox);
 	const role = kit.loop.config.roles.verifier;
-	const conv = await kitConv.createUnit({
-		instructions: VERIFY_ROLE_BRIEF,
-		guard: { role: "verifier", targetPaths: [] },
-		tools: "read",
-		model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
-		maxTurns: kit.loop.config.engine.maxTurns,
-		executionContext,
-	});
-	const outcome = await kitConv.submitAndAwait(conv, `verify-${task.id}-${Date.now()}`, content);
 	const refuse = (reason: string): VerifyResult => ({
 		verdict: "needs_human",
 		criteria: [],
 		notes: `approval refused: ${reason}`.slice(0, 300),
 	});
-	const primaryRaw = parseVerdictStrict(outcome.answer ?? "");
-	// Symmetric enforcement (M0-P11): the primary approval must prove every criterion too.
-	const primary = await enforceCriterionEvidence(primaryRaw, task.acceptance, evidenceContext, refuse);
-	let parsed = primary;
-	let skepticResult: VerifyResult | undefined;
-	// Each pass is persisted BEFORE the next pass is dispatched (M0-P11): the
-	// pass receipt + its verdict row commit in one state commit.
-	const persistPass = async (pass: "primary" | "skeptic", result: VerifyResult, usage: { usd: number; totalTokens: number }, conversationId: number, buffered: WaveRow[]): Promise<void> => {
+	const reviewResult = (review: ReviewPass): VerifyResult => ({
+		verdict: review.verdict,
+		criteria: review.criteria.map((criterion) => ({ ...criterion, malformed: false })),
+		notes: review.notes,
+	});
+	const bufferedRows: WaveRow[] = [];
+	const persistPass = async (
+		pass: VerifyPassName,
+		result: VerifyResult,
+		usage: { usd: number; totalTokens: number },
+		conversationId: number,
+		submissionKey: string,
+	): Promise<void> => {
 		const row: WaveRow = {
 			ts: Date.now(),
 			kind: "verdict",
@@ -215,43 +226,62 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 			modelId: role.modelId,
 			costUsd: usage.usd,
 			tokens: usage.totalTokens,
+			...(options.waveIdentity ? { planRevision: options.waveIdentity.planRevision } : {}),
 		};
 		if (!options.waveIdentity || !options.gateEvidence) {
-			buffered.push(row); // one-off diagnostic verify: rows only, no receipts
+			bufferedRows.push(row); // one-off diagnostic verify: rows only, no receipts
 			return;
 		}
-		const event = passReceiptEvent(
-			{ planRevision: options.waveIdentity.planRevision, taskId: task.id, wave: options.waveIdentity.wave },
-			{
-				tree: checkedTree,
-				gateId: options.gateEvidence.gateId,
-				policy,
-				review: reviewPass(pass, result, conversationId),
-			},
-		);
+		const wave = { planRevision: options.waveIdentity.planRevision, taskId: task.id, wave: options.waveIdentity.wave };
+		const event = passReceiptEvent(wave, {
+			tree: checkedTree,
+			gateId: options.gateEvidence.gateId,
+			policy,
+			review: reviewPass(pass, result, conversationId),
+		});
 		row.receipt = event.opId;
-		await commitState(kit, { receipts: [event], rows: [row] });
+		const checkpoint = options.checkpointForPass?.(pass, conversationId, submissionKey, result);
+		await commitState(kit, {
+			receipts: [event],
+			rows: [row],
+			...(checkpoint ? { checkpoints: [checkpoint] } : {}),
+		});
 	};
-	const bufferedRows: WaveRow[] = [];
-	await persistPass("primary", primary, outcome.usage, idOfConversation(conv), bufferedRows);
-
-	// Default-on defense in depth: approval requires a second, fresh read-only
-	// conversation — and it is only dispatched after a CONCLUSIVE, evidence-valid
-	// primary approval (never after an invalid or nonapproving primary). Its own
-	// verdict and usage stay visible in the wave log.
-	if (skepticSecondPass && primary.verdict === "approve") {
-		const convTwo = await kitConv.createUnit({
-			instructions: SKEPTIC_ROLE_BRIEF,
+	const passPrompt = (pass: VerifyPassName) => pass === "primary" ? VERIFY_ROLE_BRIEF : SKEPTIC_ROLE_BRIEF;
+	const runPass = async (pass: VerifyPassName): Promise<VerifyResult> => {
+		const recovery = options.submissionRecovery?.[pass];
+		const submissionKey = recovery?.submissionKey ?? options.submissionKeys?.[pass] ?? `verify-${task.id}-${pass}-${Date.now()}`;
+		let conv = recovery ? await kitConv.find(recovery.conversationId) : undefined;
+		if (recovery && !conv) throw new Error(`checkpointed ${pass} verifier conversation ${recovery.conversationId} is unavailable; refusing a new submission`);
+		conv ??= await kitConv.createUnit({
+			instructions: passPrompt(pass),
 			guard: { role: "verifier", targetPaths: [] },
 			tools: "read",
 			model: { provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel },
 			maxTurns: kit.loop.config.engine.maxTurns,
 			executionContext,
 		});
-		const outcomeTwo = await kitConv.submitAndAwait(convTwo, `verify-${task.id}-skeptic-${Date.now()}`, content);
-		const rawTwo = parseVerdictStrict(outcomeTwo.answer ?? "");
-		skepticResult = await enforceCriterionEvidence(rawTwo, task.acceptance, evidenceContext, refuse);
-		await persistPass("skeptic", skepticResult, outcomeTwo.usage, idOfConversation(convTwo), bufferedRows);
+		const conversationId = idOfConversation(conv);
+		if (!recovery) await options.onSubmissionPrepared?.(pass, conversationId, submissionKey);
+		const outcome = await kitConv.submitAndAwait(conv, submissionKey, content);
+		const raw = parseVerdictStrict(outcome.answer ?? "");
+		const result = await enforceCriterionEvidence(raw, task.acceptance, evidenceContext, refuse);
+		await persistPass(pass, result, outcome.usage, conversationId, submissionKey);
+		await options.afterPassCommitted?.(pass);
+		return result;
+	};
+	const primary = options.existingPasses?.primary
+		? reviewResult(options.existingPasses.primary)
+		: await runPass("primary");
+	let parsed = primary;
+	let skepticResult: VerifyResult | undefined;
+	// A fresh skeptic only follows a conclusive approving primary. Existing
+	// receipts are reused; a checkpointed submission is reacquired by its exact
+	// conversation/request identity rather than dispatched a second time.
+	if (skepticSecondPass && primary.verdict === "approve") {
+		skepticResult = options.existingPasses?.skeptic
+			? reviewResult(options.existingPasses.skeptic)
+			: await runPass("skeptic");
 		if (skepticResult.verdict !== "approve") parsed = { ...skepticResult, notes: `skeptic pass: ${skepticResult.notes}`.slice(0, 300) };
 	}
 
@@ -277,8 +307,9 @@ async function runShadowAssessment(
 ): Promise<void> {
 	let patch = { text: "", truncated: false, available: false };
 	try {
-		const display = diff.display ?? (executionContext?.kind === "task-execution"
-			? await diffDisplayTrees(executionContext.controlPaths.root, executionContext.startOid, executionContext.candidateOid)
+		const frozenContext = executionContext?.kind === "task-execution" || executionContext?.kind === "task-read" ? executionContext : undefined;
+		const display = diff.display ?? (frozenContext
+			? await diffDisplayTrees(frozenContext.controlPaths.root, frozenContext.startOid, frozenContext.candidateOid)
 			: await computeDisplayPatch(executionContext?.controlPaths.root ?? kit.loop.paths.root, task.baselineTreeSha));
 		patch = { text: display.text, truncated: display.truncated, available: display.ok };
 	} catch {

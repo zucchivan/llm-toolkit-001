@@ -18,7 +18,7 @@
  *     demo setup (installDemoGates) does.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec } from "../src/util/exec.ts";
@@ -140,8 +140,8 @@ describe("the full shipped replay satisfies the §0 outcome contract", () => {
 	it("smoke.replay through the REAL CLI: gate-proven wave-1 failure, wave-2 repair, STATUS: COMPLETE, `node bin/render.js /a/-b` → `a b`", async () => {
 		const root = await bakeDemo();
 		await writeConfig(root, demoConfigToml());
-		await gitInit(root); // source fixture files committed before planning
 		await initProject(root);
+		await gitInit(root); // source and reviewed fixture controls committed before planning
 
 		const replay = join(DEMO_ROOT_FIXTURE, "smoke.replay");
 		const plan = await runCli(root, ["plan"], replay);
@@ -153,10 +153,20 @@ describe("the full shipped replay satisfies the §0 outcome contract", () => {
 		expect(run.code).toBe(0);
 		expect(run.stdout).toContain("STATUS: COMPLETE");
 
-		// The §0 invocation, executed independently against the completed result.
-		const render = await exec(["node", "bin/render.js", "/a/-b"], { cwd: root, timeoutMs: 15_000 });
-		expect(render.code).toBe(0);
-		expect(render.stdout).toBe("a b\n");
+		// The §0 invocation is independent and runs from the accepted ref, not
+		// the unchanged operator checkout.
+		const resultParent = await mkdtemp(join(tmpdir(), "kit-demo-accepted-"));
+		const resultRoot = join(resultParent, "accepted");
+		try {
+			const addResult = await exec(["git", "worktree", "add", "--detach", resultRoot, `refs/kit/${revision}/accepted`], { cwd: root, timeoutMs: 15_000 });
+			expect(addResult.code).toBe(0);
+			const render = await exec(["node", "bin/render.js", "/a/-b"], { cwd: resultRoot, timeoutMs: 15_000 });
+			expect(render.code).toBe(0);
+			expect(render.stdout).toBe("a b\n");
+		} finally {
+			await exec(["git", "worktree", "remove", "--force", resultRoot], { cwd: root, timeoutMs: 15_000 });
+			await rm(resultParent, { recursive: true, force: true });
+		}
 
 		// The retry is proven by behavior: wave 1 of list-query failed an
 		// EXECUTED gate naming the case-insensitivity requirement, and wave 2
@@ -173,14 +183,14 @@ describe("the full shipped replay satisfies the §0 outcome contract", () => {
 		expect(done?.["wave"]).toBe(2);
 
 		// The failed wave's gate log carries the executed reason.
-		const queryLogName = (await readdir(join(root, ".orch", "artifacts"))).find((f) => f.startsWith("gate-list-query-"))!;
+		const queryLogName = (await readdir(join(root, ".orch", "artifacts"))).find((f) => f.startsWith(`gate-${revision}-list-query-w1-`))!;
 		const queryLog = await readFile(join(root, ".orch", "artifacts", queryLogName), "utf8");
 		expect(queryLog).toContain("gate-query — FAIL");
 		expect(queryLog).toContain("must match case-insensitively");
 
 		// Future CLI checks did not fail while their task was still pending:
 		// wave 1 of list-parse only touched src/, so gate-query/gate-cli SKIPPED.
-		const parseLogName = (await readdir(join(root, ".orch", "artifacts"))).find((f) => f.startsWith("gate-list-parse-"))!;
+		const parseLogName = (await readdir(join(root, ".orch", "artifacts"))).find((f) => f.startsWith(`gate-${revision}-list-parse-w1-`))!;
 		const parseLog = await readFile(join(root, ".orch", "artifacts", parseLogName), "utf8");
 		expect(parseLog).toContain("gate-list — PASS");
 		expect(parseLog).toContain("gate-query (skipped: on src/query.ts,bin/)");

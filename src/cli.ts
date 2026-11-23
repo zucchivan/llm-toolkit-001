@@ -4,7 +4,7 @@
  * Commands: init · gates · plan · run · status · verify · export · handoff.
  * Arg parsing: node:util parseArgs (strict) — no heavy framework.
  * Process exit codes (run): 0 fulfilled (whole plan or granted subset) ·
- * 2 policy stop (quarantine/budget) · 42 sleeping until provider reset ·
+ * 2 policy stop (quarantine/budget/recovery-required) · 42 sleeping until provider reset ·
  * 1 error (incl. lock busy / invalid grant) · 130 SIGINT.
  */
 import { parseArgs } from "node:util";
@@ -19,6 +19,13 @@ import { KIT_VERSION, ConfigError, loadConfig } from "./config.ts";
 import { openProjectHarness, projectPaths, flushStated, LockBusyError, StoreAbsentError } from "./engine/harness.ts";
 import { readout, INSPECT_SECTIONS } from "./engine/inspector.ts";
 import { readSessionState } from "./engine/state.ts";
+import { ReceiptsDoc } from "./engine/receipts.ts";
+import { BACKGROUND_CONTEXT } from "./engine/kit.ts";
+import { createTaskControls } from "./engine/controls.ts";
+import { createTaskReadContext, discard as discardWorkspace, materializeRead } from "./engine/workspace.ts";
+import type { ReadWorkspace } from "./engine/workspace.ts";
+import { recipeBundleFromTree } from "./engine/gates.ts";
+import { resolveTree } from "./util/git-objects.ts";
 import { loadPrd, runPlan, PlanParseError } from "./engine/planner.ts";
 import { runWaves } from "./engine/waves.ts";
 import type { ProgressEvent } from "./engine/driver-events.ts";
@@ -214,13 +221,19 @@ async function cmdRun(argv: string[]): Promise<void> {
 		await kit.loop.close();
 		kit.lock.release();
 		const paperTrail = " Paper trail: router.md · .orch/wave-log.jsonl";
+		const revision = summary.grant.planRevision;
+		const resultLocation = kit.loop.config.delivery.mode === "none"
+			? ` Result checkout (operator worktree unchanged): git worktree add --detach /path/to/result refs/kit/${revision}/accepted.`
+			: kit.loop.config.delivery.mode === "commit"
+				? ` Local result branch (not checked out): refs/heads/kit/${revision}/result.`
+				: " PR heads and stack bases are recorded in publication receipts; PRs are not merged.";
 		if (summary.exit === "sleeping") {
 			we.log(`\n${c.yellow}⏾ sleeping${RESET} until the provider reset — rerun ${c.cyan}${CLI_NAME} run${RESET} to resume`);
 			process.exitCode = 42;
 			return;
 		}
 		if (summary.exit === "plan-complete") {
-			we.log(`\n${c.green}STATUS: COMPLETE${RESET} — every task in the plan is done; whole plan fulfilled.${paperTrail}`);
+			we.log(`\n${c.green}STATUS: COMPLETE${RESET} — every task in the plan is done; whole plan fulfilled.${resultLocation}${paperTrail}`);
 			process.exitCode = 0;
 			return;
 		}
@@ -228,7 +241,7 @@ async function cmdRun(argv: string[]): Promise<void> {
 			we.log(
 				`\n${c.green}selection complete${RESET} — the granted task(s) are fulfilled (${summary.grant.selected.join(", ")}); ` +
 					`${summary.remainingPlanIds.length} plan task(s) remain outside the grant: ${summary.remainingPlanIds.join(", ") || "(none)"}. ` +
-					`Approve a wider set to continue (${c.cyan}${CLI_NAME} run --approve --revision <uuid>${RESET}).${paperTrail}`,
+					`Approve a wider set to continue (${c.cyan}${CLI_NAME} run --approve --revision <uuid>${RESET}).${resultLocation}${paperTrail}`,
 			);
 			process.exitCode = 0;
 			return;
@@ -240,6 +253,11 @@ async function cmdRun(argv: string[]): Promise<void> {
 					(summary.blockedIds.length ? `; stopped on: ${summary.blockedIds.join(", ")}` : "") +
 					`.${paperTrail}`,
 			);
+			process.exitCode = 2;
+			return;
+		}
+		if (summary.exit === "recovery-required") {
+			we.log(`\n${c.yellow}recovery required${RESET} — unresolved candidate effect for: ${summary.blockedIds.join(", ") || "(unknown task)"}; inspect receipts before retrying.${paperTrail}`);
 			process.exitCode = 2;
 			return;
 		}
@@ -278,6 +296,9 @@ function printProgress(event: ProgressEvent): void {
 			break;
 		case "blocked":
 			we.log(`${c.red}║ ${event.message}${RESET}`);
+			break;
+		case "recovery-required":
+			we.log(`${c.yellow}⚠ ${event.message}${RESET}`);
 			break;
 		case "quarantine-stop":
 			we.log(`${c.yellow}◇ ${event.message}${RESET}`);
@@ -443,36 +464,52 @@ async function cmdVerify(argv: string[]): Promise<void> {
 		return;
 	}
 	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
+	let frozenView: ReadWorkspace | undefined;
 	try {
 		const root = resolve(procCwd());
 		kit = await openProjectHarness(root, "verify");
 		const state = await readSessionState(kit.loop.harness);
 		const task = state.router.tasks.find((t) => t.id === taskId);
-		if (!task) {
-			we.error(`task "${taskId}" is not in the router doc — see router.md`);
-			process.exitCode = 1;
-			return;
+		if (!task) throw new Error(`task "${taskId}" is not in the router doc — see router.md`);
+		const revision = state.router.identity?.planRevision;
+		if (!revision) throw new Error(`task "${taskId}" has no reviewed plan revision; replan before verification`);
+		const receipts = await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
+		const checkpoint = receipts?.events.filter((event) => event.kind === "checkpoint"
+			&& event.value.planRevision === revision && event.value.taskId === taskId
+			&& event.value.candidate !== undefined).at(-1);
+		if (!checkpoint || checkpoint.kind !== "checkpoint" || !checkpoint.value.candidate) {
+			throw new Error(`task "${taskId}" has no retained frozen candidate checkpoint for revision ${revision}; verify does not read the operator checkout`);
 		}
-		if (!task.baselineTreeSha) {
-			we.error(`task "${taskId}" has no baseline tree (it never ran a wave); the verifier compares against the tree captured before its first wave`);
-			process.exitCode = 1;
-			return;
-		}
+		const startTree = await resolveTree(root, checkpoint.value.startTree);
+		const candidateTree = await resolveTree(root, checkpoint.value.candidate);
+		const controls = createTaskControls({ root, targetPaths: task.targetPaths });
+		frozenView = await materializeRead({ root, oid: candidateTree }, controls);
+		const executionContext = await createTaskReadContext({
+			controlPaths: kit.loop.paths,
+			taskId,
+			startOid: startTree,
+			candidateOid: candidateTree,
+			frozenReadView: frozenView,
+			recipeBundle: await recipeBundleFromTree(root, startTree),
+		});
 		const result = await runVerify(kit, {
 			id: task.id,
 			title: task.title,
 			spec: task.spec,
 			acceptance: task.acceptance,
-			baselineTreeSha: task.baselineTreeSha,
+			baselineTreeSha: startTree,
 			targetPaths: task.targetPaths,
-		}, "(one-off verify: no gate summary available)");
+		}, "(one-off verify: no gate summary available)", { executionContext });
 		we.log(JSON.stringify(result, null, 2));
 		if (result.verdict !== "approve") process.exitCode = 1;
-		await kit.loop.close();
-		kit.lock.release();
 	} catch (err) {
-		kit?.lock.release();
 		fail(err, "verify");
+	} finally {
+		if (frozenView) await discardWorkspace(frozenView).catch(() => {});
+		if (kit) {
+			await kit.loop.close().catch(() => {});
+			kit.lock.release();
+		}
 	}
 }
 

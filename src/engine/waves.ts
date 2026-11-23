@@ -1,39 +1,50 @@
 /**
- * Wave driver (§4.2): the sequential loop that turns a planned RouterDoc into
- * merged code. Per task: baseline tree capture → waves (implementer run →
- * gates → verifier) → done or quarantine (rollback to baseline) → delivery.
- * Resumable at every boundary via RouterDoc commits; permission gated by the
- * human approval stamp; rate-limited runs arm the governor's durable sleep and
- * exit 42 for the next `run` to pick up.
+ * Serial wave driver (§4.2): selection remains grant/dependency driven while
+ * each implementation runs in an owned private lease and settles on one frozen
+ * candidate. Receipts and stage checkpoints gate acceptance, integration,
+ * workspace recovery, and publication; the operator checkout is never a wave
+ * input or restore target.
  */
 import { mkdir, readFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { atomicWriteJson, readJson } from "../util/fsx.ts";
-import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
+import { join } from "node:path";
+import { atomicWrite, atomicWriteJson, readJson } from "../util/fsx.ts";
+import { BACKGROUND_CONTEXT } from "./kit.ts";
+import type { Conversation } from "./kit.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock } from "./harness.ts";
 import {
 	commitState, readSessionState, grantRefusal, readGrant, approvalMirrorRefusal, resolveGrantSelection,
 } from "./state.ts";
 import type { Grant, SessionState } from "./state.ts";
-import type { RouterTask, RouterDocValue, WaveRow, TaskFeedback } from "./infos.ts";
-import { runGates } from "./gates.ts";
+import type { RouterTask, RunStatusDocValue, WaveRow, TaskFeedback } from "./infos.ts";
+import { recipeBundleFromTree, runGates } from "./gates.ts";
+import type { GateOutcome, GateResult } from "./gates.ts";
 import { renderRouterMd } from "./infos.ts";
-import type { GateOutcome } from "./gates.ts";
 import { runVerify, gateSummaryText } from "./verifier.ts";
 import type { VerifyResult } from "./verifier.ts";
-import { gateCheckFromResult, gateReceiptEvent, passReceiptEvent } from "./receipts.ts";
-import type { GateCheck } from "./receipts.ts";
+import { gateCheckFromResult, gateReceiptEvent, latestCheckpoint, latestCheckpointForWave, receiptStatesForWave, ReceiptsDoc } from "./receipts.ts";
+import type { Checkpoint, CheckpointStage, GateCheck, GateReceipt, ReceiptEvent, ReceiptsDocValue, WaveKey } from "./receipts.ts";
 import {
 	assessFailureTriage, persistFailureTriageAssessment, type FailureTriageEvidence,
 } from "./failure-triage.ts";
 import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, waitOutSleep } from "./governor.ts";
-import { captureBaselineTree, restoreTree, saveDisplayPatch, changedFilesVsTree } from "../util/git.ts";
-import type { DisplayDiffStats } from "../util/git.ts";
-import { runDelivery } from "./delivery.ts";
+import { diffDisplayTrees } from "../util/git.ts";
+import { readCommit, readRef, resolveTree } from "../util/git-objects.ts";
+import { hostExecArgv } from "./recipe-runner.ts";
+import { createTaskControls } from "./controls.ts";
+import {
+	acceptCandidate, discardCandidateWorkspace, integrateAcceptedCandidate, preflightPullRequest,
+	publishLocalResult, publishPullRequest, RecoveryRequiredError,
+} from "./delivery.ts";
+import type { PrPublicationOptions } from "./delivery.ts";
 import type { ProgressEvent } from "./driver-events.ts";
 import type { JudgmentClient } from "../judgment/types.ts";
-import { trustedCompatibilityContext } from "./workspace.ts";
+import {
+	createTaskExecutionContext, discard as discardWorkspace, fenceWorkspace, freeze, materializeRead, openTask,
+	resumeTask, diffTaskTrees,
+} from "./workspace.ts";
+import type { FencedWorkspace, ReadWorkspace, TaskExecutionContext, TaskWorkspaceLease } from "./workspace.ts";
+import type { FrozenCheckpointView } from "./receipts.ts";
 
 export class DriverStateError extends Error {}
 
@@ -107,6 +118,12 @@ export function selectionFacts(tasks: readonly RouterTask[], selected: readonly 
 // Driver
 // ---------------------------------------------------------------------------
 
+export type DriverFaultPoint =
+	| "after-implementer-submit" | "after-freeze" | "after-gates"
+	| "after-primary" | "after-skeptic" | "after-review-before-delivery"
+	| "after-acceptance" | "after-integration" | "before-publication" | "after-publication"
+	| "after-workspace-discard";
+
 export interface RunOptions {
 	/** A NEW grant (the review point): approve exactly this plan revision —
 	 *  the CLI's `run --approve --revision <uuid>`. Validation (revision,
@@ -121,16 +138,19 @@ export interface RunOptions {
 	deliverExplicit?: boolean;
 	/** Optional Jev injection for tests/embedders; disabled unless explicitly configured. */
 	judgmentClient?: JudgmentClient;
+	/** Narrow fake transport/host seams for offline PR-publication tests. */
+	prPublication?: Omit<PrPublicationOptions, "deliverExplicit">;
+	/** Deterministic crash injection for interrupted-stage tests only. */
+	driverFaultInjector?: (point: DriverFaultPoint) => void | Promise<void>;
 }
 
 /**
  * §3 transition-5 exits: `plan-complete`/`selection-complete` are the two
- * distinct fulfillment strings (both exit 0); `blocked` (quarantine or
- * unsatisfiable selection), `budget` are policy stops (exit 2); `sleeping`
- * is the rate-limit wait (exit 42). Hard errors throw (exit 1); SIGINT is
- * the CLI's 130.
+ * distinct fulfillment strings (both exit 0); `blocked`, `recovery-required`,
+ * and `budget` are policy stops (exit 2); `sleeping` is the rate-limit wait
+ * (exit 42). Hard errors throw (exit 1); SIGINT is the CLI's 130.
  */
-export type DriverExit = "plan-complete" | "selection-complete" | "blocked" | "budget" | "sleeping";
+export type DriverExit = "plan-complete" | "selection-complete" | "blocked" | "recovery-required" | "budget" | "sleeping";
 
 export interface RunSummaryInfo {
 	exit: DriverExit;
@@ -145,23 +165,27 @@ export interface RunSummaryInfo {
 	remainingPlanIds: string[];
 	/** Granted task ids that ended quarantined at the stop. */
 	quarantined: string[];
-	/** Granted task ids the run stopped on (quarantined, or outstanding and
-	 *  blocked by quarantined dependencies). */
+	/** Granted task ids the run stopped on (quarantined, dependency-blocked,
+	 *  or awaiting reconciliation). */
 	blockedIds: string[];
 	alert?: string;
 }
 
-/**
- * M0-P05 anticipation (§3 transition 5): a new grant must not be minted
- * while a different active checkpoint is unresolved (recovery blocks the
- * queue, and a disjoint grant is possible only after pending effects are
- * reconciled). No checkpoint records exist in this milestone's state model
- * yet (they arrive with the wave-keyed checkpoint/receipt packets), so this
- * refusal is a documented no-op today; it returns the named conflict once
- * durable checkpoints exist.
- */
-function activeCheckpointConflict(state: SessionState): string | undefined {
-	void state;
+/** A new grant cannot bypass an unresolved P14 stage/effect checkpoint. */
+async function activeCheckpointConflict(kit: LoopAndLock, state: SessionState): Promise<string | undefined> {
+	const revision = state.router.identity?.planRevision;
+	if (!revision) return undefined;
+	const receipts = await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
+	if (!receipts) return undefined;
+	const latestByWave = new Map<string, Checkpoint>();
+	for (const event of receipts.events) {
+		if (event.kind !== "checkpoint" || event.value.planRevision !== revision) continue;
+		latestByWave.set(`${event.value.taskId}/${event.value.wave}`, event.value);
+	}
+	for (const checkpoint of latestByWave.values()) {
+		if (checkpoint.stage === "terminal" && checkpoint.state === "complete") continue;
+		return `task ${checkpoint.taskId} wave ${checkpoint.wave} has an unresolved ${checkpoint.stage} checkpoint (${checkpoint.state}) — resume or reconcile it before changing the grant`;
+	}
 	return undefined;
 }
 
@@ -186,7 +210,7 @@ export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest): 
 	if (!state.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
 	const refusal = grantRefusal(state, { approve: { planRevision: request.planRevision, tasks: request.tasks } });
 	if (refusal) throw new DriverStateError(refusal);
-	const checkpointConflict = activeCheckpointConflict(state);
+	const checkpointConflict = await activeCheckpointConflict(kit, state);
 	if (checkpointConflict) throw new DriverStateError(checkpointConflict);
 	// The grant binds the human to what they reviewed: the mirror must exist
 	// and match the canonical durable render (edited/missing → replan).
@@ -236,6 +260,18 @@ export async function runWaves(
 	// wait, budget read or wave: no tool/model dispatch happens on an
 	// unvalidated grant, and a refusal never mutates state.
 	if (!initial.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
+	// PR consent and destination authority are preflighted before approving a grant
+	// or dispatching a model; delivery cannot become a surprise after review.
+	if (kit.loop.config.delivery.mode === "pr" && initial.router.tasks.some((task) => task.status === "todo" || task.status === "in_progress")) {
+		try {
+			await preflightPullRequest(kit, {
+				deliverExplicit: options.deliverExplicit === true,
+				...(options.prPublication?.profilePath ? { profilePath: options.prPublication.profilePath } : {}),
+			});
+		} catch (error) {
+			throw new DriverStateError((error as Error).message);
+		}
+	}
 	// An empty tasksFilter means "no explicit set" (never an empty grant).
 	const explicitTasks = options.tasksFilter?.length ? options.tasksFilter : undefined;
 	let grant: Grant;
@@ -351,13 +387,31 @@ export async function runWaves(
 		}
 
 		// ---- Per-task wave loop
-		const outcome = await driveTaskWaves(kit, task, {
-			handoffNote: handoff?.note,
-			onEvent: emit,
-			deliverExplicit: options.deliverExplicit,
-			judgmentClient: options.judgmentClient,
-			planRevision: grant.planRevision,
-		});
+		let outcome: DriverExit | "done" | "quarantined" | "recovery-required";
+		try {
+			outcome = await driveTaskWaves(kit, task, {
+				handoffNote: handoff?.note,
+				onEvent: emit,
+				deliverExplicit: options.deliverExplicit,
+				judgmentClient: options.judgmentClient,
+				grant,
+				prPublication: options.prPublication,
+				driverFaultInjector: options.driverFaultInjector,
+			});
+		} catch (error) {
+			if (!(error instanceof RecoveryRequiredError)) throw error;
+			if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] recovery required: ${(error as Error).message}`);
+			const latest = await readSessionState(kit.loop.harness);
+			const stopped = selectionFacts(latest.router.tasks, grant.selected);
+			summary.remainingPlanIds = stopped.remainingPlanIds;
+			summary.quarantined = stopped.quarantined;
+			summary.exit = "recovery-required";
+			summary.blockedIds = [task.id];
+			const message = `recovery required for ${task.id}: ${error.message}`;
+			await commitState(kit, { statusPhase: { phase: "idle", message } });
+			emit({ kind: "recovery-required", taskId: task.id, message });
+			break;
+		}
 		if (outcome === "sleeping") {
 			summary.exit = "sleeping";
 			break;
@@ -379,7 +433,8 @@ export async function runWaves(
 			await commitState(kit, { statusPhase: stopShortStatus(stopFacts), rows: [stoppedRow(`selection stopped on quarantined: ${stopFacts.quarantined.join(", ")}`)] });
 			break;
 		}
-		summary.ranWaves.push(task.waveCount);
+		const settledTask = (await readSessionState(kit.loop.harness)).router.tasks.find((entry) => entry.id === task.id);
+		summary.ranWaves.push(settledTask?.waveCount ?? task.waveCount);
 	}
 	return summary;
 }
@@ -401,13 +456,256 @@ export interface TaskWavesOptions {
 	onEvent?: (e: ProgressEvent) => void;
 	deliverExplicit?: boolean;
 	judgmentClient?: JudgmentClient;
-	/** The granted plan revision (M0-P11): wave-keyed gate/pass receipts bind
-	 *  to the authorized revision this run executes. */
-	planRevision: string;
+	grant: Grant;
+	prPublication?: Omit<PrPublicationOptions, "deliverExplicit">;
+	driverFaultInjector?: (point: DriverFaultPoint) => void | Promise<void>;
 }
 
 export interface TaskWavesResult {
-	outcome: "done" | "quarantined" | "sleeping" | "budget";
+	outcome: "done" | "quarantined" | "sleeping" | "budget" | "recovery-required";
+}
+
+function acceptedRef(planRevision: string): string {
+	return `refs/kit/${planRevision}/accepted`;
+}
+
+function latestTaskCheckpoint(doc: ReceiptsDocValue, planRevision: string, taskId: string): Checkpoint | undefined {
+	return doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "checkpoint" }> => event.kind === "checkpoint"
+		&& event.value.planRevision === planRevision && event.value.taskId === taskId)
+		.at(-1)?.value;
+}
+
+function gateReceiptForWave(doc: ReceiptsDocValue, wave: WaveKey): Extract<ReceiptEvent, { kind: "gate" }> | undefined {
+	return doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "gate" }> =>
+		event.kind === "gate" && event.value.planRevision === wave.planRevision
+			&& event.value.taskId === wave.taskId && event.value.wave === wave.wave,
+	).at(-1);
+}
+
+function passReceiptForWave(
+	doc: ReceiptsDocValue,
+	wave: WaveKey,
+	pass: "primary" | "skeptic",
+	tree: string,
+	gateId: string,
+): Extract<ReceiptEvent, { kind: "pass" }> | undefined {
+	return doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "pass" }> =>
+		event.kind === "pass" && event.value.planRevision === wave.planRevision
+			&& event.value.taskId === wave.taskId && event.value.wave === wave.wave
+			&& event.value.tree === tree && event.value.gateId === gateId && event.value.review.pass === pass,
+	).at(-1);
+}
+
+function checkpointValue(
+	wave: WaveKey,
+	stage: CheckpointStage,
+	state: Checkpoint["state"],
+	input: {
+		parent: string;
+		startTree: string;
+		candidate?: string;
+		conversationId?: number;
+		submissionKey?: string;
+		leaseId?: string;
+		grantedFeedbackIds: string[];
+		outcome?: Checkpoint["outcome"];
+		code?: string;
+	},
+): Checkpoint {
+	return {
+		...wave,
+		stage,
+		state,
+		parent: input.parent,
+		startTree: input.startTree,
+		grantedFeedbackIds: [...input.grantedFeedbackIds],
+		...(input.candidate !== undefined ? { candidate: input.candidate } : {}),
+		...(input.conversationId !== undefined ? { conversationId: input.conversationId } : {}),
+		...(input.submissionKey !== undefined ? { submissionKey: input.submissionKey } : {}),
+		...(input.leaseId !== undefined ? { leaseId: input.leaseId } : {}),
+		...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
+		...(input.code !== undefined ? { code: input.code } : {}),
+	};
+}
+
+function submissionKey(wave: WaveKey, stage: "implement" | "primary" | "skeptic"): string {
+	return `kit:${wave.planRevision}:${wave.taskId}:w${wave.wave}:${stage}`;
+}
+
+function checkpointView(wave: number, startTree: string, candidate: string): FrozenCheckpointView {
+	return { wave, baseTree: startTree, candidateTree: candidate, asOf: Date.now() };
+}
+
+function receiptSnapshot(kit: LoopAndLock): Promise<ReceiptsDocValue> {
+	return kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT).then((doc) => doc ?? { version: 1, events: [] });
+}
+
+function gateOutcomeFromReceipt(receipt: GateReceipt): GateOutcome {
+	const results: GateResult[] = receipt.checks.map((check) => ({
+		name: check.id,
+		...(check.outcome === "skip" ? { skipped: "recorded skip" } : {}),
+		passed: check.outcome === "pass" || check.outcome === "skip",
+		exit: check.exit,
+		tail: "",
+		matched: check.outcome === "pass" || check.outcome === "skip",
+		durationMs: check.ms,
+		...(check.outcome === "error" ? { reason: "[error] gate outcome was recorded before interruption" } : {}),
+	}));
+	const failed = receipt.checks.filter((check) => check.outcome === "fail" || check.outcome === "error");
+	const scope = receipt.checks.find((check) => check.kind === "scope");
+	return {
+		allPassed: failed.length === 0,
+		scopeOK: scope?.outcome === "pass",
+		scopeBody: "",
+		results,
+		feedbackText: failed.length ? `GATES FAILED: ${failed.map((check) => check.id).join(", ")}\nFix the named failure; stay within the task's targetPaths.` : "",
+		failHash: receipt.failureHash,
+		logFile: "",
+	};
+}
+
+async function driverFault(options: TaskWavesOptions, point: DriverFaultPoint): Promise<void> {
+	await options.driverFaultInjector?.(point);
+}
+
+function feedbackIdentity(task: RouterTask): string[] {
+	return task.feedback.map((feedback) => `${feedback.wave}:${feedback.from}:${feedback.ts}`);
+}
+
+async function writeCandidateArtifacts(
+	kit: LoopAndLock,
+	wave: WaveKey,
+	startTree: string,
+	candidateTree: string,
+): Promise<void> {
+	const prefix = `candidate-${wave.planRevision}-${wave.taskId}-w${wave.wave}`;
+	try {
+		const display = await diffDisplayTrees(kit.loop.paths.root, startTree, candidateTree);
+		if (!display.ok || display.stats.files.length === 0) return;
+		await mkdir(kit.loop.paths.artifacts, { recursive: true });
+		await atomicWrite(join(kit.loop.paths.artifacts, `${prefix}.patch`), display.text);
+		await atomicWriteJson(join(kit.loop.paths.artifacts, `${prefix}.json`), {
+			task: wave.taskId,
+			planRevision: wave.planRevision,
+			wave: wave.wave,
+			baselineTreeSha: startTree,
+			candidateTreeSha: candidateTree,
+			generatedAt: Date.now(),
+			files: display.stats.files,
+			totalInsertions: display.stats.totalInsertions,
+			totalDeletions: display.stats.totalDeletions,
+			bytes: display.bytes,
+			truncated: display.truncated,
+		});
+	} catch {
+		/* Display evidence is best-effort; the frozen tree and receipts are authoritative. */
+	}
+}
+
+async function finishFailedCandidate(input: {
+	kit: LoopAndLock;
+	task: RouterTask;
+	wave: WaveKey;
+	parent: string;
+	startTree: string;
+	candidate: string;
+	fencedWorkspace: FencedWorkspace;
+	feedbackIds: string[];
+	outcome: "retry" | "quarantined";
+	cause: string;
+	feedback?: TaskFeedback;
+	rows?: WaveRow[];
+	opts: TaskWavesOptions;
+}): Promise<"retry" | "quarantined"> {
+	const { kit, task, wave, parent, startTree, candidate, fencedWorkspace, feedbackIds, outcome, cause, opts } = input;
+	const checkpoint = await latestCheckpointForWave(await receiptSnapshot(kit), wave);
+	if (checkpoint?.value.stage !== "rollback" || checkpoint.value.state !== "pending" || checkpoint.value.outcome !== outcome) {
+		await commitState(kit, {
+			checkpoints: [checkpointValue(wave, "rollback", "pending", {
+				parent, startTree, candidate, leaseId: fencedWorkspace.lease.id,
+				grantedFeedbackIds: feedbackIds, outcome,
+			})],
+		});
+	}
+	try {
+		const acceptedHead = await readRef(kit.loop.paths.root, acceptedRef(wave.planRevision));
+		if (acceptedHead !== undefined && acceptedHead !== parent) {
+			throw new RecoveryRequiredError(`rollback integration head moved from ${parent} to ${acceptedHead}`);
+		}
+		await discardCandidateWorkspace(kit, {
+			...wave,
+			fencedWorkspace,
+			baseTree: startTree,
+			producedTree: candidate,
+			expectedIntegrationCommit: acceptedHead ?? null,
+		}, opts.prPublication ?? {});
+	} catch (error) {
+		await commitState(kit, {
+			checkpoints: [checkpointValue(wave, "rollback", "unknown", {
+				parent, startTree, candidate, leaseId: fencedWorkspace.lease.id,
+				grantedFeedbackIds: feedbackIds, outcome, code: "workspace-disposal-uncertain",
+			})],
+			statusPhase: { phase: "idle", message: `recovery required: workspace disposal for ${task.id} wave ${wave.wave}` },
+		});
+		throw error instanceof RecoveryRequiredError
+			? error
+			: new RecoveryRequiredError(`workspace disposal for ${task.id} wave ${wave.wave} is uncertain: ${(error as Error).message}`);
+	}
+	await driverFault(opts, "after-workspace-discard");
+	const receipts = await receiptSnapshot(kit);
+	const receiptStates = receiptStatesForWave(receipts, wave);
+	const at = Date.now();
+	const rows: WaveRow[] = [
+		...(input.rows ?? []),
+		...(outcome === "quarantined" ? [{
+			ts: at,
+			kind: "task" as const,
+			task: task.id,
+			wave: wave.wave,
+			verb: "quarantined",
+			reason: cause,
+			detail: `frozen candidate retained: ${candidate}`,
+			planRevision: wave.planRevision,
+			receiptStates,
+			checkpoint: checkpointView(wave.wave, startTree, candidate),
+		}] : []),
+		waveEndRow(task.id, wave.wave, `${outcome}: ${cause}`, candidate, {
+			planRevision: wave.planRevision,
+			receiptStates,
+			checkpoint: checkpointView(wave.wave, startTree, candidate),
+		}),
+	];
+	await commitState(kit, {
+		router: (draft) => {
+			const current = draft.tasks.find((entry) => entry.id === task.id)!;
+			current.waveCount = Math.max(current.waveCount, wave.wave);
+			current.status = outcome === "retry" ? "todo" : "quarantined";
+			if (input.feedback && !current.feedback.some((entry) => entry.wave === wave.wave && entry.from === input.feedback!.from)) {
+				current.feedback.push(input.feedback);
+			}
+			if (outcome === "quarantined" && !current.feedback.some((entry) => entry.wave === wave.wave && entry.text === `quarantined: ${cause}`)) {
+				current.feedback.push({ wave: wave.wave, from: "gate", text: `quarantined: ${cause}`, ts: at } satisfies TaskFeedback);
+			}
+		},
+		checkpoints: [
+			checkpointValue(wave, "rollback", "complete", {
+				parent, startTree, candidate, leaseId: fencedWorkspace.lease.id,
+				grantedFeedbackIds: feedbackIds, outcome: "discarded",
+			}),
+			checkpointValue(wave, "terminal", "complete", {
+				parent, startTree, candidate, leaseId: fencedWorkspace.lease.id,
+				grantedFeedbackIds: feedbackIds, outcome,
+			}),
+		],
+		rows,
+		statusPhase: { phase: "idle", message: `${task.id} wave ${wave.wave} ${outcome}: ${cause}` },
+	});
+	if (outcome === "quarantined") emitQuarantine(opts, task.id, wave.wave, cause);
+	return outcome;
+}
+
+function emitQuarantine(opts: TaskWavesOptions, taskId: string, wave: number, cause: string): void {
+	opts.onEvent?.({ kind: "task-quarantined", taskId, wave, message: cause });
 }
 
 export async function driveTaskWaves(
@@ -415,267 +713,562 @@ export async function driveTaskWaves(
 	task: RouterTask,
 	opts: TaskWavesOptions,
 ): Promise<DriverExit | "done" | "quarantined"> {
-	const paths = kit.loop.paths;
-	const emit = (e: ProgressEvent) => opts.onEvent?.(e);
+	const root = kit.loop.paths.root;
+	const emit = (event: ProgressEvent) => opts.onEvent?.(event);
 	const convKit = new ConversationKit(kit, kit.loop.toolBox);
-	// Explicit pre-cutover bridge: the serial driver still runs trusted fixtures
-	// against the operator root until P14; prepared task contexts are not active.
-	const executionContext = trustedCompatibilityContext(paths);
 
 	for (;;) {
 		const state = await readSessionState(kit.loop.harness);
-		const current = state.router.tasks.find((t) => t.id === task.id);
+		const current = state.router.tasks.find((entry) => entry.id === task.id);
 		if (!current) throw new DriverStateError(`task ${task.id} vanished from the router doc`);
 		if (current.status === "done") return "done";
 		if (current.status === "quarantined") return "quarantined";
+		const identity = state.router.identity;
+		if (!identity || identity.planRevision !== opts.grant.planRevision) {
+			throw new DriverStateError("task execution requires the current reviewed plan revision");
+		}
+		if (!identity.baseCommit) throw new DriverStateError("task execution requires a reviewed base commit; create the project seed commit and replan first");
 
-		const wave = current.waveCount + 1;
-
-		// Baseline capture before Wave 1 (§4.2.3).
-		let baseline = current.baselineTreeSha;
-		if (!baseline) {
-			baseline = await captureBaselineTree(paths.root);
-			await commitState(kit, {
-				router: (d) => {
-					const t = d.tasks.find((x) => x.id === task.id)!;
-					t.baselineTreeSha = baseline;
-				},
-				rows: [{ ts: Date.now(), kind: "task", task: task.id, verb: "baseline", detail: baseline }],
-			});
+		const receipts = await receiptSnapshot(kit);
+		const previousCheckpoint = latestTaskCheckpoint(receipts, identity.planRevision, current.id);
+		const active = previousCheckpoint && !(previousCheckpoint.stage === "terminal" && previousCheckpoint.state === "complete")
+			? previousCheckpoint
+			: undefined;
+		if (active?.stage === "terminal") throw new RecoveryRequiredError(`task ${task.id} has a nonterminal terminal checkpoint`);
+		if (active?.state === "unknown" && active.stage !== "rollback") {
+			throw new RecoveryRequiredError(`task ${task.id} wave ${active.wave} has an unknown ${active.stage} checkpoint`);
+		}
+		if (current.status === "in_progress" && !active) {
+			throw new RecoveryRequiredError(`task ${task.id} is in progress without a P14 checkpoint; refusing to replay legacy work`);
+		}
+		if (!active && current.waveCount > 0
+			&& !(previousCheckpoint?.stage === "terminal" && previousCheckpoint.outcome === "retry")) {
+			throw new RecoveryRequiredError(`task ${task.id} has legacy wave history without a terminal P14 checkpoint; replan or reconcile it before replay`);
 		}
 
-		emit({ kind: "wave-start", taskId: task.id, wave, message: `wave ${wave} starting for ${task.id}` });
-
-		// Conversation lifecycle (§4.2.4).
-		let conv = current.convId !== undefined ? await convKit.find(current.convId) : undefined;
-		if (!conv) {
-			conv = await openTaskConversation(kit, convKit, current, executionContext);
-			current.convId = conv.id as unknown as number;
-			await commitState(kit, {
-				router: (d) => {
-					const t = d.tasks.find((x) => x.id === task.id)!;
-					t.convId = conv!.id as unknown as number;
-				},
-			});
-		} else if (wave > 1) {
-			// Prior wave failed: reset the context to keep failed debug turns out of the window.
-			await conv.reset(undefined, BACKGROUND_CONTEXT);
+		const wave = active?.wave ?? current.waveCount + 1;
+		const waveKey: WaveKey = { planRevision: identity.planRevision, taskId: current.id, wave };
+		const parent = active?.parent ?? (await readRef(root, acceptedRef(identity.planRevision))) ?? identity.baseCommit;
+		await readCommit(root, parent);
+		let startTree = active?.startTree;
+		if (!startTree) {
+			if (previousCheckpoint?.stage === "terminal" && previousCheckpoint.outcome === "retry" && previousCheckpoint.candidate) {
+				startTree = previousCheckpoint.candidate;
+			} else {
+				startTree = await resolveTree(root, parent);
+			}
 		}
-
-		const promptMd = await readFile(join(paths.root, "PROMPT.md"), "utf8").catch(() => undefined);
-		const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
-		// UI seam A.1, at wave start (before the run is submitted): task → in_progress,
-		// wave-log start row (`ts` IS startedAt), and a wave-running status.json with
-		// task/wave/startedAt so an attached UI shows the live wave without storage.
-		const startedAt = Date.now();
-		// UI seam A.7: the wave's own tree at start — per-wave isolated diffs read
-		// this vs the end row's tree. A failed capture drops the field, never the run.
-		const startTree = await waveTreeSoft(paths.root);
-		await commitState(kit, {
-			router: (d) => {
-				const t = d.tasks.find((x) => x.id === task.id)!;
-				t.status = "in_progress";
-			},
-			rows: [{ ts: startedAt, kind: "wave", task: task.id, wave, verb: "start", ...(startTree ? { treeSha: startTree } : {}) }],
-			statusPhase: { phase: "wave-running", task: task.id, wave, startedAt },
+		startTree = await resolveTree(root, startTree);
+		const baseForTask = current.baselineTreeSha ?? await resolveTree(root, parent);
+		const controls = createTaskControls({ root, targetPaths: current.targetPaths });
+		let lease: TaskWorkspaceLease;
+		try {
+			if (active) {
+				if (!active.leaseId) throw new Error("active checkpoint is missing its owned workspace identity");
+				lease = await resumeTask({ root, oid: startTree }, identity, current.id, active.leaseId, { scopeBaseOid: parent });
+			} else {
+				lease = await openTask({ root, oid: startTree }, identity, current.id, { scopeBaseOid: parent });
+			}
+		} catch (error) {
+			throw new RecoveryRequiredError(`cannot reattach task ${task.id} wave ${wave} workspace: ${(error as Error).message}`);
+		}
+		if (active?.candidate && lease.frozenCandidateTree !== active.candidate) {
+			throw new RecoveryRequiredError(`candidate pin for ${task.id} wave ${wave} does not match its durable checkpoint`);
+		}
+		let candidate = active?.candidate ?? lease.frozenCandidateTree;
+		let fencedWorkspace: FencedWorkspace | undefined = candidate ? fenceWorkspace(lease, controls) : undefined;
+		const feedbackIds = feedbackIdentity(current);
+		const bundle = await recipeBundleFromTree(root, startTree);
+		const stageCheckpoint = (stage: CheckpointStage, checkpointState: Checkpoint["state"], values: {
+			candidate?: string;
+			conversationId?: number;
+			submissionKey?: string;
+			outcome?: Checkpoint["outcome"];
+			code?: string;
+		} = {}) => checkpointValue(waveKey, stage, checkpointState, {
+			parent,
+			startTree,
+			candidate: values.candidate ?? candidate,
+			leaseId: lease.id,
+			conversationId: values.conversationId,
+			submissionKey: values.submissionKey,
+			grantedFeedbackIds: feedbackIds,
+			outcome: values.outcome,
+			code: values.code,
 		});
-		const outcomeWave = await convKit.submitAndAwait(conv, `${task.id}-w${wave}`, waveInput);
 
-		const warnRows: WaveRow[] = [];
-		if (outcomeWave.usage.usd > kit.loop.config.budgets.waveUsdWarn) {
-			warnRows.push({ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "wave-usd-warn", detail: `$${outcomeWave.usage.usd.toFixed(2)} > $${kit.loop.config.budgets.waveUsdWarn}` });
-		}
-		// Budget accumulation per wave.
-		await commitState(kit, {
-			runStatus: (d) => {
-				d.budgetSpentUsd = Math.max(d.budgetSpentUsd, outcomeWave.usage.usd);
-			},
-			rows: warnRows,
-		});
-
-		// Run failure paths (§4.2.5 / §4.5).
-		if (outcomeWave.status === "unanswered") {
-			const reason = outcomeWave.reason ?? "unanswered";
-			const handled = await handleUnanswered(kit, current, wave, reason, outcomeWave.detail, outcomeWave.usage.usd);
-			if (handled === "sleeping") {
-				// UI seam A.1 at wave end: close the wave (sleep is a wave outcome — the
-				// run resumes at a later `run`, never inside this one).
-				await commitState(kit, {
-					rows: [waveEndRow(task.id, wave, "sleeping", await waveTreeSoft(paths.root) /* A.7: what the wave left behind */)],
-					statusPhase: { phase: "idle", message: `${task.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
+		let implementationOutcome: Awaited<ReturnType<ConversationKit["submitAndAwait"]>> | undefined;
+		const resumeImplement = active?.stage === "implement" && active.state === "pending";
+		const startImplement = !active;
+		if (startImplement || resumeImplement) {
+			let conversation: Conversation;
+			let requestId: string;
+			if (resumeImplement) {
+				if (active.conversationId === undefined || !active.submissionKey) {
+					throw new RecoveryRequiredError(`task ${task.id} wave ${wave} implement checkpoint is missing its submission identity`);
+				}
+				const foundConversation = await convKit.find(active.conversationId);
+				if (!foundConversation) throw new RecoveryRequiredError(`task ${task.id} wave ${wave} implementer conversation ${active.conversationId} is unavailable`);
+				conversation = foundConversation;
+				requestId = active.submissionKey;
+			} else {
+				const initialView = await materializeRead({ root, oid: startTree }, controls);
+				const initialContext = await createTaskExecutionContext({
+					controlPaths: kit.loop.paths,
+					grant: { planRevision: opts.grant.planRevision, selectedTaskIds: opts.grant.selected },
+					taskId: current.id,
+					parentOid: parent,
+					startOid: startTree,
+					candidateOid: startTree,
+					writableWorkspace: lease,
+					frozenReadView: initialView,
+					recipeBundle: bundle,
+					execArgv: hostExecArgv,
 				});
-				emit({ kind: "sleeping", taskId: task.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
+				conversation = await openTaskConversation(kit, convKit, current, initialContext);
+				requestId = submissionKey(waveKey, "implement");
+				const startedAt = Date.now();
+				await commitState(kit, {
+					router: (draft) => {
+						const row = draft.tasks.find((entry) => entry.id === current.id)!;
+						row.status = "in_progress";
+						row.convId = conversation.id as unknown as number;
+						if (!row.baselineTreeSha) row.baselineTreeSha = baseForTask;
+					},
+					checkpoints: [stageCheckpoint("implement", "pending", {
+						conversationId: Number(conversation.id), submissionKey: requestId, outcome: "submitted",
+					})],
+					rows: [{
+						ts: startedAt,
+						kind: "wave",
+						task: current.id,
+						wave,
+						verb: "start",
+						treeSha: startTree,
+						planRevision: identity.planRevision,
+				}],
+					statusPhase: { phase: "wave-running", task: current.id, wave, startedAt },
+				});
+				emit({ kind: "wave-start", taskId: current.id, wave, message: `wave ${wave} starting for ${current.id}` });
+				await discardWorkspace(initialView).catch(() => {});
+			}
+			let promptMd = await readFile(join(lease.workspacePath, "PROMPT.md"), "utf8").catch(() => undefined);
+			if (promptMd === undefined && !candidate) {
+				const promptView = await materializeRead({ root, oid: startTree }, controls);
+				promptMd = await readFile(join(promptView.viewPath, "PROMPT.md"), "utf8").catch(() => undefined);
+				await discardWorkspace(promptView).catch(() => {});
+			}
+			const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
+			implementationOutcome = await convKit.submitAndAwait(conversation, requestId, waveInput);
+			await driverFault(opts, "after-implementer-submit");
+			if (implementationOutcome.status === "unanswered"
+				&& (looksLikeRateLimit(implementationOutcome.detail) || looksLikeRateLimit(implementationOutcome.reason))) {
+				const reason = implementationOutcome.reason ?? "rate limit";
+				const delay = parseResetDelay(implementationOutcome.detail) ?? parseResetDelay(reason) ?? 30 * 60;
+				await armRateLimitSleep(kit, {
+					until: Date.now() + delay * 1000,
+					reason: String(implementationOutcome.detail ?? reason).slice(0, 120),
+					taskId: current.id,
+					wave,
+					conversationId: Number(conversation.id),
+				});
+				await commitState(kit, {
+					runStatus: (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); },
+					rows: [
+						{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? reason).slice(0, 200), planRevision: identity.planRevision },
+						waveEndRow(current.id, wave, "sleeping", startTree, { planRevision: identity.planRevision }),
+					],
+					statusPhase: { phase: "idle", message: `${current.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
+				});
+				emit({ kind: "sleeping", taskId: current.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
 				return "sleeping";
 			}
-			if (handled === "budget") return "budget";
-			if (handled === "faulted") {
-				await quarantine(kit, current, wave, `run failed: ${reason}`, baseline);
-				continue;
+		}
+
+		if (!candidate) {
+			if (!fencedWorkspace) fencedWorkspace = fenceWorkspace(lease, controls);
+			try {
+				candidate = (await freeze(fencedWorkspace)).tree;
+			} catch (error) {
+				await commitState(kit, {
+					checkpoints: [stageCheckpoint("implement", "unknown", { code: "candidate-freeze-failed" })],
+					statusPhase: { phase: "idle", message: `recovery required: ${current.id} wave ${wave} candidate could not be frozen` },
+				});
+				throw new RecoveryRequiredError(`candidate freeze for ${current.id} wave ${wave} failed: ${(error as Error).message}`);
 			}
-			continue; // retried wave under the retry limit
 		}
+		if (!candidate) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no frozen candidate`);
+		if (!fencedWorkspace) fencedWorkspace = fenceWorkspace(lease, controls);
+		await writeCandidateArtifacts(kit, waveKey, startTree, candidate);
 
-		// Zero-progress breaker (§4.5): the wave must move the tree. Fires before
-		// gates so a stalled implementer cannot burn verifier budget either.
-		const filesChangedRaw = await changedFilesVsTree(paths.root, baseline);
-		// Engine-owned writes (router.md mirror sync, .orch runtime) are not the
-		// wave's output; the zero-progress breaker and scope verdicts use the rest.
-		const filesChanged = filesChangedRaw.filter((f) => !f.startsWith(".orch") && f !== "router.md" && f !== "PROMPT.md");
-		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] ${task.id} w${wave} changedRaw=${JSON.stringify(filesChangedRaw)} engineFiles=${JSON.stringify(filesChanged)} baseline=${baseline}`);
-		if (filesChanged.length === 0) {
+		const unfinishedImplementation = startImplement || resumeImplement;
+		let implementationFailure: "retry" | "quarantined" | undefined;
+		let runFailureText: string | undefined;
+		let runFailureRows: WaveRow[] = [];
+		let runStatusUpdate: ((draft: RunStatusDocValue) => void) | undefined;
+		if (unfinishedImplementation) {
+			if (!implementationOutcome) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no reconciled implementation result`);
+			if (implementationOutcome.status === "unanswered") {
+				const latestState = await readSessionState(kit.loop.harness);
+				const nextErrors = latestState.runStatus.consecutiveErrors + 1;
+				implementationFailure = nextErrors >= kit.loop.config.budgets.maxConsecutiveErrors ? "quarantined" : "retry";
+				runFailureText = `run failed: ${implementationOutcome.reason ?? "unanswered"}`;
+				runStatusUpdate = (draft) => {
+					draft.consecutiveErrors = nextErrors;
+					draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd);
+					if (implementationFailure === "quarantined") draft.activeAlert = `${kit.loop.config.budgets.maxConsecutiveErrors} consecutive run failures — quarantining ${current.id}`;
+				};
+				runFailureRows = [{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: `run-failed:${implementationOutcome.reason ?? "unanswered"}`, detail: String(implementationOutcome.detail ?? "").slice(0, 200), planRevision: identity.planRevision }];
+			} else {
+				runStatusUpdate = (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); };
+				if (implementationOutcome.usage.usd > kit.loop.config.budgets.waveUsdWarn) {
+					runFailureRows.push({ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "wave-usd-warn", detail: `$${implementationOutcome.usage.usd.toFixed(2)} > $${kit.loop.config.budgets.waveUsdWarn}`, planRevision: identity.planRevision });
+				}
+			}
 			await commitState(kit, {
-				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "zero-progress-quarantine", detail: "wave produced zero file changes" }],
+				router: (draft) => {
+					const row = draft.tasks.find((entry) => entry.id === current.id)!;
+					row.waveCount = Math.max(row.waveCount, wave);
+					if (!row.baselineTreeSha) row.baselineTreeSha = baseForTask;
+				},
+				runStatus: runStatusUpdate,
+				checkpoints: [stageCheckpoint("implement", "complete", {
+					candidate,
+					conversationId: active?.conversationId ?? (current.convId !== undefined ? current.convId : undefined),
+					submissionKey: active?.submissionKey ?? (startImplement ? submissionKey(waveKey, "implement") : undefined),
+					outcome: implementationFailure === "retry" ? "unanswered-retry"
+						: implementationFailure === "quarantined" ? "unanswered-quarantine" : "answered",
+				})],
+				rows: runFailureRows,
 			});
-			await quarantine(kit, current, wave, "zero progress: no file changes", baseline);
-			continue;
+			await driverFault(opts, "after-freeze");
+		} else if (!active?.candidate && !lease.frozenCandidateTree) {
+			throw new RecoveryRequiredError(`task ${current.id} wave ${wave} candidate pin is absent`);
 		}
 
-		// Gates (§4.3). Router.md is engine-synced: the expected bytes render from
-		// the doc AS OF NOW (the loop-top read is stale across baseline commits).
-		const stateAtGate = await readSessionState(kit.loop.harness);
-		// Expected mirror bytes render from the durable doc INCLUDING its plan
-		// identity — byte-identical to what syncSideCars writes (M0-P04).
-		const mirrorText = renderRouterMd(
-			stateAtGate.router.tasks,
-			stateAtGate.router.phase,
-			stateAtGate.runStatus.prdPath,
-			stateAtGate.router.identity,
-			stateAtGate.router.archived,
-		);
-		const gate = await runGates(kit, { id: task.id, targetPaths: current.targetPaths, baselineTreeSha: baseline }, { "router.md": mirrorText }, { context: executionContext });
+		const latestAfterFreeze = await latestCheckpointForWave(await receiptSnapshot(kit), waveKey);
+		const implementationStage = latestAfterFreeze?.value.stage === "implement" ? latestAfterFreeze.value : undefined;
+		const failedImplementOutcome = implementationStage?.outcome === "unanswered-retry" ? "retry"
+			: implementationStage?.outcome === "unanswered-quarantine" ? "quarantined" : undefined;
+		if (implementationFailure || failedImplementOutcome) {
+			const failure = implementationFailure ?? failedImplementOutcome!;
+			const finished = await finishFailedCandidate({
+				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
+				feedbackIds, outcome: failure, cause: runFailureText ?? "implementation submission failed",
+				feedback: { wave, from: "gate", text: runFailureText ?? "implementation submission failed", ts: Date.now() }, opts,
+			});
+			if (finished === "retry") continue;
+			return "quarantined";
+		}
 
-		// M0-P11: the gate receipt binds the checked tree and every check outcome
-		// (skipped included) as a durable `loop.receipts` event. The trusted
-		// compatibility path captures the wave content the gates just inspected
-		// (prepared contexts check the frozen candidate — activated at P14). Pass
-		// receipts reference this receipt by id, so a pass can never claim
-		// evidence from another tree.
-		const checkedTree = await captureBaselineTree(paths.root);
-		const gateChecks: GateCheck[] = gate.results.map(gateCheckFromResult);
-		const gateReceipt = gateReceiptEvent(
-			{ planRevision: opts.planRevision, taskId: task.id, wave },
-			{
-				tree: checkedTree,
-				...(stateAtGate.router.identity?.controlsSha256 !== undefined ? { controlsSha256: stateAtGate.router.identity.controlsSha256 } : {}),
+		// A durable rollback stage is replayed before reclassifying its candidate.
+		// In particular, an unchanged candidate after an unanswered submission may
+		// still be a retry; zero-progress must not rewrite that recorded outcome.
+		if (active?.stage === "rollback") {
+			if (!candidate || (active.outcome !== "retry" && active.outcome !== "quarantined")) {
+				throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has an invalid rollback checkpoint`);
+			}
+			const finished = await finishFailedCandidate({
+				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
+				feedbackIds, outcome: active.outcome, cause: active.code ?? "resuming workspace disposal",
+				opts,
+			});
+			if (finished === "retry") continue;
+			return "quarantined";
+		}
+
+		const candidateChanges = await diffTaskTrees({ root, oid: startTree }, startTree, candidate);
+		const existingGate = gateReceiptForWave(await receiptSnapshot(kit), waveKey);
+		if (candidateChanges.length === 0 && !existingGate) {
+			await commitState(kit, {
+				checkpoints: [stageCheckpoint("implement", "complete", { candidate, outcome: "zero-progress" })],
+			});
+			await finishFailedCandidate({
+				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
+				feedbackIds, outcome: "quarantined", cause: "zero progress: no file changes from the start-of-wave tree",
+				rows: [{ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "zero-progress-quarantine", detail: "wave made no progress from its own start tree", planRevision: identity.planRevision }],
+				opts,
+			});
+			return "quarantined";
+		}
+
+		let readView: ReadWorkspace | undefined;
+		let executionContext: TaskExecutionContext | undefined;
+		const taskContext = async (): Promise<TaskExecutionContext> => {
+			if (executionContext) return executionContext;
+			readView = await materializeRead({ root, oid: candidate! }, controls);
+			executionContext = await createTaskExecutionContext({
+				controlPaths: kit.loop.paths,
+				grant: { planRevision: opts.grant.planRevision, selectedTaskIds: opts.grant.selected },
+				taskId: current.id,
+				parentOid: parent,
+				startOid: startTree,
+				candidateOid: candidate!,
+				writableWorkspace: lease,
+				frozenReadView: readView,
+				recipeBundle: bundle,
+				execArgv: hostExecArgv,
+			});
+			return executionContext;
+		};
+
+		try {
+		let gateReceipt = existingGate;
+		let gateRun: GateOutcome | undefined;
+		if (active?.stage === "gates" && active.state !== "pending" && !gateReceipt) {
+			throw new RecoveryRequiredError(`gate checkpoint for ${current.id} wave ${wave} has no matching durable gate receipt`);
+		}
+		if (active?.stage === "gates" && active.state === "pending" && !gateReceipt) {
+			throw new RecoveryRequiredError(`gate execution for ${current.id} wave ${wave} is uncertain and has no durable gate receipt`);
+		}
+		if (!gateReceipt) {
+			if (active && ["primary", "skeptic", "integrate", "publish"].includes(active.stage)) {
+				throw new RecoveryRequiredError(`task ${current.id} wave ${wave} advanced beyond gates without a gate receipt`);
+			}
+			const context = await taskContext();
+			await commitState(kit, { checkpoints: [stageCheckpoint("gates", "pending", { candidate })] });
+			const stateAtGate = await readSessionState(kit.loop.harness);
+			const mirrorText = renderRouterMd(
+				stateAtGate.router.tasks,
+				stateAtGate.router.phase,
+				stateAtGate.runStatus.prdPath,
+				stateAtGate.router.identity,
+				stateAtGate.router.archived,
+			);
+			gateRun = await runGates(kit, {
+				id: current.id, targetPaths: current.targetPaths, baselineTreeSha: startTree,
+				planRevision: identity.planRevision, wave,
+			}, { "router.md": mirrorText }, { context });
+			const gateChecks = gateRun.results.map(gateCheckFromResult);
+			const duplicate = !!gateRun.failHash && gateRun.failHash === current.lastGateHash;
+			gateReceipt = gateReceiptEvent(waveKey, {
+				tree: candidate,
+				...(identity.controlsSha256 !== undefined ? { controlsSha256: identity.controlsSha256 } : {}),
+				...(gateRun.failHash ? { failureHash: gateRun.failHash } : {}),
 				checks: gateChecks,
-			},
-		);
-		await commitState(kit, { receipts: [gateReceipt] });
-
-		if (gate.failHash && gate.failHash === current.lastGateHash) {
-			await commitState(kit, {
-				rows: [{ ts: Date.now(), kind: "governor", task: task.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gate.failHash.slice(0, 12) }],
 			});
-			await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "gate", gate }, opts.judgmentClient);
-			await quarantine(kit, current, wave, "duplicate failure: identical gate failure hash two waves running", baseline);
-			continue;
-		}
-
-		const underLimit = wave <= kit.loop.config.engine.retryLimit;
-		if (!gate.allPassed) {
+			const gatePassed = gateRun.allPassed;
+			const gateRow: WaveRow = {
+				ts: Date.now(),
+				kind: "gate",
+				task: current.id,
+				wave,
+				verb: gatePassed ? "pass" : "fail",
+				detail: gateRun.results.map((result) => `${result.name}:${result.passed}`).join(","),
+				...(gateRun.scopeBody ? { reason: gateRun.scopeBody } : {}),
+				planRevision: identity.planRevision,
+				receiptStates: { ...waveKey, gate: gatePassed ? "pass" : "fail" },
+				checkpoint: checkpointView(wave, startTree, candidate),
+			};
 			await commitState(kit, {
-				router: (d) => {
-					const t = d.tasks.find((x) => x.id === task.id)!;
-					t.lastGateHash = gate.failHash;
-					t.waveCount = wave;
-					if (underLimit) {
-						// Wave ends on retry: back to todo so the next wave-start can set
-						// in_progress again (UI seam A.1).
-						t.status = "todo";
-						t.feedback.push({ wave, from: "gate", text: gate.feedbackText, ts: Date.now() } satisfies TaskFeedback);
-					} else {
-						t.status = "quarantined";
+				receipts: [gateReceipt],
+				checkpoints: [stageCheckpoint("gates", "complete", { candidate, outcome: duplicate ? "gate-duplicate" : gatePassed ? "gate-pass" : "gate-fail" })],
+				router: (draft) => {
+					if (gatePassed) return;
+					const row = draft.tasks.find((entry) => entry.id === current.id)!;
+					row.lastGateHash = gateRun!.failHash;
+					if (!row.feedback.some((feedback) => feedback.wave === wave && feedback.from === "gate")) {
+						row.feedback.push({ wave, from: "gate", text: gateRun!.feedbackText, ts: Date.now() } satisfies TaskFeedback);
 					}
 				},
-				rows: underLimit
-					? [gateRowFor(task.id, wave, gate), waveEndRow(task.id, wave, "retry: gates failed", await waveTreeSoft(paths.root) /* A.7: a retried wave still ends a span */)]
-					: [gateRowFor(task.id, wave, gate)],
-				// UI seam A.1 at wave end: on retry the wave window closes here (idle);
-				// the next wave's start row re-opens it. Terminal outcomes flush via
-				// quarantine() below.
-				...(underLimit
-					? { statusPhase: { phase: "idle" as const, message: `${task.id} gates failed (wave ${wave}) — retry queued` } }
-					: {}),
+				rows: [...(gatePassed ? [] : [gateRow]), ...(duplicate ? [{ ts: Date.now(), kind: "governor" as const, task: current.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gateRun.failHash?.slice(0, 12) ?? "", planRevision: identity.planRevision }] : [])],
 			});
-			await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "gate", gate }, opts.judgmentClient);
-			emit({
-				kind: "gate-result",
-				taskId: task.id,
-				wave,
-				passed: gate.allPassed,
-				message: gate.allPassed ? "gates pass" : gate.feedbackText.slice(0, 160),
+			await driverFault(opts, "after-gates");
+			emit({ kind: "gate-result", taskId: current.id, wave, passed: gatePassed, message: gatePassed ? "gates pass" : gateRun.feedbackText.slice(0, 160) });
+		}
+		if (!gateReceipt) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no gate receipt after gate execution`);
+		const gateOutcome = gateRun ?? gateOutcomeFromReceipt(gateReceipt.value);
+		const gateCheckpoint = latestCheckpoint(await receiptSnapshot(kit), { ...waveKey, stage: "gates" })?.value;
+		const duplicateGate = gateCheckpoint?.outcome === "gate-duplicate";
+		if (!gateOutcome.allPassed) {
+			if (gateRun) await runFailureTriageShadow(kit, current, startTree, wave, candidateChanges.map((change) => change.path), { source: "gate", gate: gateRun }, opts.judgmentClient);
+			const retry = wave <= kit.loop.config.engine.retryLimit && !duplicateGate;
+			const feedback = current.feedback.find((entry) => entry.wave === wave && entry.from === "gate");
+			const finish = await finishFailedCandidate({
+				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
+				feedbackIds,
+				outcome: retry ? "retry" : "quarantined",
+				cause: duplicateGate ? "duplicate failure: identical gate failure on consecutive waves" : retry ? "gates failed" : "gate failures exhausted the wave retry limit",
+				...(feedback ? { feedback } : {}),
+				rows: duplicateGate ? [{ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "duplicate-gate-hash-quarantine", detail: gateOutcome.failHash?.slice(0, 12), planRevision: identity.planRevision }] : [],
+				opts,
 			});
-			if (underLimit) continue; // loop to next wave with structured feedback
-			await quarantine(kit, current, wave, "gate failures exhausted the wave retry limit", baseline);
-			continue;
+			if (retry && finish === "retry") continue;
+			return "quarantined";
 		}
 
-		// Verifier (§4.4). Both read-only passes receive the checked tree, the gate
-		// receipt id and the non-skipped outcomes independently; each pass is
-		// validated against the checked tree and committed before the next runs.
-		const verdict = await runVerify(kit, {
-			id: current.id,
-			title: current.title,
-			spec: current.spec,
-			acceptance: current.acceptance,
-			baselineTreeSha: baseline,
-			targetPaths: current.targetPaths,
-		}, gateSummaryText(gate.results), {
-			skepticSecondPass: kit.loop.config.gates.skepticSecondPass,
-			jevShadow: { enabled: kit.loop.config.gates.jevVerifierShadow, client: opts.judgmentClient },
-			executionContext,
-			gateEvidence: { tree: checkedTree, gateId: gateReceipt.value.id, checks: gateChecks },
-			waveIdentity: { planRevision: opts.planRevision, wave },
-		});
-
-		if (verdict.verdict === "approve") {
-			await commitState(kit, {
-				router: (d) => {
-					const t = d.tasks.find((x) => x.id === task.id)!;
-					t.status = "done";
-					t.waveCount = wave;
-				},
-				rows: [
-					{ ts: Date.now(), kind: "task", task: task.id, wave, verb: "done", verdict: "approve" },
-					// UI seam A.1: the wave ends here — the span outcome stays "approved".
-					waveEndRow(task.id, wave, "approved", await waveTreeSoft(paths.root) /* A.7: the approved wave's own end tree */),
-				],
-				statusPhase: { phase: "idle", message: `${task.id} approved (wave ${wave})` },
-			});
-			// UI seam A.2: the task's display patch + stats side-car land in
-			// .orch/artifacts BEFORE delivery — the tree is the task's final state
-			// here (delivery may commit; the patch is cumulative since baseline).
-			await writeTaskDiffArtifacts(kit, task.id, wave, baseline);
-			emit({ kind: "task-done", taskId: task.id, wave, message: `${task.id} verified + approved` });
-			await runDelivery(kit, task.id, wave, { deliverExplicit: opts.deliverExplicit });
-			return "done";
-		}
-
-		const canRetry = verdict.verdict === "reject" && underLimit;
-		await commitState(kit, {
-			router: (d) => {
-				const t = d.tasks.find((x) => x.id === task.id)!;
-				t.waveCount = wave;
-				if (canRetry) {
-					// Wave ends on retry (UI seam A.1): back to todo.
-					t.status = "todo";
-					t.feedback.push({ wave, from: "verifier", text: verdict.notes, ts: Date.now() } satisfies TaskFeedback);
-				} else {
-					t.status = "quarantined";
+		const afterGateReceipts = await receiptSnapshot(kit);
+		const primaryEvent = passReceiptForWave(afterGateReceipts, waveKey, "primary", candidate, gateReceipt.value.id);
+		const skepticEvent = passReceiptForWave(afterGateReceipts, waveKey, "skeptic", candidate, gateReceipt.value.id);
+		const skepticRequired = kit.loop.config.gates.skepticSecondPass;
+		const acceptanceExists = afterGateReceipts.events.some((event) => event.kind === "acceptance"
+			&& event.value.planRevision === waveKey.planRevision && event.value.taskId === waveKey.taskId
+			&& event.value.wave === waveKey.wave && event.value.tree === candidate);
+		let verdict: VerifyResult | undefined;
+		if (acceptanceExists || active?.stage === "integrate" || active?.stage === "publish") {
+			if (!primaryEvent || primaryEvent.value.review.verdict !== "approve" || (skepticRequired && (!skepticEvent || skepticEvent.value.review.verdict !== "approve"))) {
+				throw new RecoveryRequiredError(`integration checkpoint for ${current.id} wave ${wave} is missing its approving pass receipts`);
+			}
+			verdict = { verdict: "approve", criteria: [], notes: "reusing receipted approval" };
+		} else {
+			const completePassSet = !!primaryEvent && (primaryEvent.value.review.verdict !== "approve" || !skepticRequired || !!skepticEvent);
+			if (completePassSet) {
+				const primaryReview = primaryEvent!.value.review;
+				verdict = {
+					verdict: primaryReview.verdict,
+					criteria: primaryReview.criteria.map((criterion) => ({ ...criterion, malformed: false })),
+					notes: primaryReview.notes,
+				};
+				if (primaryReview.verdict === "approve" && skepticRequired && skepticEvent) {
+					const skepticReview = skepticEvent.value.review;
+					verdict = skepticReview.verdict === "approve" ? verdict : {
+						verdict: skepticReview.verdict,
+						criteria: skepticReview.criteria.map((criterion) => ({ ...criterion, malformed: false })),
+						notes: `skeptic pass: ${skepticReview.notes}`.slice(0, 300),
+					};
 				}
-			},
-			rows: [
-				{ ts: Date.now(), kind: "verdict", task: task.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes },
-				...(canRetry ? [waveEndRow(task.id, wave, "retry: verifier rejected", await waveTreeSoft(paths.root) /* A.7: retry-scope end tree */)] : []),
-			],
-			...(canRetry
-				? { statusPhase: { phase: "idle" as const, message: `${task.id} verifier rejected (wave ${wave}) — retry queued` } }
-				: {}),
+			}
+			if (!verdict) {
+				const context = await taskContext();
+				const receiptsNow = await receiptSnapshot(kit);
+				const primaryCheckpoint = latestCheckpoint(receiptsNow, { ...waveKey, stage: "primary" })?.value;
+				const skepticCheckpoint = latestCheckpoint(receiptsNow, { ...waveKey, stage: "skeptic" })?.value;
+				if (primaryCheckpoint?.state === "complete" && !primaryEvent) throw new RecoveryRequiredError(`primary checkpoint for ${current.id} wave ${wave} has no pass receipt`);
+				if (skepticCheckpoint?.state === "complete" && !skepticEvent) throw new RecoveryRequiredError(`skeptic checkpoint for ${current.id} wave ${wave} has no pass receipt`);
+				if (primaryCheckpoint?.state === "pending" && (primaryCheckpoint.conversationId === undefined || !primaryCheckpoint.submissionKey)) {
+					throw new RecoveryRequiredError(`primary checkpoint for ${current.id} wave ${wave} is missing its submission identity`);
+				}
+				if (skepticCheckpoint?.state === "pending" && (skepticCheckpoint.conversationId === undefined || !skepticCheckpoint.submissionKey)) {
+					throw new RecoveryRequiredError(`skeptic checkpoint for ${current.id} wave ${wave} is missing its submission identity`);
+				}
+				const submissionRecovery = {
+					...(primaryCheckpoint?.state === "pending" && primaryCheckpoint.conversationId !== undefined && primaryCheckpoint.submissionKey
+						? { primary: { conversationId: primaryCheckpoint.conversationId, submissionKey: primaryCheckpoint.submissionKey } } : {}),
+					...(skepticCheckpoint?.state === "pending" && skepticCheckpoint.conversationId !== undefined && skepticCheckpoint.submissionKey
+						? { skeptic: { conversationId: skepticCheckpoint.conversationId, submissionKey: skepticCheckpoint.submissionKey } } : {}),
+				};
+				verdict = await runVerify(kit, {
+					id: current.id,
+					title: current.title,
+					spec: current.spec,
+					acceptance: current.acceptance,
+					baselineTreeSha: startTree,
+					targetPaths: current.targetPaths,
+				}, gateSummaryText(gateOutcome.results), {
+					skepticSecondPass: skepticRequired,
+					jevShadow: { enabled: kit.loop.config.gates.jevVerifierShadow, client: opts.judgmentClient },
+					executionContext: context,
+					gateEvidence: { tree: candidate, gateId: gateReceipt.value.id, checks: gateReceipt.value.checks },
+					waveIdentity: { planRevision: identity.planRevision, wave },
+					existingPasses: {
+						...(primaryEvent ? { primary: primaryEvent.value.review } : {}),
+						...(skepticEvent ? { skeptic: skepticEvent.value.review } : {}),
+					},
+					submissionRecovery,
+					submissionKeys: { primary: submissionKey(waveKey, "primary"), skeptic: submissionKey(waveKey, "skeptic") },
+					onSubmissionPrepared: async (pass, conversationId, key) => {
+						await commitState(kit, { checkpoints: [stageCheckpoint(pass, "pending", { candidate, conversationId, submissionKey: key, outcome: "submitted" })] });
+					},
+					checkpointForPass: (pass, conversationId, key, result) => stageCheckpoint(pass, "complete", {
+						candidate, conversationId, submissionKey: key, outcome: result.verdict,
+					}),
+					afterPassCommitted: (pass) => driverFault(opts, pass === "primary" ? "after-primary" : "after-skeptic"),
+				});
+			}
+		}
+		if (!verdict) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no reconciled verifier result`);
+		if (verdict.verdict === "approve") await driverFault(opts, "after-review-before-delivery");
+		if (verdict.verdict !== "approve") {
+			const retry = verdict.verdict === "reject" && wave <= kit.loop.config.engine.retryLimit;
+			await runFailureTriageShadow(kit, current, startTree, wave, candidateChanges.map((change) => change.path), { source: "verifier", verifier: verdict }, opts.judgmentClient);
+			emit({ kind: "verifier-verdict", taskId: current.id, wave, verdict: verdict.verdict, message: verdict.notes || "(no notes)" });
+			const feedback: TaskFeedback | undefined = retry ? { wave, from: "verifier", text: verdict.notes, ts: Date.now() } : undefined;
+			const finish = await finishFailedCandidate({
+				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
+				feedbackIds, outcome: retry ? "retry" : "quarantined",
+				cause: verdict.verdict === "needs_human" ? "verifier needs a human" : retry ? "verifier rejected" : "verifier rejects exhausted the wave retry limit",
+				...(feedback ? { feedback } : {}),
+				rows: [{ ts: Date.now(), kind: "verdict", task: current.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes, planRevision: identity.planRevision }],
+				opts,
+			});
+			if (finish === "retry") continue;
+			return "quarantined";
+		}
+
+		const policy = skepticRequired ? "always" : "never";
+		const required = skepticRequired ? ["primary", "skeptic"] as const : ["primary"] as const;
+		await commitState(kit, { checkpoints: [stageCheckpoint("integrate", "pending", { candidate, outcome: "accepted" })] });
+		await acceptCandidate(kit, {
+			...waveKey,
+			parent,
+			tree: candidate,
+			policy,
+			required: [...required],
+			...(identity.controlsSha256 !== undefined ? { controlsSha256: identity.controlsSha256 } : {}),
+		}, opts.prPublication ?? {});
+		await driverFault(opts, "after-acceptance");
+		const integrated = await integrateAcceptedCandidate(kit, waveKey, opts.prPublication ?? {});
+		await commitState(kit, {
+			checkpoints: [stageCheckpoint("integrate", "complete", { candidate, outcome: "integrated" })],
+			rows: [{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "integrated", detail: integrated.receipt.commit, planRevision: identity.planRevision }],
 		});
-		await runFailureTriageShadow(kit, current, baseline, wave, filesChanged, { source: "verifier", verifier: verdict }, opts.judgmentClient);
-		emit({ kind: "verifier-verdict", taskId: task.id, wave, verdict: verdict.verdict, message: verdict.notes || "(no notes)" });
-		if (canRetry) continue;
-		await quarantine(kit, current, wave, verdict.verdict === "needs_human" ? "verifier needs a human" : "verifier rejects exhausted the retry limit", baseline);
+		await driverFault(opts, "after-integration");
+
+		const mode = kit.loop.config.delivery.mode;
+		if (mode === "pr" && !opts.deliverExplicit) throw new DriverStateError('delivery.mode="pr" requires explicit --deliver consent before the run starts');
+		const publishStage = latestCheckpoint(await receiptSnapshot(kit), { ...waveKey, stage: "publish" })?.value;
+		if (publishStage?.state !== "pending") {
+			await commitState(kit, { checkpoints: [stageCheckpoint("publish", "pending", { candidate })] });
+		}
+		await driverFault(opts, "before-publication");
+		let delivery;
+		try {
+			delivery = mode === "pr"
+				? await publishPullRequest(kit, waveKey, { ...(opts.prPublication ?? {}), deliverExplicit: opts.deliverExplicit === true })
+				: await publishLocalResult(kit, waveKey, mode, opts.prPublication ?? {});
+		} catch (error) {
+			throw error instanceof RecoveryRequiredError ? error
+				: new RecoveryRequiredError(`${mode} publication for ${current.id} wave ${wave} is not confirmed: ${(error as Error).message}`);
+		}
+		const afterDeliveryReceipts = await receiptSnapshot(kit);
+		const receiptStates = receiptStatesForWave(afterDeliveryReceipts, waveKey);
+		const publishOutcome = delivery.receipt.state === "not_requested" ? "not-requested" : "published";
+		await commitState(kit, {
+			checkpoints: [stageCheckpoint("publish", "complete", { candidate, outcome: publishOutcome })],
+			rows: [{
+				ts: Date.now(),
+				kind: "delivery",
+				task: current.id,
+				wave,
+				verb: delivery.receipt.state,
+				detail: delivery.receipt.ref ?? delivery.receipt.code ?? delivery.receipt.commit,
+				planRevision: identity.planRevision,
+				receiptStates,
+				checkpoint: checkpointView(wave, startTree, candidate),
+			}],
+		});
+		await driverFault(opts, "after-publication");
+		const terminalReceipts = await receiptSnapshot(kit);
+		const finalReceiptStates = receiptStatesForWave(terminalReceipts, waveKey);
+		const view = checkpointView(wave, startTree, candidate);
+		await commitState(kit, {
+			router: (draft) => {
+				const row = draft.tasks.find((entry) => entry.id === current.id)!;
+				row.status = "done";
+				row.waveCount = Math.max(row.waveCount, wave);
+			},
+			checkpoints: [stageCheckpoint("terminal", "complete", { candidate, outcome: "accepted" })],
+			rows: [
+				{ ts: Date.now(), kind: "task", task: current.id, wave, verb: "done", verdict: "approve", planRevision: identity.planRevision, receiptStates: finalReceiptStates, checkpoint: view },
+				waveEndRow(current.id, wave, "approved", candidate, { planRevision: identity.planRevision, receiptStates: finalReceiptStates, checkpoint: view }),
+			],
+			statusPhase: { phase: "idle", message: `${current.id} accepted and publication confirmed (wave ${wave})` },
+		});
+		emit({ kind: "task-done", taskId: current.id, wave, message: `${current.id} accepted and publication confirmed` });
+		return "done";
+		} finally {
+			if (readView) await discardWorkspace(readView).catch(() => {});
+		}
 	}
 }
 
@@ -718,7 +1311,7 @@ async function runFailureTriageShadow(
 }
 
 /** Open the implementer conversation with role config + guard doc. */
-async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, task: RouterTask, executionContext: ReturnType<typeof trustedCompatibilityContext>) {
+async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, task: RouterTask, executionContext: TaskExecutionContext) {
 	const role = kit.loop.config.roles.implementer;
 	return convKit.createUnit({
 		instructions: `${IMPLEMENTER_BRIEF}\n\nKit: ${kit.loop.config.engine.piDurable} · project ${kit.loop.paths.root}`,
@@ -728,37 +1321,6 @@ async function openTaskConversation(kit: LoopAndLock, convKit: ConversationKit, 
 		maxTurns: kit.loop.config.engine.maxTurns,
 		executionContext,
 	});
-}
-
-/**
- * UI seam A.2: persist the task's cumulative display patch + stats side-car to
- * .orch/artifacts (task-<id>.patch / task-<id>.json). Retries never reset the
- * tree, so the patch spans every attempt since the baseline; each terminal
- * outcome rewrites both files. Best-effort evidence: a failed write is
- * swallowed — the loop never breaks for the UI.
- */
-async function writeTaskDiffArtifacts(kit: LoopAndLock, taskId: string, wave: number, baseline: string | undefined): Promise<void> {
-	if (!baseline) return;
-	const artifacts = kit.loop.paths.artifacts;
-	const patchFile = join(artifacts, `task-${taskId}.patch`);
-	try {
-		const display = await saveDisplayPatch(kit.loop.paths.root, baseline, patchFile);
-		if (!display.ok) return; // nothing displayable — no patch, no stats side-car
-		const stats: DisplayDiffStats = {
-			task: taskId,
-			wave,
-			baselineTreeSha: baseline,
-			generatedAt: Date.now(),
-			files: display.stats.files,
-			totalInsertions: display.stats.totalInsertions,
-			totalDeletions: display.stats.totalDeletions,
-			bytes: display.bytes,
-			truncated: display.truncated,
-		};
-		await atomicWriteJson(join(artifacts, `task-${taskId}.json`), stats);
-	} catch {
-		/* UI-seam evidence only — the run outcome stands on its own */
-	}
 }
 
 /**
@@ -784,172 +1346,29 @@ export async function assembleWaveInput(task: RouterTask, wave: number, handoffN
 	return spec.join("\n\n");
 }
 
-// ---------------------------------------------------------------------------
-// Run-failure handling (governor)
-// ---------------------------------------------------------------------------
-
-async function handleUnanswered(
-	kit: LoopAndLock,
-	task: RouterTask,
-	wave: number,
-	reason: string,
-	detail: unknown,
-	waveUsd: number,
-): Promise<"sleeping" | "retried" | "faulted" | "budget"> {
-	const rows: WaveRow[] = [
-		{ ts: Date.now(), kind: "engine", task: task.id, wave, verb: `run-failed:${reason}`, detail: String(detail ?? "").slice(0, 200) },
-	];
-	if (looksLikeRateLimit(detail) || looksLikeRateLimit(reason)) {
-		const delaySec = parseResetDelay(detail) ?? parseResetDelay(reason) ?? 30 * 60;
-		const until = Date.now() + delaySec * 1000;
-		const convId = task.convId ?? 0;
-		if (task.convId === undefined) return "faulted";
-		await armRateLimitSleep(kit, { until, reason: String(detail ?? reason).slice(0, 120), taskId: task.id, wave, conversationId: task.convId });
-		return "sleeping";
-	}
-	// Non-rate-limit failure: count it; consecutive errors breaker (§4.5).
-	const state = await readSessionState(kit.loop.harness);
-	const maxErrors = kit.loop.config.budgets.maxConsecutiveErrors;
-	const nextCount = state.runStatus.consecutiveErrors + 1;
-	if (nextCount >= maxErrors) {
-		await commitState(kit, {
-			rows,
-			runStatus: (d) => {
-				d.consecutiveErrors = nextCount;
-				d.activeAlert = `${maxErrors} consecutive run failures — quarantining ${task.id}`;
-			},
-		});
-		return "faulted"; // the driver quarantines once
-	}
-	await commitState(kit, {
-		rows: [...rows, waveEndRow(task.id, wave, `retry: run failed: ${reason.slice(0, 120)}`, await waveTreeSoft(kit.loop.paths.root) /* A.7: what the failed wave left behind */)],
-		router: (d) => {
-			const t = d.tasks.find((x) => x.id === task.id)!;
-			t.waveCount = wave;
-			// UI seam A.1 at wave end: back to todo; the next wave sets in_progress.
-			t.status = "todo";
-			t.feedback.push({ wave, from: "gate", text: `run failed: ${reason}`, ts: Date.now() } satisfies TaskFeedback);
-		},
-		runStatus: (d) => {
-			d.consecutiveErrors = nextCount;
-			d.budgetSpentUsd = Math.max(d.budgetSpentUsd, waveUsd);
-		},
-		statusPhase: { phase: "idle", message: `${task.id} wave ${wave} run failed (${reason.slice(0, 160)}) — retry queued` },
-	});
-	return "retried";
-}
-
-// ---------------------------------------------------------------------------
-// Quarantine (§4.2.7): patch the wave's changes, roll back to baseline
-// ---------------------------------------------------------------------------
-
-export async function quarantine(kit: LoopAndLock, task: RouterTask, wave: number, cause: string, baselineTreeSha?: string): Promise<void> {
-	const paths = kit.loop.paths;
-	// The caller's in-scope baseline (captured at wave start) beats the stale
-	// task copy: on a wave-1 quarantine the task object predates the capture.
-	// Without this, first-wave quarantines never wrote their evidence patch.
-	const baseline = baselineTreeSha ?? task.baselineTreeSha;
-	// A.7: the quarantined wave's own tree — captured BEFORE the rollback so the
-	// isolated wave diff names what the wave produced (the evidence saved below),
-	// not the empty post-restore tree. The save below only touches .orch, which
-	// the capture skips, so the tree bytes are the wave's final content either way.
-	const producedTree = await waveTreeSoft(paths.root);
-	let patchFile: string | undefined;
-	if (baseline) {
-		const artifactName = `quarantined-${task.id}-w${wave}.patch`;
-		patchFile = join(paths.artifacts, artifactName);
-		try {
-			await mkdir(dirname(patchFile), { recursive: true });
-			// UI seam A.2: the display wrapper keeps this an evidence artifact
-			// (engine paths excluded, 5 MiB cap) and enables the stats side-car;
-			// rollback itself stays restoreTree — never the (possibly truncated) patch.
-			const saved = await saveDisplayPatch(paths.root, baseline, patchFile);
-			if (saved.ok) {
-				const stats: DisplayDiffStats = {
-					task: task.id,
-					wave,
-					baselineTreeSha: baseline,
-					generatedAt: Date.now(),
-					files: saved.stats.files,
-					totalInsertions: saved.stats.totalInsertions,
-					totalDeletions: saved.stats.totalDeletions,
-					bytes: saved.bytes,
-					truncated: saved.truncated,
-				};
-				await atomicWriteJson(join(paths.artifacts, `quarantined-${task.id}-w${wave}.json`), stats);
-			} else {
-				patchFile = undefined;
-			}
-		} catch {
-			patchFile = undefined;
-		}
-		await restoreTree(paths.root, baseline).catch(() => {});
-	}
-	await commitState(kit, {
-		router: (d) => {
-			const t = d.tasks.find((x) => x.id === task.id)!;
-			t.status = "quarantined";
-			t.feedback.push({
-				wave,
-				from: "gate",
-				text: `quarantined: ${cause}`,
-				ts: Date.now(),
-			} satisfies TaskFeedback);
-		},
-		rows: [
-			{
-				ts: Date.now(),
-				kind: "task",
-				task: task.id,
-				wave,
-				verb: "quarantined",
-				reason: cause,
-				detail: patchFile ? `working tree rolled back to ${baseline!.slice(0, 12)}; patch at ${artifact(patchFile)}` : "working tree rolled back to baseline",
-			},
-			// UI seam A.1: the terminal wave outcome closes the span; detail keeps the
-			// cause so the timeline leaves no dead-end "wave/end" label.
-			waveEndRow(task.id, wave, `quarantined: ${cause.slice(0, 200)}`, producedTree),
-		],
-		statusPhase: { phase: "idle", message: `${task.id} quarantined: ${cause}` },
-	});
-}
-
-function artifact(path: string): string {
-	return path.split("/").slice(-2).join("/");
-}
-
 /** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
 /** UI seam A.1: the close of one (task, wave) — outcome in `detail` so the
  *  timeline spans keep real start/end times and messages. A.7: `endTree` (when
  *  captured) rides the row so the wave's isolated diff has its end point; a row
  *  without one is a wave that is simply not isolatable, never a failed run. */
-function waveEndRow(taskId: string, wave: number, outcome: string, endTree?: string): WaveRow {
-	return { ts: Date.now(), kind: "wave", task: taskId, wave, verb: "end", detail: outcome, ...(endTree ? { treeSha: endTree } : {}) };
-}
-
-/** A.7's soft capture: the same `captureBaselineTree` throwaway-index snapshot
- *  the baseline path uses, but a failure degrades to `undefined` — a missing
- *  view, not a failed wave (deliberately softer than the baseline path's
- *  throw: a missing baseline is fatal, a missing wave tree is only a view). */
-async function waveTreeSoft(root: string): Promise<string | undefined> {
-	try {
-		return await captureBaselineTree(root);
-	} catch {
-		return undefined;
-	}
-}
-
-/** Gate row; empty scopeBody stays absent (strict-JSON drafts hate undefined). */
-function gateRowFor(taskId: string, wave: number, gate: GateOutcome): WaveRow {
-	const base: WaveRow = {
+function waveEndRow(
+	taskId: string,
+	wave: number,
+	outcome: string,
+	endTree?: string,
+	facts: { planRevision?: string; receiptStates?: import("./receipts.ts").ReceiptStateView; checkpoint?: FrozenCheckpointView } = {},
+): WaveRow {
+	return {
 		ts: Date.now(),
-		kind: "gate",
+		kind: "wave",
 		task: taskId,
 		wave,
-		verb: gate.allPassed ? "pass" : "fail",
-		detail: gate.results.map((r) => `${r.name}:${r.passed}`).join(","),
+		verb: "end",
+		detail: outcome,
+		...(endTree ? { treeSha: endTree } : {}),
+		...(facts.planRevision ? { planRevision: facts.planRevision } : {}),
+		...(facts.receiptStates ? { receiptStates: facts.receiptStates } : {}),
+		...(facts.checkpoint ? { checkpoint: facts.checkpoint } : {}),
 	};
-	if (gate.scopeBody) base.reason = gate.scopeBody;
-	return base;
 }
 

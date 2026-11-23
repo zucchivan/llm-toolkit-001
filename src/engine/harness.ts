@@ -39,6 +39,7 @@ import { exists as fileExists, atomicWriteJson } from "../util/fsx.ts";
 import { loadConfig, KIT_VERSION } from "../config.ts";
 import type { KitConfig } from "../config.ts";
 import { usageUsd, type CostRates } from "../util/budget.ts";
+import type { FrozenCheckpointView, ReceiptStateView } from "./receipts.ts";
 
 export { LockBusyError, KIT_VERSION };
 
@@ -130,7 +131,7 @@ export type LoopGuardDocValue = {
 	role: "implementer" | "verifier" | "planner";
 	/** Non-empty: write/edit outside these paths are blocked (implementer only). */
 	targetPaths: string[];
-	/** Host-issued execution identity; absent for legacy/prepared compatibility conversations. */
+	/** Host-issued execution identity for an implementer wave; absent for planner/diagnostic roles. */
 	execution?: { planRevision: string; taskId: string; leaseId: string };
 }
 
@@ -430,6 +431,12 @@ function requireConfig(configPath: string): void {
 export interface StatusPayloads {
 	kit: string;
 	piDurable: string;
+	/** Latest current plan identity, copied from RouterDoc for side-car observers. */
+	planRevision?: string;
+	/** Latest per-wave receipt states; the receipt journal remains authoritative. */
+	receiptStates?: ReceiptStateView;
+	/** Latest frozen candidate for this plan, when one has been recorded. */
+	checkpoint?: FrozenCheckpointView;
 	ts: number;
 	root: string;
 	lockedByPid?: number;

@@ -52,10 +52,13 @@ export class ConversationKit {
 		const harness = this.kit.loop.harness;
 		const execution = setup.executionContext;
 		if (execution && execution.controlPaths.root !== this.kit.loop.paths.root) throw new Error("execution context control root does not match the open project harness");
+		if (execution?.kind === "task-read" && setup.tools !== "read") {
+			throw new Error("a candidate-only context cannot create a writable conversation");
+		}
 		const cwd = execution?.kind === "task-execution"
 			? setup.tools === "coding" ? execution.writableWorkspace.workspacePath : execution.frozenReadView.viewPath
-			: execution?.kind === "trusted-compatibility"
-				? setup.tools === "coding" ? execution.executionRoot : execution.readRoot
+			: execution?.kind === "task-read"
+				? execution.frozenReadView.viewPath
 				: this.kit.loop.paths.root;
 		const conv = await harness.createConversation(
 			{

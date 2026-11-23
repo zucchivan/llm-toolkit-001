@@ -8,9 +8,8 @@ import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import { RouterDoc, RunStatusDoc, WaveLogDoc, syncSideCars, renderRouterMd } from "./infos.ts";
-import { ReceiptsDoc } from "./receipts.ts";
-import { receiptKey } from "./receipts.ts";
-import type { JournalReceiptEvent, ReceiptEvent, ReceiptIdentity, ReceiptsDocValue } from "./receipts.ts";
+import { checkpointKey, latestFrozenCheckpoint, latestReceiptStates, receiptKey, ReceiptsDoc } from "./receipts.ts";
+import type { Checkpoint, CheckpointEvent, JournalReceiptEvent, ReceiptEvent, ReceiptIdentity, ReceiptsDocValue } from "./receipts.ts";
 import type { ArchivedPlanRef, PlanIdentity } from "./plans.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
@@ -275,6 +274,9 @@ export interface StateInput {
 	/** Journal attempts: allocate per-key ordinals and update latest pointers
 	 *  inside the same harness transaction as any accompanying state changes. */
 	receiptAttempts?: ReceiptAttempt[];
+	/** Latest durable checkpoint snapshots for wave stages, appended with their
+	 *  per-wave/stage pointer in the same harness transaction. */
+	checkpoints?: Checkpoint[];
 	/** Wave-log rows appended inside the commit (then mirrored to JSONL). */
 	rows?: WaveRow[];
 	/** What status.json should show after this commit. */
@@ -297,13 +299,17 @@ export type StatusPhase =
  * conversation starts, so an attached UI sees the planning state immediately.
  */
 export async function flushStatusSnapshot(loopAndLock: LoopAndLock, statusPhase: StatusPhase): Promise<void> {
-	const state = await readSessionState(loopAndLock.loop.harness);
-	const sessionUsage = await loopAndLock.loop.sessionUsage();
+	const [state, sessionUsage, receipts] = await Promise.all([
+		readSessionState(loopAndLock.loop.harness),
+		loopAndLock.loop.sessionUsage(),
+		loopAndLock.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT),
+	]);
 	await flushStated(loopAndLock.loop.paths, composeStatusPayload(loopAndLock, {
 		routerAfter: state.router,
 		statusAfter: state.runStatus,
 		statusPhase,
 		sessionUsageUsd: sessionUsage.totalUsd,
+		receiptsAfter: receipts ?? { version: 1, events: [] },
 	}));
 }
 
@@ -313,6 +319,7 @@ interface PayloadInput {
 	statusPhase?: StatusPhase;
 	reports?: ReportRow[];
 	sessionUsageUsd: number;
+	receiptsAfter: ReceiptsDocValue;
 }
 
 /** The single status.json composer: commit flushes and commit-less snapshots share it. */
@@ -359,6 +366,13 @@ function composeStatusPayload(loopAndLock: LoopAndLock, input: PayloadInput): St
 		consecutiveErrors: input.statusAfter.consecutiveErrors,
 		sleepCycleCount: input.statusAfter.sleepCycleCount,
 		prdPath: input.statusAfter.prdPath,
+		planRevision: input.routerAfter.identity?.planRevision,
+		receiptStates: input.routerAfter.identity
+			? latestReceiptStates(input.receiptsAfter, input.routerAfter.identity.planRevision)
+			: undefined,
+		checkpoint: input.routerAfter.identity
+			? latestFrozenCheckpoint(input.receiptsAfter, input.routerAfter.identity.planRevision)
+			: undefined,
 	};
 }
 
@@ -379,7 +393,7 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 				const wlDraft = await tx.doc(WaveLogDoc);
 				wlDraft.rows.push(...input.rows);
 			}
-			if (input.receipts || input.receiptAttempts?.length) {
+			if (input.receipts || input.receiptAttempts?.length || input.checkpoints?.length) {
 				const recDraft = await tx.doc(ReceiptsDoc);
 				if (input.receipts) {
 					if (typeof input.receipts === "function") input.receipts(recDraft);
@@ -403,21 +417,36 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 					}
 					recDraft.latest = latest;
 				}
+				if (input.checkpoints?.length) {
+					const latestCheckpoints = { ...(recDraft.latestCheckpoints ?? {}) };
+					for (const checkpoint of input.checkpoints) {
+						const key = checkpointKey(checkpoint);
+						const recordedOrdinal = recDraft.events.reduce((max, event) =>
+							event.kind === "checkpoint" && checkpointKey(event.value) === key ? Math.max(max, event.ordinal) : max, 0);
+						const ordinal = Math.max(latestCheckpoints[key]?.ordinal ?? 0, recordedOrdinal) + 1;
+						const event: CheckpointEvent = { kind: "checkpoint", opId: randomUUID(), at: Date.now(), ordinal, value: checkpoint };
+						recDraft.events.push(event);
+						latestCheckpoints[key] = { opId: event.opId, ordinal };
+					}
+					recDraft.latestCheckpoints = latestCheckpoints;
+				}
 			}
 		},
 		BACKGROUND_CONTEXT,
 	);
 
 	// Drafts are commit-scoped: read the committed values via snapshots after resolution.
-	const [routerAfter, statusAfter] = await Promise.all([
+	const [routerAfter, statusAfter, receiptsAfter] = await Promise.all([
 		harness.snapshot(RouterDoc, BACKGROUND_CONTEXT),
 		harness.snapshot(RunStatusDoc, BACKGROUND_CONTEXT),
+		harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT),
 	]);
 	const wlRead = await harness.snapshot(WaveLogDoc, BACKGROUND_CONTEXT);
 	await postCommit(loopAndLock, {
 		routerAfter: { ...(routerAfter ?? emptyRouter()) },
 		statusAfter: { ...(statusAfter ?? defaultRunStatus()) },
 		rowsAfter: wlRead?.rows ?? [],
+		receiptsAfter: receiptsAfter ?? { version: 1, events: [] },
 		input,
 	});
 }
@@ -437,6 +466,7 @@ async function postCommit(
 		routerAfter: RouterDocValue;
 		statusAfter: RunStatusDocValue;
 		rowsAfter: WaveRow[];
+		receiptsAfter: ReceiptsDocValue;
 		input: StateInput;
 	},
 ): Promise<void> {
@@ -471,6 +501,7 @@ async function postCommit(
 			statusPhase,
 			reports: calculated.input.reports,
 			sessionUsageUsd: sessionUsage.totalUsd,
+			receiptsAfter: calculated.receiptsAfter,
 		}),
 	);
 }

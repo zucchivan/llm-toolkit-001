@@ -172,8 +172,8 @@ describe("criterion evidence against the checked tree (M0-P11)", () => {
 				targetPaths: TASK.targetPaths, priority: 1,
 			}] }), { stopReason: "stop" }),
 		], models.faux);
+		await writeGateFile(project.root); // reviewed recipe fixture is committed before planning
 		await accomplish(kit);
-		await writeGateFile(project.root); // broken-gate passes while no BROKEN token exists
 		const baseline = await captureBaselineTree(kit.loop.paths.root);
 		const gate = await runGates(kit, { id: TASK.id, targetPaths: TASK.targetPaths, baselineTreeSha: baseline }, {});
 		expect(gate.allPassed).toBe(true);
@@ -289,14 +289,14 @@ describe("criterion evidence against the checked tree (M0-P11)", () => {
 		expect(state.router.tasks[0]).toMatchObject({ id: TASK.id, status: "quarantined" });
 
 		const receipts = await readReceipts(kit);
-		// The gate receipt and the primary pass receipt exist even though the
-		// skeptic never answered cleanly: each pass was committed before the next
-		// pass was dispatched, and the failed skeptic pass records needs_human.
-		expect(receipts.events.map((e) => e.kind)).toEqual(["gate", "pass", "pass"]);
-		const primary = receipts.events[1]!;
+		// Checkpoint events are additive P14 recovery markers; the P11 evidence
+		// order remains gate → primary pass → skeptic pass.
+		const evidenceEvents = receipts.events.filter((event) => event.kind === "gate" || event.kind === "pass");
+		expect(evidenceEvents.map((event) => event.kind)).toEqual(["gate", "pass", "pass"]);
+		const primary = evidenceEvents[1]!;
 		if (primary.kind !== "pass") throw new Error("unreachable");
 		expect(primary.value.review).toMatchObject({ pass: "primary", verdict: "approve" });
-		const skepticEvent = receipts.events[2]!;
+		const skepticEvent = evidenceEvents[2]!;
 		if (skepticEvent.kind !== "pass") throw new Error("unreachable");
 		expect(skepticEvent.value.review).toMatchObject({ pass: "skeptic", verdict: "needs_human" });
 		const verdictRows = state.rows.filter((row) => row.kind === "verdict");

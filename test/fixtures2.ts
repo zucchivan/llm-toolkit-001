@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { initProject } from "../src/init.ts";
+import { exec } from "../src/util/exec.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
 import type { FauxProviderHandle, Models } from "./kit-types.ts";
 
@@ -25,9 +26,9 @@ export interface BakeOptions {
 export async function bakeProject(opts: BakeOptions): Promise<Baked> {
 	const project = await prepareDemoProject();
 	await writeConfig(project.root, opts.configToml ?? (opts.budgetCeiling ? demoBudgetToml2(opts.budgetCeiling) : demoConfigToml()));
-	await gitInit(project.root);
 	await mkdir(join(project.root, "bin"), { recursive: true });
 	await initProject(project.root);
+	await gitInit(project.root);
 
 	const models = opts.buildFauxModels([] as never[]);
 	const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models, retryMax: opts.retryMax });
@@ -99,6 +100,18 @@ export async function scripted(kit: Awaited<ReturnType<typeof openProjectHarness
  * a bare-timestamp stamp. Returns the granted plan revision.
  */
 export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarness>>): Promise<string> {
+	// Test-only setup changes (for example a custom reviewed gate) belong in the
+	// immutable base tree before planning; the P14 driver never imports them from
+	// the operator worktree after the review point.
+	const staged = await exec(["git", "add", "-A"], { cwd: kit.loop.paths.root, timeoutMs: 15_000 });
+	if (staged.code !== 0) throw new Error(staged.stderr || "could not stage fixture base");
+	const stagedDiff = await exec(["git", "diff", "--cached", "--quiet"], { cwd: kit.loop.paths.root, timeoutMs: 15_000 });
+	if (stagedDiff.code === 1) {
+		const committed = await exec(["git", "commit", "-m", "fixture: seal reviewed plan inputs"], { cwd: kit.loop.paths.root, timeoutMs: 15_000 });
+		if (committed.code !== 0) throw new Error(committed.stderr || "could not commit fixture base");
+	} else if (stagedDiff.code !== 0) {
+		throw new Error(stagedDiff.stderr || "could not inspect fixture index");
+	}
 	const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
 	const { approveGrant } = await import("../src/engine/waves.ts");
 	const prd = await loadPrd(kit);
