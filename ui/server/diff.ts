@@ -1,21 +1,26 @@
 /**
  * Task diff serving (ui/PRD.md §11.2 + §11.4 + Appendix A.2/A.3):
- *   GET /api/tasks/:id/diff        persisted patch (+stats side-car); 404 if none
- *   GET /api/tasks/:id/diff/live   compute vs the task baseline on demand; 409
- *                                  when the task is not the current in-flight one
+ *   GET /api/tasks/:id/diff        persisted patch (+stats side-car) for the
+ *                                  current plan revision; 404 if none; legacy
+ *                                  pre-revision artifacts labeled historical
+ *   GET /api/tasks/:id/diff/live   the in-flight task's LATEST FROZEN
+ *                                  CHECKPOINT, tree-to-tree; 409 when the task
+ *                                  is not in flight OR before its first
+ *                                  checkpoint (stated reason)
  *   GET /api/artifacts[:name]      artifact list / text; names validated,
  *                                  5 MiB text cap, larger → metadata + download
  *
  * The git work is the engine's own display seam (src/util/git.ts
- * computeDisplayPatch): same exclusions (.orch/**, router.md, PROMPT.md), same
- * 5 MiB cap. Live diffs are NEVER persisted and the lock is never taken — all
- * reads here are side-car/artifact filesystem reads plus git plumbing against
- * the baseline tree, so the lock contract of §11.1 stays intact.
+ * diffDisplayTrees): same exclusions (.orch/**, router.md, PROMPT.md), same
+ * 5 MiB cap. Live diffs read a frozen checkpoint's immutable trees — never
+ * the operator checkout — and are NEVER persisted; the lock is never taken —
+ * all reads here are side-car/artifact filesystem reads plus pure tree-to-tree
+ * git plumbing, so the lock contract of §11.1 stays intact.
  */
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve as resolvePath, sep } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
-import { computeDisplayPatch, diffDisplayTrees, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
+import { diffDisplayTrees, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
 import type { DiffStats, DisplayDiffStats } from "../../src/util/git.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
 import type { WaveRow } from "../../src/engine/infos.ts";
@@ -39,21 +44,55 @@ export function validateTaskId(taskId: string): Validation {
 	return { ok: true };
 }
 
+/**
+ * Where a task's persisted diff lives. P15: the CURRENT plan revision's
+ * newest revision-qualified candidate artifact
+ * (`candidate-<revision>-<task>-w<N>.patch`, mirroring the core readout's
+ * selection) is the only "current" patch — a legacy `task-*.patch` /
+ * `quarantined-*` artifact is served ONLY when no plan revision is known at
+ * all (pre-P14 project), labeled `historical` (no receipt backing it), and is
+ * never selected for a new revision that reuses a task id.
+ */
 export interface PatchLocation {
 	task: string;
 	patch: string;
 	patchPath: string;
 	stats?: string;
 	statsPath?: string;
+	/** legacy artifact from a pre-revision kit run — display only, no receipt. */
+	historical?: boolean;
 }
 
-/**
- * Where a task's persisted diff lives: done tasks → `task-<id>.patch`,
- * quarantined ones → the newest `quarantined-<id>-w<N>.patch`. The stats
- * side-car (when present) sits beside the patch. Names are re-validated
- * against §11.4 even though they are constructed here.
- */
+/** The current plan revision from the status side-car (undefined when unknown). */
+async function currentPlanRevision(root: string): Promise<string | undefined> {
+	const payload = await readJson<StatusPayloads>(join(root, ".orch", "status.json")).catch(() => undefined);
+	return typeof payload?.planRevision === "string" ? payload.planRevision : undefined;
+}
+
 export async function locateTaskDiff(root: string, taskId: string): Promise<PatchLocation | undefined> {
+	const revision = await currentPlanRevision(root);
+	if (revision) {
+		// Revision-qualified selection — the same rule the core readout applies.
+		// A revision exists but no candidate artifact for this task → 404: a
+		// legacy same-named artifact must never present as current.
+		const prefix = `candidate-${revision}-${taskId}-w`;
+		let bestWave = 0;
+		let bestName: string | undefined;
+		try {
+			for (const name of await readdir(join(root, ".orch", "artifacts"))) {
+				if (!name.startsWith(prefix) || !name.endsWith(".patch")) continue;
+				const wave = Number(/-w(\d+)\.patch$/.exec(name)?.[1]);
+				if (Number.isSafeInteger(wave) && wave > bestWave) {
+					bestWave = wave;
+					bestName = name;
+				}
+			}
+		} catch {
+			/* no artifacts dir → no diff */
+		}
+		return bestName ? located(root, taskId, bestName, false) : undefined;
+	}
+	// No known revision (pre-P14 project): legacy names, labeled historical.
 	const candidates = [`task-${taskId}.patch`];
 	try {
 		const names = await readdir(join(root, ".orch", "artifacts"));
@@ -68,21 +107,28 @@ export async function locateTaskDiff(root: string, taskId: string): Promise<Patc
 		/* no artifacts dir → no diff */
 	}
 	for (const patch of candidates) {
-		const patchPath = join(root, ".orch", "artifacts", patch);
-		if (!validateName(patch) || livesOutsideArtifacts(root, patchPath)) continue;
-		const meta = await stat(patchPath).catch(() => undefined);
-		if (!meta?.isFile()) continue;
-		const statsName = patch.replace(/\.patch$/, ".json");
-		const statsPath = join(root, ".orch", "artifacts", statsName);
-		const statsMeta = validateName(statsName) ? await stat(statsPath).catch(() => undefined) : undefined;
-		return {
-			task: taskId,
-			patch,
-			patchPath,
-			...(statsMeta?.isFile() ? { stats: statsName, statsPath } : {}),
-		};
+		const locatedPatch = located(root, taskId, patch, true);
+		if (locatedPatch) return locatedPatch;
 	}
 	return undefined;
+}
+
+/** Validate + stat one constructed artifact name (§11.4 even for our own names). */
+async function located(root: string, taskId: string, patch: string, historical: boolean): Promise<PatchLocation | undefined> {
+	const patchPath = join(root, ".orch", "artifacts", patch);
+	if (!validateName(patch) || livesOutsideArtifacts(root, patchPath)) return undefined;
+	const meta = await stat(patchPath).catch(() => undefined);
+	if (!meta?.isFile()) return undefined;
+	const statsName = patch.replace(/\.patch$/, ".json");
+	const statsPath = join(root, ".orch", "artifacts", statsName);
+	const statsMeta = validateName(statsName) ? await stat(statsPath).catch(() => undefined) : undefined;
+	return {
+		task: taskId,
+		patch,
+		patchPath,
+		...(historical ? { historical: true } : {}),
+		...(statsMeta?.isFile() ? { stats: statsName, statsPath } : {}),
+	};
 }
 
 function livesOutsideArtifacts(root: string, resolved: string): boolean {
@@ -106,6 +152,8 @@ export interface TaskDiffPayload {
 	/** parsed stats side-car when present */
 	statsJson?: DisplayDiffStats;
 	baselineTreeSha?: string;
+	/** P15: a legacy pre-revision artifact — display only, no receipt backs it. */
+	historical?: boolean;
 }
 
 export type Api<T> = { ok: true; payload: T } | { ok: false; status: number; error: string; detail?: Record<string, unknown> };
@@ -131,6 +179,7 @@ export async function readTaskDiff(root: string, taskId: string): Promise<Api<Ta
 		bytes: (await stat(located.patchPath).catch(() => ({ size: 0 }))).size,
 		truncated: false,
 		diff: text,
+		...(located.historical ? { historical: true } : {}),
 	};
 	if (located.statsPath) {
 		const stats = await readJson<DisplayDiffStats>(located.statsPath).catch(() => undefined);
@@ -148,21 +197,31 @@ export async function readTaskDiff(root: string, taskId: string): Promise<Api<Ta
 export interface LiveDiffPayload {
 	at: number;
 	task: string;
+	/** the frozen checkpoint's wave (a previous wave's checkpoint can be the
+	 *  latest frozen one while a retry wave is mid-flight — the label says). */
 	wave: number;
+	/** the checkpoint's base tree (start-of-wave tree). */
 	baselineTreeSha: string;
+	/** P15: the checkpoint's freeze timestamp — the drawer's "frozen at" label. */
+	frozenAt: number;
 	/** response diff bytes (≤ 5 MiB cap) */
 	bytes: number;
 	truncated: boolean;
-	/** patch TEXT vs the task baseline; "" + note when nothing changed yet */
+	/** patch TEXT between the frozen trees; "" + note when nothing displayable */
 	diff: string;
 	stats: DiffStats;
 	note?: string;
 }
 
 /**
- * GET /api/tasks/:id/diff/live body: the current tree vs the in-flight task's
- * baseline. Reads ONLY .orch/status.json (side-car; the run owns the lock) and
- * runs git plumbing — never persisted, never blocks the run.
+ * GET /api/tasks/:id/diff/live body (P15): the requested task's LATEST FROZEN
+ * CHECKPOINT — a tree-to-tree display diff between the checkpoint's immutable
+ * base tree and candidate tree. Reads ONLY .orch/status.json (side-car; the
+ * run owns the lock) and runs pure git tree-to-tree plumbing: no working-copy
+ * read, no staging, no temporary index, nothing persisted — later
+ * operator-checkout edits are not task changes and cannot leak in. Before the
+ * first frozen checkpoint the answer is 409 with the reason (never a
+ * fabricated empty patch).
  */
 export async function liveTaskDiff(root: string, taskId: string): Promise<Api<LiveDiffPayload>> {
 	const id = validateTaskId(taskId);
@@ -176,30 +235,39 @@ export async function liveTaskDiff(root: string, taskId: string): Promise<Api<Li
 			detail: { phase: payload?.phase ?? "unknown", currentTask: payload?.task?.id },
 		};
 	}
-	const baseline = payload.tasks.find((t) => t.id === taskId)?.baselineTreeSha;
-	if (!baseline) {
+	const checkpoint = payload.checkpoint;
+	if (!checkpoint) {
 		return {
 			ok: false,
 			status: 409,
-			error: "live diff unavailable — the status side-car does not carry this task's baseline (older kit flush)",
+			error: `no frozen checkpoint yet for ${taskId} — the wave is before its first checkpoint (the candidate has not been frozen); there is nothing task-attributable to show`,
+			detail: { phase: payload.phase, currentTask: payload.task.id, checkpoint: "none" },
 		};
 	}
-	const computed = await computeDisplayPatch(root, baseline);
+	const computed = await diffDisplayTrees(root, checkpoint.baseTree, checkpoint.candidateTree);
+	const base = {
+		at: Date.now(),
+		task: taskId,
+		wave: checkpoint.wave,
+		baselineTreeSha: checkpoint.baseTree,
+		frozenAt: checkpoint.asOf,
+		stats: computed.ok ? computed.stats : { files: [], totalInsertions: 0, totalDeletions: 0 },
+	};
 	if (!computed.ok) {
-		return { ok: true, payload: emptyLive(taskId, payload.task.wave, baseline, computed.reason) };
+		return {
+			ok: true,
+			payload: {
+				...base,
+				bytes: 0,
+				truncated: false,
+				diff: "",
+				note: computed.reason ?? "no display diff between the frozen checkpoint trees",
+			},
+		};
 	}
 	return {
 		ok: true,
-		payload: {
-			at: Date.now(),
-			task: taskId,
-			wave: payload.task.wave,
-			baselineTreeSha: baseline,
-			bytes: computed.bytes,
-			truncated: computed.truncated,
-			diff: computed.text,
-			stats: computed.stats,
-		},
+		payload: { ...base, bytes: computed.bytes, truncated: computed.truncated, diff: computed.text },
 	};
 }
 
@@ -310,20 +378,6 @@ export async function waveTaskDiff(root: string, taskId: string, waveRaw: unknow
 	return {
 		ok: true as const,
 		payload: { ...base, bytes: computed.bytes, truncated: computed.truncated, diff: computed.text },
-	};
-}
-
-function emptyLive(task: string, wave: number, baseline: string, reason?: string): LiveDiffPayload {
-	return {
-		at: Date.now(),
-		task,
-		wave,
-		baselineTreeSha: baseline,
-		bytes: 0,
-		truncated: false,
-		diff: "",
-		stats: { files: [], totalInsertions: 0, totalDeletions: 0 },
-		note: reason ?? "no display diff yet",
 	};
 }
 

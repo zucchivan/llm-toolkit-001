@@ -94,11 +94,11 @@
 					<td class="mono muted">{task.dependsOn.length ? task.dependsOn.join(", ") : "—"}</td>
 					<td class="mono">
 						{#if task.diff}
-							<button class="btn tiny" title={task.status === "quarantined" ? "quarantine patch + its stats (rolled back)" : `task diff — cumulative since baseline, ${task.waveCount >= 0 ? task.waveCount : "?"} wave(s)`} onclick={() => onOpenDiff(task.id)}>
+								<button class="btn tiny" title={task.status === "quarantined" ? "the retained candidate patch + its stats — the workspace-recovery receipt label rides the drawer, never the status" : `task diff — cumulative since baseline, ${task.waveCount >= 0 ? task.waveCount : "?"} wave(s)`} onclick={() => onOpenDiff(task.id)}>
 								diff
 							</button>
 						{:else if task.status === "in_progress"}
-							<button class="btn tiny live-diff" title="live preview — the tree vs the task baseline, right now; nothing is persisted" onclick={() => onOpenDiff(task.id)}>
+							<button class="btn tiny live-diff" title="live view — the latest frozen checkpoint, tree-to-tree; nothing is persisted" onclick={() => onOpenDiff(task.id)}>
 								live
 							</button>
 						{:else}

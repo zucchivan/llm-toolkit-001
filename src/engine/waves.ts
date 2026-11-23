@@ -28,6 +28,9 @@ import {
 	assessFailureTriage, persistFailureTriageAssessment, type FailureTriageEvidence,
 } from "./failure-triage.ts";
 import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, waitOutSleep } from "./governor.ts";
+import {
+	admitSubmission, BudgetAdmissionError, isBudgetDenial, recordBudgetStop, refreshAdmissionHighWater,
+} from "./model-admission.ts";
 import { diffDisplayTrees } from "../util/git.ts";
 import { readCommit, readRef, resolveTree } from "../util/git-objects.ts";
 import { hostExecArgv } from "./recipe-runner.ts";
@@ -297,9 +300,9 @@ export async function runWaves(
 	}
 
 	// Resume a live rate-limit sleep from a previous run, if any.
-	await recomputeSpent(kit);
+	await refreshAdmissionHighWater(kit);
 	const slept = await waitOutSleep(kit);
-	if (slept) await recomputeSpent(kit);
+	if (slept) await refreshAdmissionHighWater(kit);
 
 	const summary: RunSummaryInfo = {
 		exit: "plan-complete",
@@ -359,15 +362,27 @@ export async function runWaves(
 			break;
 		}
 
-		// Budget ceiling first (§4.5): stop the loop before starting another wave.
-		const spent = await recomputeSpent(kit);
-		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] budget spent=$${spent.toFixed(6)} ceiling=$${kit.loop.config.budgets.sessionUsd}`);
-		if (spent > kit.loop.config.budgets.sessionUsd) {
+		// Budget ceiling first (§4.5 / M0-P16): the FRESH session high-water —
+		// observed spend at or above the ceiling (refusing at >=, incl. a zero
+		// ceiling) or unpriceable observed spend — stops the loop before
+		// starting another wave. A stop is a pause, never a reject; raising
+		// budgets.sessionUsd resumes the same pending stage.
+		const account = await refreshAdmissionHighWater(kit);
+		const ceiling = kit.loop.config.budgets.sessionUsd;
+		if (process.env["KIT_DEBUG"]) console.error(`[kit-debug] budget spent=$${account.spentUsd.toFixed(6)} ceiling=$${ceiling}`);
+		if (account.unpriced.length > 0 || account.spentUsd >= ceiling) {
+			const reason = account.unpriced.length > 0
+				? `observed spend is unpriceable — ${account.unpriced.join("; ")}`
+				: `session spend $${account.spentUsd.toFixed(4)} is at or above the ceiling $${ceiling.toFixed(4)}`;
 			summary.exit = "budget";
-			emit({ kind: "budget-stop", message: `budget reached at $${spent.toFixed(2)} of $${kit.loop.config.budgets.sessionUsd} — resume with \`run\`` });
+			summary.alert = `budget pause: ${reason}`;
+			emit({ kind: "budget-stop", message: summary.alert });
 			await commitState(kit, {
-				rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "budget-stop", detail: `spent $${spent.toFixed(2)}` }],
-				statusPhase: { phase: "idle", message: "budget ceiling" },
+				runStatus: (d) => {
+					d.activeAlert = summary.alert!.slice(0, 300);
+				},
+				rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "budget-stop", detail: reason }],
+				statusPhase: { phase: "idle", message: `${summary.alert} — raise budgets.sessionUsd in .orch/config.toml and rerun to resume` },
 			});
 			break;
 		}
@@ -418,6 +433,9 @@ export async function runWaves(
 		}
 		if (outcome === "budget") {
 			summary.exit = "budget";
+			const latestState = await readSessionState(kit.loop.harness);
+			summary.alert = latestState.runStatus.activeAlert;
+			emit({ kind: "budget-stop", message: summary.alert ?? "budget pause" });
 			break;
 		}
 		if (outcome === "quarantined") {
@@ -439,12 +457,29 @@ export async function runWaves(
 	return summary;
 }
 
-async function recomputeSpent(kit: LoopAndLock): Promise<number> {
-	const usage = await kit.loop.sessionUsage();
-	const state = await readSessionState(kit.loop.harness);
-	// spend = max(session usage estimate, last recorded accumulator) — usage is
-	// cumulative per storage; the accumulator adds throttled deltas.
-	return Math.max(usage.totalUsd, state.runStatus.budgetSpentUsd + usage.totalUsd - state.runStatus.budgetSpentUsd);
+/**
+ * A settled implementer outcome that carried the budget-denial marker: the
+ * transport guard stopped a dispatch mid-submission. Record the pause (the
+ * stage checkpoint stays pending; prior usage stays counted) and stop the
+ * task loop — never a model failure, a sleep, or a reject.
+ */
+async function implementerBudgetPause(
+	kit: LoopAndLock,
+	current: { id: string },
+	wave: WaveKey,
+	outcome: { usage: { usd: number } },
+	detail: unknown,
+): Promise<"budget"> {
+	const reason = isBudgetDenial(detail)
+		? "a provider dispatch inside the submission was paused by budget admission (tool follow-up, retry, or compaction)"
+		: "budget admission refused the submission";
+	await recordBudgetStop(kit, "implement", { planRevision: wave.planRevision, taskId: current.id, wave: wave.wave }, reason);
+	await commitState(kit, {
+		runStatus: (d) => {
+			d.budgetSpentUsd = Math.max(d.budgetSpentUsd, outcome.usage.usd);
+		},
+	});
+	return "budget";
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +565,20 @@ function checkpointValue(
 
 function submissionKey(wave: WaveKey, stage: "implement" | "primary" | "skeptic"): string {
 	return `kit:${wave.planRevision}:${wave.taskId}:w${wave.wave}:${stage}`;
+}
+
+/**
+ * A NEW submission attempt key after a checkpointed request reconciled to a
+ * TERMINAL failure: the durable request identity is derived from the wave's
+ * checkpoint-event count, so a crash between the checkpoint and the dispatch
+ * re-derives the same key and reacquires the same (never-dispatched)
+ * request instead of double-dispatching.
+ */
+function nextSubmissionAttemptKey(baseKey: string, receipts: ReceiptsDocValue, wave: WaveKey, stage: CheckpointStage): string {
+	const attempts = receipts.events.filter((event) => event.kind === "checkpoint"
+		&& event.value.planRevision === wave.planRevision && event.value.taskId === wave.taskId
+		&& event.value.wave === wave.wave && event.value.stage === stage).length;
+	return `${baseKey}#a${attempts + 1}`;
 }
 
 function checkpointView(wave: number, startTree: string, candidate: string): FrozenCheckpointView {
@@ -798,6 +847,7 @@ export async function driveTaskWaves(
 		});
 
 		let implementationOutcome: Awaited<ReturnType<ConversationKit["submitAndAwait"]>> | undefined;
+		let usageBefore = { usd: 0, totalTokens: 0 };
 		const resumeImplement = active?.stage === "implement" && active.state === "pending";
 		const startImplement = !active;
 		if (startImplement || resumeImplement) {
@@ -859,29 +909,69 @@ export async function driveTaskWaves(
 				await discardWorkspace(promptView).catch(() => {});
 			}
 			const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
+			if (startImplement) {
+				// M0-P16: the paid submission is admitted BEFORE any call. A refusal
+				// records the stop and pauses with no call — the wave never starts.
+				const admission = await admitSubmission(kit, "implement", { planRevision: identity.planRevision, taskId: current.id, wave });
+				if (!admission.admitted) return "budget";
+			}
+			// The wave warn uses the ACTUAL before→after delta of this submission
+			// attempt, not the conversation's cumulative session sum (which would
+			// double-count earlier waves of the same task).
+			usageBefore = await convKit.conversationUsage(Number(conversation.id));
 			implementationOutcome = await convKit.submitAndAwait(conversation, requestId, waveInput);
+			if (resumeImplement && implementationOutcome.status === "unanswered") {
+				// Reconcile-first: the same request was reacquired by its exact
+				// identity (a crash after admission settles it without a second
+				// wave). A TERMINAL failure under this key — a model error or a past
+				// budget denial — is never replayed and the key is never reused:
+				// checkpoint a NEW submission attempt for this unfinished pass only
+				// (prior usage stays counted) and dispatch it. Whether the pause
+				// still holds is the admission's call: it refuses (recording the
+				// stop) while the ceiling is still breached and admits after the
+				// human raises it. Rate-limit failures keep the durable-sleep path.
+				if (!looksLikeRateLimit(implementationOutcome.detail) && !looksLikeRateLimit(implementationOutcome.reason)) {
+					const attemptKey = nextSubmissionAttemptKey(active.submissionKey!, receipts, waveKey, "implement");
+					await commitState(kit, {
+						checkpoints: [stageCheckpoint("implement", "pending", {
+							conversationId: Number(conversation.id), submissionKey: attemptKey, outcome: "submitted",
+						})],
+					});
+					requestId = attemptKey;
+					const admission = await admitSubmission(kit, "implement", { planRevision: identity.planRevision, taskId: current.id, wave });
+					if (!admission.admitted) return "budget";
+					implementationOutcome = await convKit.submitAndAwait(conversation, requestId, waveInput);
+				}
+			}
 			await driverFault(opts, "after-implementer-submit");
-			if (implementationOutcome.status === "unanswered"
-				&& (looksLikeRateLimit(implementationOutcome.detail) || looksLikeRateLimit(implementationOutcome.reason))) {
-				const reason = implementationOutcome.reason ?? "rate limit";
-				const delay = parseResetDelay(implementationOutcome.detail) ?? parseResetDelay(reason) ?? 30 * 60;
-				await armRateLimitSleep(kit, {
-					until: Date.now() + delay * 1000,
-					reason: String(implementationOutcome.detail ?? reason).slice(0, 120),
-					taskId: current.id,
-					wave,
-					conversationId: Number(conversation.id),
-				});
-				await commitState(kit, {
-					runStatus: (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); },
-					rows: [
-						{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? reason).slice(0, 200), planRevision: identity.planRevision },
-						waveEndRow(current.id, wave, "sleeping", startTree, { planRevision: identity.planRevision }),
-					],
-					statusPhase: { phase: "idle", message: `${current.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
-				});
-				emit({ kind: "sleeping", taskId: current.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
-				return "sleeping";
+			if (implementationOutcome.status === "unanswered") {
+				// A denial inside the submission (tool follow-up, SDK retry, or
+				// compaction dispatch paused by the guard) is a budget pause —
+				// never a model failure, never a sleep, never a reject.
+				if (isBudgetDenial(implementationOutcome.detail) || isBudgetDenial(implementationOutcome.reason)) {
+					return await implementerBudgetPause(kit, current, waveKey, implementationOutcome, implementationOutcome.detail ?? implementationOutcome.reason);
+				}
+				if (looksLikeRateLimit(implementationOutcome.detail) || looksLikeRateLimit(implementationOutcome.reason)) {
+					const reason = implementationOutcome.reason ?? "rate limit";
+					const delay = parseResetDelay(implementationOutcome.detail) ?? parseResetDelay(reason) ?? 30 * 60;
+					await armRateLimitSleep(kit, {
+						until: Date.now() + delay * 1000,
+						reason: String(implementationOutcome.detail ?? reason).slice(0, 120),
+						taskId: current.id,
+						wave,
+						conversationId: Number(conversation.id),
+					});
+					await commitState(kit, {
+						runStatus: (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); },
+						rows: [
+							{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? reason).slice(0, 200), planRevision: identity.planRevision },
+							waveEndRow(current.id, wave, "sleeping", startTree, { planRevision: identity.planRevision }),
+						],
+						statusPhase: { phase: "idle", message: `${current.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
+					});
+					emit({ kind: "sleeping", taskId: current.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
+					return "sleeping";
+				}
 			}
 		}
 
@@ -920,9 +1010,15 @@ export async function driveTaskWaves(
 				};
 				runFailureRows = [{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: `run-failed:${implementationOutcome.reason ?? "unanswered"}`, detail: String(implementationOutcome.detail ?? "").slice(0, 200), planRevision: identity.planRevision }];
 			} else {
+				// The accumulator keeps the conversation's cumulative (session-sum)
+				// spend — prior usage is always counted; resume never double-charges.
+				// The warn, in contrast, uses the ACTUAL before→after delta of this
+				// submission attempt (submitAndAwait reads the usage doc after the
+				// run settles), never the cumulative sum.
 				runStatusUpdate = (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); };
-				if (implementationOutcome.usage.usd > kit.loop.config.budgets.waveUsdWarn) {
-					runFailureRows.push({ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "wave-usd-warn", detail: `$${implementationOutcome.usage.usd.toFixed(2)} > $${kit.loop.config.budgets.waveUsdWarn}`, planRevision: identity.planRevision });
+				const waveDelta = Math.max(0, implementationOutcome.usage.usd - usageBefore.usd);
+				if (waveDelta > kit.loop.config.budgets.waveUsdWarn) {
+					runFailureRows.push({ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "wave-usd-warn", detail: `$${waveDelta.toFixed(4)} this-wave delta (conversation total $${implementationOutcome.usage.usd.toFixed(4)}) > $${kit.loop.config.budgets.waveUsdWarn} warn`, planRevision: identity.planRevision });
 				}
 			}
 			await commitState(kit, {
@@ -1130,6 +1226,11 @@ export async function driveTaskWaves(
 			}
 			if (!verdict) {
 				const context = await taskContext();
+				// M0-P16: every verifier pass is a paid submission. Refusals and
+				// mid-pass denials surface as BudgetAdmissionError: the stop is
+				// already recorded, the pending pass checkpoint persists the
+				// paused stage, and the verified candidate is preserved — a stop
+				// is never a reject, so no verdict receipt is written.
 				const receiptsNow = await receiptSnapshot(kit);
 				const primaryCheckpoint = latestCheckpoint(receiptsNow, { ...waveKey, stage: "primary" })?.value;
 				const skepticCheckpoint = latestCheckpoint(receiptsNow, { ...waveKey, stage: "skeptic" })?.value;
@@ -1147,14 +1248,15 @@ export async function driveTaskWaves(
 					...(skepticCheckpoint?.state === "pending" && skepticCheckpoint.conversationId !== undefined && skepticCheckpoint.submissionKey
 						? { skeptic: { conversationId: skepticCheckpoint.conversationId, submissionKey: skepticCheckpoint.submissionKey } } : {}),
 				};
-				verdict = await runVerify(kit, {
-					id: current.id,
-					title: current.title,
-					spec: current.spec,
-					acceptance: current.acceptance,
-					baselineTreeSha: startTree,
-					targetPaths: current.targetPaths,
-				}, gateSummaryText(gateOutcome.results), {
+				try {
+					verdict = await runVerify(kit, {
+						id: current.id,
+						title: current.title,
+						spec: current.spec,
+						acceptance: current.acceptance,
+						baselineTreeSha: startTree,
+						targetPaths: current.targetPaths,
+					}, gateSummaryText(gateOutcome.results), {
 					skepticSecondPass: skepticRequired,
 					jevShadow: { enabled: kit.loop.config.gates.jevVerifierShadow, client: opts.judgmentClient },
 					executionContext: context,
@@ -1173,7 +1275,12 @@ export async function driveTaskWaves(
 						candidate, conversationId, submissionKey: key, outcome: result.verdict,
 					}),
 					afterPassCommitted: (pass) => driverFault(opts, pass === "primary" ? "after-primary" : "after-skeptic"),
-				});
+					resubmitAttemptKey: (pass, baseKey) => nextSubmissionAttemptKey(baseKey, receiptsNow, waveKey, pass),
+					});
+				} catch (error) {
+					if (!(error instanceof BudgetAdmissionError)) throw error;
+					return "budget";
+				}
 			}
 		}
 		if (!verdict) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no reconciled verifier result`);

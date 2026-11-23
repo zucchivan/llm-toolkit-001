@@ -12,6 +12,10 @@ export interface Baked {
 	project: Awaited<ReturnType<typeof prepareDemoProject>>;
 	kit: Awaited<ReturnType<typeof openProjectHarness>>;
 	models: { models: Models; faux: FauxProviderHandle };
+	/** The config TOML this project was baked with (reopen helpers rewrite it). */
+	configToml: string;
+	/** The faux-models builder the harness was opened with (reopen reuses it). */
+	buildFauxModels: BakeOptions["buildFauxModels"];
 }
 
 export interface BakeOptions {
@@ -32,7 +36,29 @@ export async function bakeProject(opts: BakeOptions): Promise<Baked> {
 
 	const models = opts.buildFauxModels([] as never[]);
 	const kit = await openProjectHarness(project.root, "test", { modelsOverride: models.models, retryMax: opts.retryMax });
-	return { project, kit, models };
+	const configToml = opts.configToml ?? (opts.budgetCeiling ? demoBudgetToml2(opts.budgetCeiling) : demoConfigToml());
+	return { project, kit, models, configToml, buildFauxModels: opts.buildFauxModels };
+}
+
+/** Replace the session ceiling line in a config TOML (M0-P16 pause/resume tests). */
+export function replaceSessionUsd(toml: string, sessionUsd: number): string {
+	return toml.replace(/^sessionUsd = .*$/m, `sessionUsd = ${sessionUsd}`);
+}
+
+/**
+ * Close a baked harness and reopen the SAME project with a (possibly new)
+ * config — the durable store, grant, checkpoints, and usage survive; the
+ * caller gets a FRESH faux provider whose callCount proves which submissions
+ * the resumed run dispatched. This is the raise-the-ceiling resume dance.
+ */
+export async function reopenProject(baked: Baked, configToml?: string): Promise<Baked> {
+	await baked.kit.loop.close().catch(() => {});
+	baked.kit.lock.release();
+	const toml = configToml ?? baked.configToml;
+	await writeConfig(baked.project.root, toml);
+	const models = baked.buildFauxModels([] as never[]);
+	const kit = await openProjectHarness(baked.project.root, "test", { modelsOverride: models.models });
+	return { project: baked.project, kit, models, configToml: toml, buildFauxModels: baked.buildFauxModels };
 }
 
 /** Budget-test config: rate-loaded roles + explicit session ceiling. */

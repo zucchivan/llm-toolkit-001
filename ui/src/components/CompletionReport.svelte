@@ -7,7 +7,7 @@
 	 * deferred to M5). Run again only when todo tasks remain.
 	 */
 	import type { ReadoutSnapshot, JobsPayload } from "../lib/api.ts";
-	import { deliveryReport, wholePlanComplete } from "../lib/view.ts";
+	import { deliveryReport, wholePlanComplete, receiptLabelsLine } from "../lib/view.ts";
 	import { usd, msDuration, relativeAge } from "../lib/format.ts";
 	import type { JobRecord } from "../../server/jobs.ts";
 
@@ -43,6 +43,12 @@
 	// phase (every task done), never a subset run's exit 0. Anything else with
 	// terminal rows is stopped-short, named as such.
 	const planComplete = $derived(wholePlanComplete(readout));
+	// P15: the four observed receipt labels for the latest receipt wave —
+	// review / checks / workspace recovery / publication, each "no receipt"
+	// when the receipt is absent (never derived from task status).
+	const receiptStates = $derived(readout.receiptStates);
+	const receiptsLine = $derived(receiptStates ? receiptLabelsLine(receiptStates) : undefined);
+	const checkpoint = $derived(readout.checkpoint);
 </script>
 
 <section class="panel">
@@ -77,6 +83,18 @@
 		</details>
 	{/if}
 
+	{#if receiptStates && receiptsLine}
+		<!-- P15: observed receipts, never derived — "discarded"/"published" appear
+		     ONLY on confirmed receipts; a quarantined task alone shows "no receipt". -->
+		<div class="diffmeta" style="padding:6px 16px 0; font-size:11.5px">
+			<span class="badge ph-planned" title="the four labels every report renders — review, checks, workspace recovery, publication — read from receipts; the journal stays authoritative">receipts</span>
+			<span class="mono">{receiptStates.taskId} w{receiptStates.wave}: {receiptsLine}</span>
+			{#if checkpoint}
+				<span class="muted mono" title={`frozen checkpoint: ${checkpoint.baseTree} → ${checkpoint.candidateTree}`}>frozen w{checkpoint.wave} · {new Date(checkpoint.asOf).toISOString()}</span>
+			{/if}
+		</div>
+	{/if}
+
 	<!-- §8.6 per-task diff access: terminal rows carry their diffs; todo rows stay silent -->
 	<table class="grid" aria-label="terminal tasks — status, id, title, waves, spend, diff" style="margin-top:6px">
 		<thead>
@@ -101,8 +119,8 @@
 					<td class="mono muted" title="per-task spend (usage joins in storage mode)">{usd(readout.usage.byTask[task.id]?.usd ?? 0)}</td>
 					<td class="mono">
 						{#if task.diff}
-							<button class="btn tiny" onclick={() => onOpenDiff(task.id)} title={task.status === "quarantined" ? "quarantine patch + stats (tree rolled back)" : `cumulative since baseline, ${task.waveCount} wave(s)`}>
-								{task.status === "quarantined" ? "patch (rolled back)" : "diff"}
+							<button class="btn tiny" onclick={() => onOpenDiff(task.id)} title={task.status === "quarantined" ? "the retained candidate patch + stats — the workspace-recovery receipt label rides the drawer, never the status" : `cumulative since baseline, ${task.waveCount} wave(s)`}>
+								{task.status === "quarantined" ? "patch" : "diff"}
 							</button>
 						{:else}
 							<span class="muted">—</span>

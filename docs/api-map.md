@@ -40,6 +40,11 @@ SDK values, re-exported by module:
   /providers/anthropic, /providers/openai, /providers/openrouter)
 - faux replay (pi-ai subpath /providers/faux): `fauxProvider`,
   `fauxAssistantMessage`, `fauxText`, `fauxToolCall`
+- budget denial stream (pi-ai subpath /utils/event-stream, M0-P16):
+  `modelStreamSetupError(model, error)` builds the dispatch guard's denial
+  stand-in — an AssistantMessageEventStream ending in an error message
+  (zero usage), so a refused dispatch settles like a provider error instead
+  of faulting the generation task
 - contexts (chord, beside the seam): `BACKGROUND_CONTEXT`, `withAbortSignal`
 - metadata: `readInstalledPiDurableVersion` — the kit's ONLY installed-version
   query; reads the pinned package.json through a seam-owned require so the pin
@@ -393,12 +398,43 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   `role: "verifier"`; STRICT JSON verdict parse — on any deviation the verdict
   degrades to `needs_human`, never silently approves
 
+## src/engine/model-admission.ts (M0-P16)
+
+- the single paid-submission gate: `admitSubmission(kit, stage, checkpoint)`
+  reads the fresh session high-water (max of the priced `sessionUsage()` total
+  and the recorded accumulator), syncs the `Models` dispatch guard snapshot,
+  and refuses at `>=` of `budgets.sessionUsd` (zero refuses everything) or
+  when observed spend is unpriceable — recording the stop (governor row +
+  alert + status) with NO provider call. Stages: `planner`, `implement`,
+  `primary`, `skeptic`, `verify`
+- `guardModelsDispatch(models, state, deniedStream)` wraps the session's
+  Models object before `Harness.open`: every chat/deferred dispatch (initial
+  request, tool follow-ups, SDK retries, compaction calls) checks the
+  high-water snapshot; a denial returns `kit.ts`'s
+  `modelStreamSetupError(model, error)` — an async setup-error stream that
+  settles `unanswered` with the `BUDGET_DENIAL_MARKER` detail (detected via
+  `isBudgetDenial`), never a synchronous throw that would fault the task
+- `budgetGuardExtension(state, price)`: the afterResponse hook that folds
+  each finished provider turn's priced usage into the snapshot
+- `recordBudgetStop` / `refreshAdmissionHighWater`: the committed stop row
+  and the run-boundary snapshot refresh
+- pricing lives in `src/util/budget.ts` `priceUsage`: reported cost, then
+  Models catalog (per-class rates), then config input/output rates; unpriced
+  cache deltas and unpriced previously used classes are `unknown`, never
+  approximated or labeled free; the faux provider's explicit zero-cost report
+  is a legitimate simulated zero
+- denial is a budget pause, not a model failure or sleep; a stop is never a
+  reject. Resubmission after a terminal failure mints a NEW attempt key
+  (never reusing the terminal one) for the unfinished pass only; resume
+  reconciles the same request first and prior usage stays counted
+
 ## src/engine/governor.ts
 
-- budget math over `harness.usage(Session)` — pi-ai `Usage` shapes; estimated
-  cost fallback via `roles.*.costPerMillionInput/Output`. Stops are based on
-  recorded/estimated spend, not a hard provider-bill guarantee; an admitted
-  in-flight request can exceed the ceiling
+- budget math over `harness.usage(Session)` — pi-ai `Usage` shapes; the
+  admission estimator (`priceUsage`, see model-admission) prices reported
+  cost first, then catalog, then `roles.*.costPerMillionInput/Output`.
+  Stops are based on recorded/estimated spend, not a hard provider-bill
+  guarantee; an admitted in-flight request can exceed the ceiling
 - rate-limit detection (`looksLikeRateLimit`) + reset parsing
   (`parseResetDelay`, e.g. "resets in 30m", "retry after", 429 reset fields);
   sleep via `tasks.ts` `kit.sleep`

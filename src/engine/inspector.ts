@@ -67,6 +67,54 @@ export interface KitIdentity {
 	at: number;
 }
 
+/**
+ * P15: the four receipt-derived labels every report renders — the CLI views
+ * and the UI share this ONE derivation so their wording can never drift.
+ * Receipts are observed facts: a missing receipt is "no receipt", never an
+ * inferred outcome (a quarantine row alone does not say "discarded"; an
+ * approval alone does not say "published").
+ */
+export interface ReceiptLabels {
+	/** Review passes: "accepted" when the acceptance receipt exists, else the
+	 *  newest recorded pass verdict, else "no receipt". */
+	review: string;
+	/** Gate receipt outcome: "pass" / "fail" / "no receipt". */
+	checks: string;
+	/** Workspace-disposal (rollback) receipt: "discarded" is ONLY ever the
+	 *  confirmed receipt; otherwise the recorded pending/failed/unknown state
+	 *  or "no receipt". */
+	recovery: string;
+	/** Delivery receipt: not requested / pending / published / failed /
+	 *  unknown, else the integration state as the publication pipeline's
+	 *  progress, else "no receipt". */
+	publication: string;
+}
+
+/** Derive the four P15 labels from the latest receipt-state projection. */
+export function receiptLabels(states: ReceiptStateView | undefined): ReceiptLabels {
+	const review = states?.acceptance === "accepted"
+		? "accepted"
+		: states?.primary !== undefined
+			? states.primary
+			: states?.skeptic !== undefined
+				? states.skeptic
+				: "no receipt";
+	const checks = states?.gate ?? "no receipt";
+	const recovery = states?.rollback ?? "no receipt";
+	const publication = states?.delivery !== undefined
+		? states.delivery === "not_requested" ? "not requested" : states.delivery
+		: states?.integration !== undefined
+			? states.integration === "integrated" ? "pending" : states.integration
+			: "no receipt";
+	return { review, checks, recovery, publication };
+}
+
+/** Render the four labels in the shared "k v · k v" report form (CLI + UI). */
+export function receiptLabelsLine(states: ReceiptStateView | undefined): string {
+	const labels = receiptLabels(states);
+	return `review ${labels.review} · checks ${labels.checks} · workspace recovery ${labels.recovery} · publication ${labels.publication}`;
+}
+
 export interface KitTaskView {
 	id: string;
 	title: string;

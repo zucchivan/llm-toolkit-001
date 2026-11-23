@@ -33,6 +33,7 @@ import { renderInspectPanel } from "./views/inspect.ts";
 import { renderStatusPanel } from "./views/status.ts";
 import { writeExports } from "./views/export.ts";
 import { runVerify } from "./engine/verifier.ts";
+import { BudgetAdmissionError } from "./engine/model-admission.ts";
 import { readJson, atomicWriteJson } from "./util/fsx.ts";
 import { runGatesCli } from "./adoption/cli.ts";
 
@@ -150,6 +151,12 @@ async function cmdPlan(argv: string[]): Promise<void> {
 		kit.lock.release();
 	} catch (err) {
 		kit?.lock.release();
+		if (err instanceof BudgetAdmissionError) {
+			// M0-P16: planning is a paid submission; its budget pause is exit 2.
+			we.error(`${c.yellow}plan stopped: budget${RESET} — ${err.reason}`);
+			process.exitCode = 2;
+			return;
+		}
 		fail(err, "plan");
 	}
 }
@@ -258,6 +265,17 @@ async function cmdRun(argv: string[]): Promise<void> {
 		}
 		if (summary.exit === "recovery-required") {
 			we.log(`\n${c.yellow}recovery required${RESET} — unresolved candidate effect for: ${summary.blockedIds.join(", ") || "(unknown task)"}; inspect receipts before retrying.${paperTrail}`);
+			process.exitCode = 2;
+			return;
+		}
+		if (summary.exit === "budget") {
+			// M0-P16: a budget pause is a policy stop (exit 2), never a reject —
+			// the pending stage/candidate survives and editing the ceiling resumes.
+			we.log(
+				`\n${c.yellow}run stopped: budget${RESET} — ${summary.alert ?? "session spend reached the configured ceiling"}. ` +
+					`Recorded spend is an estimate, not a provider bill cap (one admitted in-flight request can overrun). ` +
+					`Raise ${c.cyan}budgets.sessionUsd${RESET} in .orch/config.toml and rerun ${c.cyan}${CLI_NAME} run${RESET} to resume the same pending stage.${paperTrail}`,
+			);
 			process.exitCode = 2;
 			return;
 		}
@@ -503,6 +521,13 @@ async function cmdVerify(argv: string[]): Promise<void> {
 		we.log(JSON.stringify(result, null, 2));
 		if (result.verdict !== "approve") process.exitCode = 1;
 	} catch (err) {
+		if (err instanceof BudgetAdmissionError) {
+			// M0-P16: a one-off verify is a paid submission; a budget pause is a
+			// policy stop (exit 2), not an error or a verdict.
+			we.error(`${c.yellow}verify stopped: budget${RESET} — ${err.reason}`);
+			process.exitCode = 2;
+			return;
+		}
 		fail(err, "verify");
 	} finally {
 		if (frozenView) await discardWorkspace(frozenView).catch(() => {});

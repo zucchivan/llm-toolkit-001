@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { ReadoutSnapshot } from "../lib/api.ts";
 	import { msDuration, phaseLabel, relativeAge, healthLevel } from "../lib/format.ts";
-	import { healthAlertText } from "../lib/view.ts";
+	import { healthAlertText, receiptLabels } from "../lib/view.ts";
 	import type { JobRecord } from "../../server/jobs.ts";
 	import BudgetBar from "./BudgetBar.svelte";
 	import NotifyToggle from "./NotifyToggle.svelte";
@@ -31,6 +31,9 @@
 	const failingTitle = $derived(failing.length ? failing.map((c) => `${c.severity}: ${c.detail}`).join("\n") : "all checks pass");
 	const alertText = $derived(healthAlertText(readout.health));
 	const quarantined = $derived(readout.tasks.filter((t) => t.status === "quarantined"));
+	// P15: workspace recovery is a RECEIPT label — quarantined alone is "no
+	// receipt", never "rolled back" (only a confirmed discard receipt is).
+	const recoveryLabel = $derived(receiptLabels(readout.receiptStates).recovery);
 </script>
 
 <header style="padding:14px 0 10px">
@@ -104,9 +107,11 @@
 	{/if}
 
 	{#if quarantined.length > 0 && !readout.live}
-		<!-- §8.4: the rollback fact where the operator cannot miss it; the drawer carries cause + patch + baseline. Note the router phase can stay "running" after an exited run — the live wave is the freshness signal. -->
+		<!-- §8.4 (P15): the workspace-recovery RECEIPT label where the operator cannot miss it;
+		     the drawer carries cause + patch + baseline. Quarantine alone is not proof of
+		     rollback — the label says "discarded" only on a confirmed discard receipt. -->
 		<div class="banner error">
-			<strong>quarantined:</strong> {quarantined.length} task(s) exhausted their waves and the tree was rolled back to each baseline — evidence in their diff drawers ({quarantined.map((t) => t.id).join(", ")}); dependent tasks are blocked-by-dependency until a re-plan.
+			<strong>quarantined:</strong> {quarantined.length} task(s) exhausted their waves — workspace recovery: {recoveryLabel}; evidence in their diff drawers ({quarantined.map((t) => t.id).join(", ")}); dependent tasks are blocked-by-dependency until a re-plan.
 		</div>
 	{/if}
 

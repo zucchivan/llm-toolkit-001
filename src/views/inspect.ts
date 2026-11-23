@@ -5,7 +5,7 @@
  */
 import { ansi as b } from "../theme.ts";
 import type { KitReadout, InspectSectionName } from "../engine/inspector.ts";
-import { INSPECT_SECTIONS } from "../engine/inspector.ts";
+import { INSPECT_SECTIONS, receiptLabelsLine } from "../engine/inspector.ts";
 
 export interface InspectRenderOptions {
 	/** Positional section filter; empty/absent renders every section. */
@@ -47,6 +47,18 @@ export function renderInspectPanel(r: KitReadout, opts: InspectRenderOptions = {
 			lines.push(`${glyph} ${task.id.padEnd(24)} w${task.waveCount} ${deps}${paths} ${b.dim(task.title)}`);
 		}
 		if (r.tasks.length === 0) lines.push(b.dim("(no tasks — run `plan` first)"));
+	}
+
+	// P15: the four observed receipt labels (review / checks / workspace
+	// recovery / publication) for the latest receipt wave — never derived from
+	// task status: quarantine alone is not "discarded", approval alone is not
+	// "published".
+	if (show("tasks") && !opts.healthOnly && r.receiptStates) {
+		lines.push("", b.dim(`receipts (latest wave ${r.receiptStates.taskId} w${r.receiptStates.wave})`));
+		lines.push(`  ${receiptLabelsLine(r.receiptStates)}`);
+	}
+	if (show("tasks") && !opts.healthOnly && r.checkpoint) {
+		lines.push(b.dim(`  frozen checkpoint: wave ${r.checkpoint.wave} · ${r.checkpoint.baseTree.slice(0, 12)}… → ${r.checkpoint.candidateTree.slice(0, 12)}… · asOf ${new Date(r.checkpoint.asOf).toISOString()}`));
 	}
 
 	if (show("usage") && !opts.healthOnly) {

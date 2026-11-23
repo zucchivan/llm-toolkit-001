@@ -16,6 +16,7 @@ import type { RouterTask } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
 import { buildPlanIdentity, type ArchivedPlanRef } from "./plans.ts";
+import { admitSubmission, BudgetAdmissionError } from "./model-admission.ts";
 import type { Remediation } from "../adoption/types.ts";
 
 export class PlanParseError extends Error {}
@@ -79,6 +80,11 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 
 	const remediations = await loadApprovedRemediations(kitAndLock.loop.paths.root);
 	const remediationBrief = formatRemediationBrief(remediations);
+	// M0-P16: the planning conversation is a paid submission like any other —
+	// admitted before the first call. A refusal records the stop and surfaces
+	// as BudgetAdmissionError (the CLI maps it to exit 2, a budget pause).
+	const admission = await admitSubmission(kitAndLock, "planner");
+	if (!admission.admitted) throw new BudgetAdmissionError(admission.reason);
 	const outcome = await kit.submitAndAwait(
 		conv,
 		"kit-plan-v1",

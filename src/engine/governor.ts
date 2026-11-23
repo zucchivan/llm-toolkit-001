@@ -10,10 +10,7 @@
 import { defineTask, BACKGROUND_CONTEXT } from "./kit.ts";
 import type { LoopAndLock, LoopHarness } from "./harness.ts";
 import { commitState, readSessionState } from "./state.ts";
-import { usageUsd } from "../util/budget.ts";
 import { convId } from "./kit.ts";
-import type { UsageLike } from "../util/budget.ts";
-import type { CostRates } from "../util/budget.ts";
 import type { WaveRow } from "./infos.ts";
 
 // ---------------------------------------------------------------------------
@@ -32,20 +29,15 @@ export function budgetView(kit: LoopAndLock, spentUsd: number): BudgetView {
 	return { spentUsd, sessionUsd, waveWarnUsd: waveUsdWarn, remainingUsd: Math.max(0, sessionUsd - spentUsd) };
 }
 
-/** Session spend in USD, provider cost when reported, else role rates, else 0. */
+/**
+ * Session spend in USD — the priced total of a `sessionUsage()` account
+ * (reported cost, then config rates, then catalog, then the faux
+ * simulated-zero exemption; unpriced classes are excluded and listed in
+ * `usage.unpriced`, never labeled free).
+ */
 export function sessionSpentEstimate(kit: LoopAndLock, usage: Awaited<ReturnType<LoopHarness["sessionUsage"]>>): number {
-	const rates: Record<string, CostRates> = {};
-	for (const role of Object.values(kit.loop.config.roles)) {
-		rates[`${role.provider}/${role.modelId}`] = {
-			costPerMillionInput: (role as { costPerMillionInput?: number }).costPerMillionInput,
-			costPerMillionOutput: (role as { costPerMillionOutput?: number }).costPerMillionOutput,
-		};
-	}
-	let total = 0;
-	for (const [key, u] of Object.entries(usage.byModel)) {
-		total += usageUsd(u as unknown as UsageLike, rates[key]);
-	}
-	return total;
+	void kit;
+	return usage.totalUsd;
 }
 
 /** Estimated USD of ONE wave conversation readout (before/after delta). */

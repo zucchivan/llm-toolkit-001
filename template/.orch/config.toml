@@ -31,8 +31,13 @@ modelId = "openai/gpt-5-nano"
 # costPerMillionOutput = 0.4
 
 [budgets]
-sessionUsd = 10.0            # stop on observed estimated spend; not a hard bill cap (in-flight calls can overrun)
-waveUsdWarn = 2.0            # warn row when one wave's estimated spend crosses this
+sessionUsd = 10.0            # paid-submission ceiling: planner, every implementer retry, and each verifier pass are
+                             # admitted fresh and refused at >= (a zero ceiling refuses all paid work). Observed
+                             # spend that cannot be priced (no reported cost, catalog price, or rate for a used
+                             # class) pauses submissions too — it is never labeled free. Not a hard bill cap:
+                             # one admitted in-flight request can overrun, and there is no cost reservation.
+                             # Resume by raising this value and rerunning `run` — the paused stage continues.
+waveUsdWarn = 2.0            # warn row when one submission attempt's before→after spend delta crosses this
 maxConsecutiveErrors = 3     # persistent unanswered-run counter; cap ⇒ quarantine (not reset by answered waves in M0-P14)
 maxSleepCycles = 3           # rate-limit sleep round-trips per task across restarts
 

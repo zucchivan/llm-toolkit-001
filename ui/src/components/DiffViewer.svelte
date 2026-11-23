@@ -15,13 +15,13 @@
 		task,
 		live = false,
 		snapshot, // live mode: a new snapshot triggers one refetch (event-driven)
-		rolledBack = false, // quarantined: the tree no longer matches this diff
+		recovery = "no receipt", // P15: the receipt-derived workspace-recovery label (never inferred)
 		waves = 1, // task.waveCount for the cumulative label
 	}: {
 		task: string;
 		live?: boolean;
 		snapshot?: ReadoutSnapshot;
-		rolledBack?: boolean;
+		recovery?: string;
 		waves?: number;
 	} = $props();
 
@@ -132,15 +132,23 @@
 	<div class="diffmeta">
 		<span class="mono">task {task}</span>
 		<span class="muted label-cumulative">{waveLabel}</span>
-		{#if rolledBack}<span class="badge ph-quarantined" title="the working tree was rolled back to the baseline — this patch is the evidence of what was undone">rolled back</span>{/if}
+		<!-- P15: recovery is a RECEIPT label — "discarded" only when the rollback
+		     receipt confirms it; a quarantined status alone shows "no receipt". -->
+		<span class="badge {recovery === 'discarded' ? 'ph-quarantined' : 'ph-blocked'}" title="workspace recovery is read from the rollback receipt — never inferred from task status">recovery: {recovery}</span>
+		{#if doc?.historical === true}
+			<span class="badge ph-blocked" title="a legacy pre-revision artifact — display only; no receipt backs it and it is never the current revision's patch">historical — no receipt</span>
+		{/if}
 		{#if live}
-			<span class="badge ph-running" title="computed on demand vs the task baseline; nothing is persisted">live preview</span>
+			<span class="badge ph-running" title="the latest frozen checkpoint, tree-to-tree; computed on demand and never persisted">frozen checkpoint</span>
+			{#if doc?.frozenAt !== undefined}
+				<span class="muted" style="font-size:11px" title={`candidate frozen at ${new Date(doc.frozenAt).toISOString()}`}>frozen {new Date(doc.frozenAt).toISOString()}</span>
+			{/if}
 			<button class="btn tiny" onclick={() => void load()} disabled={loading}>{loading ? "…" : "refresh"}</button>
 		{/if}
 	</div>
 
 	{#if live}
-		<div class="banner diffbanner">live preview — may be incomplete: the wave is still running; this is the working tree vs the task baseline right now</div>
+		<div class="banner diffbanner">live view — the latest frozen checkpoint (wave {doc?.wave ?? "?"}), diffed tree-to-tree. Later operator-checkout edits are not task changes and never appear here; before the first checkpoint the server answers 409 with the reason.</div>
 	{/if}
 
 	{#if waveChoices.length && !live}
@@ -174,7 +182,9 @@
 			{:else if /unreadable/i.test(error)}
 			<strong>diff unreadable.</strong> {error} — the patch file exists but could not be read; nothing can be shown safely.
 			{:else if /not the current in-flight/i.test(error)}
-			<strong>live preview ended.</strong> {error} — the wave moved on; reopen for the persisted diff if one exists now.
+			<strong>live view ended.</strong> {error} — the wave moved on; reopen for the persisted diff if one exists now.
+			{:else if /no frozen checkpoint yet/i.test(error)}
+			<strong>before the first checkpoint.</strong> {error} — nothing is shown rather than a fabricated patch; the frozen view appears the moment the candidate is frozen.
 			{:else if /does not carry this task's baseline/i.test(error)}
 			<strong>live preview unavailable.</strong> {error}
 			{:else}

@@ -3,7 +3,7 @@
  * topological order + selection defaults, failure-row toasts.
  */
 import { describe, expect, it } from "vitest";
-import { decideView, topoOrder, jobOutcome, wholePlanComplete, runReportLine, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded, conversationGroups, conversationById, hashConversationDrawer, isConversationListHash, excerptErrorState, entryKindLabel, deliveryReport, windowedTail, EVENT_LOG_DOM_WINDOW, filterTasks, TASK_STATUSES } from "../src/lib/view.ts";
+import { decideView, topoOrder, jobOutcome, wholePlanComplete, runReportLine, failureRows, defaultSelection, selectableTasks, diffDrawerState, diffOpenable, latestDiffTask, hashDiffTask, orderedHealthChecks, healthAlertText, budgetBarData, filterWaveRows, globalShortcut, escapeTarget, modelPreflight, firstFailureLine, rolesNeeded, conversationGroups, conversationById, hashConversationDrawer, isConversationListHash, excerptErrorState, entryKindLabel, deliveryReport, windowedTail, EVENT_LOG_DOM_WINDOW, filterTasks, TASK_STATUSES, receiptLabels } from "../src/lib/view.ts";
 import type { RoleModelInfo } from "../src/lib/api.ts";
 import type { HealthCheck } from "../../src/engine/inspector.ts";
 import type { ReadoutSnapshot } from "../src/lib/api.ts";
@@ -11,7 +11,7 @@ import type { JobRecord } from "../server/jobs.ts";
 import type { KitReadout, KitTaskView, ConvSummary, ConvEntryView, DeliveryRow } from "../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../src/engine/infos.ts";
 
-function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "storage" | "sidecars"; storageTasks?: RouterTask[]; storageConversations?: ConvSummary[]; sleep?: ReadoutSnapshot["sleep"] }> = {}): ReadoutSnapshot {
+function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "storage" | "sidecars"; storageTasks?: RouterTask[]; storageConversations?: ConvSummary[]; sleep?: ReadoutSnapshot["sleep"]; receiptStates?: KitReadout["receiptStates"] }> = {}): ReadoutSnapshot {
 	return {
 		readout: {
 			at: 1,
@@ -26,6 +26,7 @@ function snap(over: Partial<{ phase: string; tasks: KitReadout["tasks"]; mode: "
 			delivery: { rows: [] },
 			artifacts: [],
 			health: [],
+			...(over.receiptStates ? { receiptStates: over.receiptStates } : {}),
 			...(over.storageTasks || over.storageConversations
 			? { storage: { router: { version: 1, phase: "planned", tasks: over.storageTasks ?? [] }, runStatus: { version: 1, budgetSpentUsd: 0, sleepCycleCount: 0, consecutiveErrors: 0, kitVersion: "k" }, conversations: over.storageConversations ?? [], reports: [] } }
 			: {}),
@@ -208,31 +209,77 @@ describe("failureRows (toast inputs)", () => {
 // ---------------------------------------------------------------------------
 
 describe("diffDrawerState", () => {
-	it("in_progress or the live task → live mode; done → persisted with wave label; quarantined → rolled back", () => {
+	it("in_progress or the live task → live mode; done → persisted; the recovery label comes from the receipt, never the status", () => {
 		const s = snap({
 			tasks: [
 				{ id: "t-live", title: "x", status: "in_progress", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 },
-				{ id: "t-done", title: "y", status: "done", waveCount: 2, dependsOn: [], targetPaths: [], priority: 1, feedback: 0, diff: { task: "t-done", patch: "task-t-done.patch", stats: "task-t-done.json", bytes: 99, truncated: false } },
-				{ id: "t-q", title: "z", status: "quarantined", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0, diff: { task: "t-q", patch: "quarantined-t-q-w1.patch", bytes: 10, truncated: false } },
+				{ id: "t-done", title: "y", status: "done", waveCount: 2, dependsOn: [], targetPaths: [], priority: 1, feedback: 0, diff: { task: "t-done", patch: "candidate-rev-t-done-w2.patch", stats: "candidate-rev-t-done-w2.json", bytes: 99, truncated: false } },
+				{ id: "t-q", title: "z", status: "quarantined", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0, diff: { task: "t-q", patch: "candidate-rev-t-q-w1.patch", bytes: 10, truncated: false } },
 			] as KitReadout["tasks"],
+			// P15: the latest receipt wave is t-q's — and its rollback receipt is
+			// still pending (quarantine row only) → "no receipt", NEVER "rolled back".
+			receiptStates: { planRevision: "rev", taskId: "t-q", wave: 1, gate: "fail", rollback: "pending" },
 		});
 		(s.readout as { live?: unknown }).live = { task: "t-live", wave: 1, startedAt: 1, elapsedMs: 5 };
 
 		const live = diffDrawerState(s, "t-live")!;
-		expect(live).toEqual({ task: "t-live", live: true, waves: 1, rolledBack: false });
+		expect(live).toEqual({ task: "t-live", live: true, waves: 1, workspaceRecovery: "no receipt" });
 		// the side-car's live task counts even when the task list hasn't caught up
 		const s2 = snap({ tasks: [{ id: "t-2", title: "t", status: "todo", waveCount: 0, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 }] as KitReadout["tasks"] });
 		(s2.readout as { live?: unknown }).live = { task: "t-2", wave: 1, startedAt: 1, elapsedMs: 5 };
 		expect(diffDrawerState(s2, "t-2")?.live).toBe(true);
 
 		const done = diffDrawerState(s, "t-done")!;
-		expect(done).toEqual({ task: "t-done", live: false, waves: 2, rolledBack: false });
+		expect(done).toEqual({ task: "t-done", live: false, waves: 2, workspaceRecovery: "no receipt" });
+		// a quarantined row alone does not say discarded — the pending receipt shows
 		const quarantined = diffDrawerState(s, "t-q")!;
-		expect(quarantined).toEqual({ task: "t-q", live: false, waves: 1, rolledBack: true });
+		expect(quarantined).toEqual({ task: "t-q", live: false, waves: 1, workspaceRecovery: "pending" });
+
+		// a CONFIRMED discard receipt is the only "discarded" source
+		const s3 = snap({
+			tasks: [{ id: "t-q", title: "z", status: "quarantined", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0 }] as KitReadout["tasks"],
+			receiptStates: { planRevision: "rev", taskId: "t-q", wave: 1, gate: "fail", rollback: "discarded" },
+		});
+		expect(diffDrawerState(s3, "t-q")?.workspaceRecovery).toBe("discarded");
 
 		expect(diffDrawerState(s, "ghost")).toBeUndefined();
 		expect(diffDrawerState(s, undefined)).toBeUndefined();
 		expect(diffDrawerState(undefined, "t-done")).toBeUndefined();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// M0-P15: the four receipt-derived labels (the core's derivation, re-exported)
+// ---------------------------------------------------------------------------
+
+describe("receiptLabels (P15)", () => {
+	const key = { planRevision: "rev", taskId: "t", wave: 1 };
+
+	it("a quarantine row alone is every label 'no receipt' or the recorded state — never 'discarded'", () => {
+		// only a gate fail exists (the quarantine path) — no rollback receipt
+		expect(receiptLabels({ ...key, gate: "fail" })).toEqual({ review: "no receipt", checks: "fail", recovery: "no receipt", publication: "no receipt" });
+		// a pending disposal is pending, not discarded
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "pending" }).recovery).toBe("pending");
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "unknown" }).recovery).toBe("unknown");
+		// only a CONFIRMED discard receipt says discarded
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "discarded" }).recovery).toBe("discarded");
+	});
+
+	it("review acceptance and publication failure stay separate; not_requested is two words", () => {
+		const labels = receiptLabels({ ...key, gate: "pass", primary: "approve", acceptance: "accepted", delivery: "failed" });
+		expect(labels.review).toBe("accepted");
+		expect(labels.publication).toBe("failed");
+		expect(labels.checks).toBe("pass");
+		// approval alone never implies delivery
+		expect(receiptLabels({ ...key, primary: "approve", acceptance: "accepted" }).publication).toBe("no receipt");
+		expect(receiptLabels({ ...key, delivery: "not_requested" }).publication).toBe("not requested");
+		// integration progress folds into publication only when no delivery receipt exists
+		expect(receiptLabels({ ...key, integration: "integrated" }).publication).toBe("pending");
+		expect(receiptLabels({ ...key, integration: "integrated", delivery: "published" }).publication).toBe("published");
+	});
+
+	it("undefined states (no receipts at all) are all 'no receipt'", () => {
+		expect(receiptLabels(undefined)).toEqual({ review: "no receipt", checks: "no receipt", recovery: "no receipt", publication: "no receipt" });
 	});
 });
 
@@ -262,13 +309,14 @@ describe("diffOpenable + latestDiffTask", () => {
 		expect(diffOpenable(readout.tasks[2]!, readout)).toBe(false);
 	});
 
-	it("newest diff patch wins: task-…patch parses to its id; quarantined names strip the wave", () => {
+	it("newest diff patch wins: candidate/task names parse to the task id (revision prefix stripped); quarantined legacy names strip the wave", () => {
 		expect(latestDiffTask([
-			{ name: "task-a.patch", kind: "diff", mtimeMs: 10 },
-			{ name: "task-a.json", kind: "diff", mtimeMs: 11 },
+			{ name: "candidate-11111111-2222-3333-4444-555555555555-a-w3.patch", kind: "diff", mtimeMs: 10 },
+			{ name: "task-a.patch", kind: "diff", mtimeMs: 11 },
 			{ name: "quarantined-b-w2.patch", kind: "diff", mtimeMs: 20 },
 			{ name: "report.json", kind: "other", mtimeMs: 99 },
 		])).toBe("b");
+		expect(latestDiffTask([{ name: "candidate-11111111-2222-3333-4444-555555555555-a-w3.patch", kind: "diff", mtimeMs: 30 }, { name: "quarantined-b-w2.patch", kind: "diff", mtimeMs: 20 }])).toBe("a");
 		expect(latestDiffTask([{ name: "task-a.patch", kind: "diff", mtimeMs: 30 }, { name: "quarantined-b-w2.patch", kind: "diff", mtimeMs: 20 }])).toBe("a");
 		expect(latestDiffTask(undefined)).toBeUndefined();
 		expect(latestDiffTask([{ name: "gate-x.log", kind: "gate", mtimeMs: 1 }])).toBeUndefined();

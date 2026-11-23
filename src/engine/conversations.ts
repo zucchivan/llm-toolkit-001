@@ -7,10 +7,10 @@
  */
 import type { Conversation, ToolRegistration } from "./kit.ts";
 import { BACKGROUND_CONTEXT, AssistantEntry, LiveDoc, UsageDoc, convId, entryId, idOfConversation } from "./kit.ts";
-import { LoopGuardDoc, estimateUsageUsd } from "./harness.ts";
+import { LoopGuardDoc, catalogRatesFor, roleRatesFor } from "./harness.ts";
 import type { LoopAndLock } from "./harness.ts";
 import type { RoleName } from "../config.ts";
-import type { CostRates } from "../util/budget.ts";
+import { priceUsage } from "../util/budget.ts";
 import type { ExecutionContext } from "./workspace.ts";
 
 export interface WaveOutcome {
@@ -124,22 +124,41 @@ export class ConversationKit {
 			.join("");
 	}
 
-	/** Conversation usage (pi.usage doc): estimated USD + total tokens. */
+	/**
+	 * Conversation usage (pi.usage doc): USD + total tokens, priced with the
+	 * SAME estimator as session admission (`priceUsage`): reported cost, then
+	 * config role rates, then the Models catalog, then the faux simulated-zero
+	 * exemption. Unpriced records contribute 0 here (they are surfaced by the
+	 * session account's `unpriced` list instead).
+	 */
 	async conversationUsage(conversationId: number): Promise<{ usd: number; totalTokens: number }> {
 		const usage = await this.kit.loop.harness.snapshot(UsageDoc, convId(conversationId), BACKGROUND_CONTEXT);
 		if (!usage) return { usd: 0, totalTokens: 0 };
 		let usd = 0;
 		let totalTokens = 0;
-		const rates: Record<string, CostRates> = {};
-		for (const role of Object.values(this.kit.loop.config.roles)) {
-			rates[`${role.provider}/${role.modelId}`] = {
-				costPerMillionInput: role.costPerMillionInput,
-				costPerMillionOutput: role.costPerMillionOutput,
-			};
-		}
+		const config = this.kit.loop.config;
 		for (const [key, record] of Object.entries(usage.models)) {
 			totalTokens += Number(record.totalTokens ?? 0);
-			usd += estimateUsageUsd(record, rates[key]);
+			const unwrapped = {
+				input: Number(record.input ?? 0),
+				output: Number(record.output ?? 0),
+				cacheRead: Number(record.cacheRead ?? 0),
+				cacheWrite: Number(record.cacheWrite ?? 0),
+				cost: {
+					input: Number(record.cost?.input ?? 0),
+					output: Number(record.cost?.output ?? 0),
+					cacheRead: Number(record.cost?.cacheRead ?? 0),
+					cacheWrite: Number(record.cost?.cacheWrite ?? 0),
+					total: Number(record.cost?.total ?? 0),
+				},
+			};
+			const slash = key.indexOf("/");
+			const priced = priceUsage(unwrapped, {
+				providerId: slash > 0 ? key.slice(0, slash) : key,
+				configRates: roleRatesFor(config, key),
+				catalogRates: catalogRatesFor(this.kit.loop.models, key),
+			});
+			if (priced.kind === "priced") usd += priced.usd;
 		}
 		for (const record of Object.values(usage.tools)) {
 			totalTokens += Number(record.totalTokens ?? 0);

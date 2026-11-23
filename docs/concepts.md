@@ -173,14 +173,43 @@ safe to run.
 
 All decisions append to `.orch/wave-log.jsonl` with a `reason`.
 
-- **Session ceiling** (`budgets.sessionUsd`): cumulative estimated spend from
-  `harness.usage()` — provider/catalog `Usage.cost.total` when reported, else
-  `tokens × roles.*.costPerMillion*` rates. On an observed breach the loop ends
-  gracefully (`resumable`; CLI prints the resume hint). This is not a hard bill
-  cap: pricing can be incomplete, and one admitted in-flight request can overrun
-  the ceiling.
-- **Wave warn** (`budgets.waveUsdWarn`): warn row when one wave's estimated
-  spend crosses the threshold.
+- **Paid-submission admission** (`budgets.sessionUsd`, M0-P16): ONE
+  `admitSubmission(stage, checkpoint)` gate guards every paid submission — the
+  planner conversation, every implementer retry, each verifier pass, and
+  one-off `verify` — reading the fresh session high-water before any call. It
+  refuses at `>=` (a zero ceiling refuses all paid work) and when observed
+  spend is unpriceable; the stop is recorded (governor row + status) and no
+  call is made. A `Models` dispatch guard wraps the session's Models object so
+  EVERY provider dispatch inside a submission — the first request, tool
+  follow-ups, SDK transport retries, compaction calls — passes the same
+  high-water check; an after-response hook folds each finished turn's priced
+  usage into the snapshot, so a submission that spends its allowance
+  mid-flight is stopped before its next dispatch. Denial is a distinctive
+  error the driver maps back to a budget pause — never a model failure, never
+  a sleep, never a reject: the paused stage checkpoint and the verified
+  candidate persist, and raising the ceiling resumes the same pass.
+- **Pricing, never free**: provider/catalog `Usage.cost.total` when reported,
+  else the Models catalog (per-class rates incl. cache classes), else
+  `roles.*.costPerMillion*` config rates for input/output only. An unpriced
+  cache delta is NEVER folded into the input rate (no flat-input
+  approximation) — it pauses submissions; a previously used nonzero class
+  with no price anywhere is likewise never labeled free. Fixture/faux
+  providers may legitimately report simulated zero.
+- **Stop ≠ reject; resume reconciles first**: an interrupted submission is
+  reacquired by its exact request identity first (no second wave, no double
+  charge — prior usage is always counted). A terminal failure is never
+  replayed and its key never reused: the driver checkpoints a NEW submission
+  attempt for the unfinished pass only. The wave warn compares the ACTUAL
+  before→after delta of one submission attempt; the accumulator keeps the
+  session-sum so resume never re-charges.
+- **Session ceiling** (`budgets.sessionUsd`): the loop-top check uses the
+  same fresh account (`>=`, incl. zero). Recorded spend is an estimate, not
+  a hard bill cap: hidden transport retries and external services inside a
+  provider implementation are visible only once usage lands, and one admitted
+  in-flight request can overrun the ceiling. There is no speculative cost
+  reservation and no provider-level midstream credit enforcement.
+- **Wave warn** (`budgets.waveUsdWarn`): warn row when one submission
+  attempt's before→after spend delta crosses the threshold.
 - **Zero-progress breaker**: a wave that produces no changes from its own
   start tree to its frozen candidate is quarantined immediately — no
   `retryLimit` burn, even if the task has cumulative changes from prior waves.

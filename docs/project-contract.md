@@ -43,7 +43,19 @@ effect receipts.
   `thinkingLevel`, `costPerMillionInput`, and `costPerMillionOutput` provide
   thinking configuration and USD-rate fallback for budget estimates when
   providers/catalogs do not report cost.
-- `[budgets]` — `sessionUsd` (observed/estimated spend stop, not a hard provider-bill cap), `waveUsdWarn`, `maxConsecutiveErrors`, `maxSleepCycles`. An admitted in-flight request can exceed the ceiling.
+- `[budgets]` — `sessionUsd` is the paid-submission ceiling (M0-P16): the
+  planner, every implementer retry, each verifier pass, and one-off `verify`
+  are admitted fresh and refused at `>=` (zero refuses all paid work); the
+  Models dispatch guard also covers every provider dispatch inside a
+  submission (tool follow-ups, SDK retries, compaction). Unpriceable observed
+  spend pauses submissions with a distinct reason — never approximated,
+  never labeled free. A stop is a pause, not a reject: the paused stage
+  checkpoint and verified candidate persist, and raising `sessionUsd`
+  resumes the same pass (terminal failures are never replayed; request keys
+  are never reused). Also `waveUsdWarn` (per-attempt before→after delta),
+  `maxConsecutiveErrors`, `maxSleepCycles`. Not a hard provider-bill cap: an
+  admitted in-flight request can exceed the ceiling and there is no cost
+  reservation.
 - gate recipes — `[name]` tables in `evals/recipes.toml` and approved
   `evals/recipes.auto.toml`: EXACTLY ONE command form each — legacy `cmd`
   (trimmed and split on whitespace only; shell quoting/pipes/redirections/

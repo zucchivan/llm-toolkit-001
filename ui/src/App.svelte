@@ -220,7 +220,7 @@
 	}
 
 	// --- diff drawer + hash deep links (#/diff/<task>, §7.1) — M2's evidence view
-	// The task id is the drawer state; live/rolledBack/waves derive from the
+	// The task id is the drawer state; live/workspaceRecovery/waves derive from the
 	// snapshot (lib/view.ts diffDrawerState) so the drawer stays truthful as the
 	// run progresses between snapshots.
 	let diffDrawerTask = $state<string | undefined>(undefined);
@@ -470,7 +470,7 @@
 			<button class="btn tiny" onclick={closeDiff}>close</button>
 		</div>
 		{#key drawer.task}
-			<DiffViewer task={drawer.task} live={drawer.live} {snapshot} rolledBack={drawer.rolledBack} waves={drawer.waves} />
+			<DiffViewer task={drawer.task} live={drawer.live} {snapshot} recovery={drawer.workspaceRecovery} waves={drawer.waves} />
 		{/key}
 	</div>
 {:else if unknownDrawerTask}

@@ -28,6 +28,7 @@ import {
 	openNodeSqliteStorage,
 	openrouterProvider,
 	readInstalledPiDurableVersion,
+	modelStreamSetupError,
 	ToolTask,
 } from "./kit.ts";
 import type { Context, ConversationDocToken, Extension, Models, Provider, Session, SetTimer, ToolRegistration, Usage } from "./kit.ts";
@@ -38,8 +39,15 @@ import type { LockHandle } from "../util/lockfile.ts";
 import { exists as fileExists, atomicWriteJson } from "../util/fsx.ts";
 import { loadConfig, KIT_VERSION } from "../config.ts";
 import type { KitConfig } from "../config.ts";
-import { usageUsd, type CostRates } from "../util/budget.ts";
+import { priceUsage, usageUsd, type CatalogClassRates, type CostRates } from "../util/budget.ts";
 import type { FrozenCheckpointView, ReceiptStateView } from "./receipts.ts";
+import {
+	budgetGuardExtension,
+	createBudgetGuardState,
+	guardModelsDispatch,
+	usagePricerFor,
+type BudgetGuardState,
+} from "./model-admission.ts";
 
 export { LockBusyError, KIT_VERSION };
 
@@ -261,8 +269,12 @@ export interface LoopHarness {
 	toolBox: { read: ToolRegistration; write: ToolRegistration; edit: ToolRegistration; bash: ToolRegistration };
 	/** ring buffer of harness reports (task_faulted, task_interrupted, …) since open */
 	reports: ReportRow[];
-	/** Session-wide spend in USD via pi-ai usage (roles' config rates as fallback). */
-	sessionUsage(): Promise<{ totalUsd: number; tokens: number; byModel: Record<string, Usage> }>;
+	/** Session-wide spend in USD via pi-ai usage (reported cost, then catalog, then config rates).
+	 *  `unpriced` names classes whose observed spend cannot be priced — never
+	 *  labeled free; they pause the next paid submission instead. */
+	sessionUsage(): Promise<{ totalUsd: number; tokens: number; byModel: Record<string, Usage>; unpriced: string[] }>;
+	/** The budget dispatch guard's high-water snapshot (M0-P16). */
+	budgetGuard: BudgetGuardState;
 	close(): Promise<void>;
 }
 
@@ -301,18 +313,29 @@ export async function openProjectHarness(
 		// Models registry), so inspection never constructs a provider object or
 		// resolves its credentials — even for providers a real run would wire.
 		// Tests still inject their scripted faux overlay via modelsOverride.
-		const models =
+		const rawModels =
 			opts.modelsOverride ??
 			faux?.models ??
 			(opts.readView === true
 				? createModels()
 				: buildModels(Object.values(config.roles).map((r) => r.provider), { fauxOverlay: faux !== undefined }));
 
+		// M0-P16: the budget dispatch guard wraps EVERY Models object before it
+		// reaches the harness, so each provider dispatch (initial request, tool
+		// follow-up, SDK retry, compaction call) passes the high-water check.
+		const budgetGuard = createBudgetGuardState(config.budgets.sessionUsd);
+		const price = usagePricerFor(
+			(key) => roleRatesFor(config, key),
+			(key) => catalogRatesFor(rawModels, key),
+		);
+		const models = guardModelsDispatch(rawModels, budgetGuard, (model, error) => modelStreamSetupError(model, error));
+
 		const tools: ToolRegistration[] = [createReadTool(), createWriteTool(), createEditTool(), createBashTool()];
 		const registry = createRegistry();
 		registry.install(defineExtension({ name: "kit-tools", tools }));
 		registry.install(structuredBoundaryExtension());
 		registry.install(defineExtension({ name: "kit-governor", tasks: [GovernorSleep] }));
+		registry.install(budgetGuardExtension(budgetGuard, price));
 
 		const reports: ReportRow[] = [];
 		const push = (row: ReportRow) => {
@@ -355,7 +378,8 @@ export async function openProjectHarness(
 				models,
 				toolBox: { read: tools[0]!, write: tools[1]!, edit: tools[2]!, bash: tools[3]! },
 				reports,
-				sessionUsage: () => computeSessionUsage(harness, config),
+				budgetGuard,
+				sessionUsage: () => computeSessionUsage(harness, config, rawModels),
 				close: async () => {
 					await harness.close(BACKGROUND_CONTEXT);
 				},
@@ -367,20 +391,56 @@ export async function openProjectHarness(
 	}
 }
 
-/** Session totals in USD (provider/catalog cost first, config rates as fallback). */
-export async function computeSessionUsage(harness: Harness, config: KitConfig): Promise<{ totalUsd: number; tokens: number; byModel: Record<string, Usage> }> {
+/**
+ * Session totals in USD and the unpriced-class list. Pricing is the admission
+ * estimator (`priceUsage`): SDK-reported cost first, then config rates
+ * (unpriced cache deltas are unpriced, never folded into the input rate),
+ * then the Models catalog, then the faux simulated-zero exemption. Classes
+ * that cannot be priced are EXCLUDED from the total (never labeled free) and
+ * reported in `unpriced` — the next paid submission pauses on them.
+ */
+export async function computeSessionUsage(harness: Harness, config: KitConfig, models?: Models): Promise<{ totalUsd: number; tokens: number; byModel: Record<string, Usage>; unpriced: string[] }> {
 	const usage = await harness.usage(BACKGROUND_CONTEXT);
 	let totalUsd = 0;
 	let tokens = 0;
+	const unpriced: string[] = [];
 	const byModel: Record<string, Usage> = {};
 	for (const [key, record] of Object.entries(usage.models)) {
 		const u = unwrapUsage(record);
 		byModel[key] = u;
 		tokens += u.input + u.output + u.cacheRead + u.cacheWrite;
-		const rates: CostRates | undefined = roleRatesFor(config, key);
-		totalUsd += usageUsd(u, rates);
+		const slash = key.indexOf("/");
+		const priced = priceUsage(u, {
+			providerId: slash > 0 ? key.slice(0, slash) : key,
+			configRates: roleRatesFor(config, key),
+			catalogRates: models ? catalogRatesFor(models, key) : undefined,
+		});
+		if (priced.kind === "priced") totalUsd += priced.usd;
+		else unpriced.push(`${key}: ${priced.reason}`);
 	}
-	return { totalUsd, tokens, byModel };
+	return { totalUsd, tokens, byModel, unpriced };
+}
+
+/**
+ * Catalog rates for one `provider/modelId` usage key from a Models registry.
+ * Model ids may contain `/` (e.g. openrouter/openai/gpt-5-nano), so the key
+ * splits at the FIRST slash. An absent class (or an all-zero catalog, which
+ * means "no price data") yields undefined — the caller falls back to config
+ * rates or the simulated-zero/unknown decision.
+ */
+export function catalogRatesFor(models: Models, key: string): CatalogClassRates | undefined {
+	const slash = key.indexOf("/");
+	if (slash <= 0) return undefined;
+	const model = models.getModel(key.slice(0, slash), key.slice(slash + 1));
+	const cost = model?.cost;
+	if (!cost) return undefined;
+	const rates: CatalogClassRates = {
+		input: Number(cost.input ?? 0),
+		output: Number(cost.output ?? 0),
+		cacheRead: Number(cost.cacheRead ?? 0),
+		cacheWrite: Number(cost.cacheWrite ?? 0),
+	};
+	return rates.input || rates.output || rates.cacheRead || rates.cacheWrite ? rates : undefined;
 }
 
 /** pi.usage stores usage as JSON-ish records; safe narrow to the Usage shape. */
@@ -403,7 +463,11 @@ function unwrapUsage(record: unknown): Usage {
 	};
 }
 
-/** USD estimator over a Usage record using role rates; catalog total kept as-is. */
+/**
+ * DISPLAY-ONLY USD estimator over a Usage record (readouts/conversation
+ * summaries): reported cost first, else config rates on input/output. Never
+ * an admission decision — `priceUsage`/`computeSessionUsage` own those.
+ */
 export function estimateUsageUsd(record: unknown, rates: CostRates | undefined): number {
 	return usageUsd(unwrapUsage(record), rates);
 }
@@ -444,7 +508,7 @@ export interface StatusPayloads {
 	/** UI seam A.1: `startedAt` rides the wave-running task so an attached UI can
 	 *  render a truthful elapsed timer without storage. */
 	task?: { id: string; wave: number; status: string; startedAt?: number };
-	budget: { spentUsd: number; sessionCeilingUsd: number; waveWarnUsd: number };
+	budget: { spentUsd: number; sessionCeilingUsd: number; waveWarnUsd: number; unpricedClasses?: string[] };
 	tasks: { id: string; status: string; waveCount: number; title: string;
 		/** UI seam A.2 (additive): the task's baseline tree, so an attached UI can compute a live diff without storage. */
 		baselineTreeSha?: string }[];

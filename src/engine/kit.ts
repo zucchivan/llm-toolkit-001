@@ -63,6 +63,7 @@ import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { FauxProviderHandle, FauxResponseStep } from "@earendil-works/pi-ai/providers/faux";
+import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 
 export {
 	AssistantEntry,
@@ -127,6 +128,40 @@ export type {
 	FauxResponseStep,
 };
 export { BACKGROUND_CONTEXT, withAbortSignal };
+
+/**
+ * M0-P16: the budget dispatch guard's denial stand-in. Mirrors pi-ai's
+ * lazyStream setup-error path: an AssistantMessageEventStream that ends with
+ * an error message (stopReason "error", the error's text as errorMessage) —
+ * the run settles `unanswered`/model_error with this detail instead of
+ * faulting the generation task on a synchronous throw. Usage is zeroed.
+ */
+export function modelStreamSetupError(model: { provider: string; id: string; api?: string }, error: Error): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	const message = {
+		role: "assistant" as const,
+		content: [],
+		api: model.api ?? "unknown",
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error" as const,
+		errorMessage: error.message,
+		timestamp: Date.now(),
+	};
+	queueMicrotask(() => {
+		stream.push({ type: "error", reason: "error", error: message });
+		stream.end(message);
+	});
+	return stream;
+}
 
 /**
  * Installed-version query for the SDK pin. Reading

@@ -309,6 +309,7 @@ export async function flushStatusSnapshot(loopAndLock: LoopAndLock, statusPhase:
 		statusAfter: state.runStatus,
 		statusPhase,
 		sessionUsageUsd: sessionUsage.totalUsd,
+		unpricedClasses: sessionUsage.unpriced,
 		receiptsAfter: receipts ?? { version: 1, events: [] },
 	}));
 }
@@ -319,6 +320,9 @@ interface PayloadInput {
 	statusPhase?: StatusPhase;
 	reports?: ReportRow[];
 	sessionUsageUsd: number;
+	/** Classes whose observed spend cannot be priced (M0-P16); they pause the
+	 *  next paid submission — never labeled free. */
+	unpricedClasses?: string[];
 	receiptsAfter: ReceiptsDocValue;
 }
 
@@ -349,6 +353,7 @@ function composeStatusPayload(loopAndLock: LoopAndLock, input: PayloadInput): St
 			spentUsd: input.statusAfter.budgetSpentUsd,
 			sessionCeilingUsd: loopAndLock.loop.config.budgets.sessionUsd,
 			waveWarnUsd: loopAndLock.loop.config.budgets.waveUsdWarn,
+			...(input.unpricedClasses?.length ? { unpricedClasses: input.unpricedClasses } : {}),
 		},
 		// UI seam A.2 (additive): baselineTreeSha rides each task so an attached UI
 		// can compute the live diff vs the task's baseline while a run owns the lock
@@ -501,6 +506,7 @@ async function postCommit(
 			statusPhase,
 			reports: calculated.input.reports,
 			sessionUsageUsd: sessionUsage.totalUsd,
+			unpricedClasses: sessionUsage.unpriced,
 			receiptsAfter: calculated.receiptsAfter,
 		}),
 	);

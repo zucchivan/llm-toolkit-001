@@ -11,7 +11,7 @@ import { openProjectHarness } from "../src/engine/harness.ts";
 import { commitState } from "../src/engine/state.ts";
 import { loadPrd, runPlan } from "../src/engine/planner.ts";
 import { runWaves } from "../src/engine/waves.ts";
-import { readout } from "../src/engine/inspector.ts";
+import { readout, receiptLabels } from "../src/engine/inspector.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { initProject } from "../src/init.ts";
 
@@ -123,6 +123,15 @@ describe("inspector: readout seam", () => {
 		const read = await readout(kit.loop.paths, { loop: kit });
 		expect(read.phase).toBe("complete");
 		expect(read.tasks[0]).toMatchObject({ id: "t1", status: "done", waveCount: 1 });
+
+		// P15: the readout carries the observed receipts + the frozen checkpoint;
+		// the label derivation is shared with the CLI views and the UI.
+		expect(read.receiptStates).toMatchObject({ taskId: "t1", wave: 1, gate: "pass", acceptance: "accepted" });
+		expect(read.receiptStates?.delivery ?? "not_requested").toBe("not_requested");
+		expect(read.checkpoint?.baseTree).toMatch(/^[0-9a-f]{40}$/);
+		expect(read.checkpoint?.candidateTree).toMatch(/^[0-9a-f]{40}$/);
+		// the demo config delivers nothing: accepted and not-requested stay separate
+		expect(receiptLabels(read.receiptStates)).toMatchObject({ review: "accepted", checks: "pass", publication: "not requested" });
 
 		expect(read.timeline.length).toBe(1);
 		const span = read.timeline[0]!;
@@ -245,5 +254,33 @@ describe("inspector: readout seam", () => {
 			await kit.loop.close();
 			kit.lock.release();
 		}
+	});
+});
+
+describe("receiptLabels (P15: the four labels the CLI views and the UI share)", () => {
+	const key = { planRevision: "rev", taskId: "t1", wave: 1 };
+
+	it("a quarantine row alone is 'no receipt' / the recorded state — never discarded", () => {
+		// only the gate failure exists (the quarantine path): no rollback receipt
+		expect(receiptLabels({ ...key, gate: "fail" })).toEqual({ review: "no receipt", checks: "fail", recovery: "no receipt", publication: "no receipt" });
+		// disposal recorded but not confirmed
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "pending" }).recovery).toBe("pending");
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "unknown" }).recovery).toBe("unknown");
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "failed" }).recovery).toBe("failed");
+		// ONLY a confirmed discard receipt says discarded
+		expect(receiptLabels({ ...key, gate: "fail", rollback: "discarded" }).recovery).toBe("discarded");
+	});
+
+	it("review acceptance and publication failure are separate labels; approval alone never delivers", () => {
+		const labels = receiptLabels({ ...key, gate: "pass", primary: "approve", skeptic: "approve", acceptance: "accepted", delivery: "failed" });
+		expect(labels).toMatchObject({ review: "accepted", checks: "pass", publication: "failed" });
+		expect(receiptLabels({ ...key, primary: "approve", acceptance: "accepted" }).publication).toBe("no receipt");
+		expect(receiptLabels({ ...key, delivery: "not_requested" }).publication).toBe("not requested");
+		expect(receiptLabels({ ...key, delivery: "pending" }).publication).toBe("pending");
+		expect(receiptLabels({ ...key, delivery: "published" }).publication).toBe("published");
+	});
+
+	it("no receipts at all → every label 'no receipt' (nothing inferred, nothing fabricated)", () => {
+		expect(receiptLabels(undefined)).toEqual({ review: "no receipt", checks: "no receipt", recovery: "no receipt", publication: "no receipt" });
 	});
 });

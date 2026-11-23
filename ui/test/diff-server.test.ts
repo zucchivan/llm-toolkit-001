@@ -1,14 +1,20 @@
 /**
- * Diff + artifact HTTP contract tests (§11.2/§11.4 + Appendix A.2/A.3):
- *   GET /api/tasks/:id/diff        persisted patch + parsed stats; 404 when absent;
+ * Diff + artifact HTTP contract tests (§11.2/§11.4 + Appendix A.2/A.3/A.7 + M0-P15):
+ *   GET /api/tasks/:id/diff        persisted patch + parsed stats for the
+ *                                  CURRENT plan revision's newest candidate
+ *                                  artifact; legacy pre-revision artifacts are
+ *                                  labeled historical (or 404 when a revision
+ *                                  exists — never presented as current);
  *                                  400 on a traversal-shaped task id
  *   GET /api/tasks/:id/diff?wave=N A.7 per-wave isolated diff: computed between
  *                                  the wave's own recorded trees (409 plain-words
  *                                  when not isolatable; 200 empty + note when the
  *                                  wave's delta is engine-owned-only churn)
- *   GET /api/tasks/:id/diff/live   200 mid-wave vs the task baseline (exclusions
- *                                  still applied); empty 200 before anything writes;
- *                                  409 when the task is not the in-flight one
+ *   GET /api/tasks/:id/diff/live   M0-P15: the in-flight task's LATEST FROZEN
+ *                                  CHECKPOINT, tree-to-tree (operator-checkout
+ *                                  edits excluded by construction); 409 when the
+ *                                  task is not in flight OR before its first
+ *                                  checkpoint (stated reason)
  *   GET /api/artifacts[/name]      list / text ≤5 MiB / metadata for larger
  *                                  (with a download link) / traversal → 400
  * `?download=1` streams the stored patch as an attachment (≤5 MiB at write time).
@@ -43,11 +49,14 @@ beforeAll(async () => {
 	cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
 	base = `http://127.0.0.1:${running.port}`;
 
-	// Seed a done task's artifacts (patch + stats side-car) and a quarantine's.
+	// Seed the CURRENT plan revision in the status side-car, then this revision's
+	// candidate artifacts (patch + stats side-car) for a done task (w2 = the
+	// terminal wave) and a quarantined one — the P14/P15 revision-qualified names.
+	await writeFile(join(root, ".orch", "status.json"), JSON.stringify({ planRevision: REVISION, phase: "idle", ts: Date.now() }), "utf8");
 	const artifacts = join(root, ".orch", "artifacts");
 	await mkdir(artifacts, { recursive: true });
 	await writeFile(
-		join(artifacts, "task-one.patch"),
+		join(artifacts, `candidate-${REVISION}-one-w2.patch`),
 		`diff --git a/src/one.ts b/src/one.ts
 index 1111111..2222222 100644
 --- a/src/one.ts
@@ -58,26 +67,34 @@ index 1111111..2222222 100644
 		"utf8",
 	);
 	await writeFile(
-		join(artifacts, "task-one.json"),
+		join(artifacts, `candidate-${REVISION}-one-w2.json`),
 		JSON.stringify({
 			task: "one",
+			planRevision: REVISION,
 			wave: 2,
 			baselineTreeSha: "1111111111111111111111111111111111111111",
+			candidateTreeSha: "2222222222222222222222222222222222222222",
 			generatedAt: 1,
 			files: [{ path: "src/one.ts", status: "A", insertions: 1, deletions: 0, binary: false }],
 			totalInsertions: 1,
 			totalDeletions: 0,
 			bytes: 163,
 			truncated: false,
-		} satisfies DisplayDiffStats),
+		}),
 		"utf8",
 	);
-	await writeFile(join(artifacts, "quarantined-two-w1.patch"), "diff --git a/src/two.ts b/src/two.ts\n--- a/src/two.ts\n+++ b/src/two.ts\n@@ -0,0 +1,1 @@\n+export const two = 2;\n", "utf8");
+	await writeFile(join(artifacts, `candidate-${REVISION}-two-w1.patch`), "diff --git a/src/two.ts b/src/two.ts\n--- a/src/two.ts\n+++ b/src/two.ts\n@@ -0,0 +1,1 @@\n+export const two = 2;\n", "utf8");
 	await writeFile(
-		join(artifacts, "quarantined-two-w1.json"),
-		JSON.stringify({ task: "two", wave: 1, baselineTreeSha: "a", generatedAt: 1, files: [], totalInsertions: 0, totalDeletions: 0, bytes: 80, truncated: false }),
+		join(artifacts, `candidate-${REVISION}-two-w1.json`),
+		JSON.stringify({ task: "two", planRevision: REVISION, wave: 1, baselineTreeSha: "a", candidateTreeSha: "b", generatedAt: 1, files: [], totalInsertions: 0, totalDeletions: 0, bytes: 80, truncated: false }),
 		"utf8",
 	);
+	// legacy pre-revision artifacts: a same-named task patch (must NEVER be served
+	// while a revision exists) and one on a task with no revision at all (served
+	// only as historical once the revision is unknown)
+	await writeFile(join(artifacts, "task-stale.patch"), "diff --git a/stale b/stale\n", "utf8");
+	await writeFile(join(artifacts, "task-legacy.patch"), "diff --git a/legacy b/legacy\n--- a/legacy\n+++ b/legacy\n@@ -0,0 +1 @@\n+old\n", "utf8");
+	await writeFile(join(artifacts, "task-legacy.json"), JSON.stringify({ task: "legacy", wave: 1, baselineTreeSha: "c", generatedAt: 1, files: [], totalInsertions: 0, totalDeletions: 0, bytes: 40, truncated: false }), "utf8");
 	// an oversized artifact for the metadata path (5 MiB cap)
 	await writeFile(join(artifacts, "gate-huge-w9.log"), "x".repeat(DISPLAY_PATCH_CAP_BYTES + 10), "utf8");
 });
@@ -99,30 +116,55 @@ async function fakeDist(): Promise<string> {
 	return distDirPromise;
 }
 
+/** The revision the seeded candidate artifacts belong to (a real plan UUID shape). */
+const REVISION = "11111111-2222-3333-4444-555555555555";
+
 const get = (path: string): Promise<Response> => fetch(`${base}${path}`, { headers: { cookie } });
 
-describe("GET /api/tasks/:id/diff (persisted)", () => {
-	it("returns the patch text + parsed stats for a done task", async () => {
+describe("GET /api/tasks/:id/diff (persisted, P15 revision-qualified)", () => {
+	it("returns the current revision's newest candidate patch + parsed stats for a done task", async () => {
 		const res = await get("/api/tasks/one/diff");
 		expect(res.status).toBe(200);
-		const payload = (await res.json()) as { task: string; patch: string; stats: string; diff: string; statsJson?: DisplayDiffStats; bytes: number; truncated: boolean };
-		expect(payload.patch).toBe("task-one.patch");
-		expect(payload.stats).toBe("task-one.json");
+		const payload = (await res.json()) as { task: string; patch: string; stats: string; diff: string; historical?: boolean; statsJson?: DisplayDiffStats; bytes: number; truncated: boolean };
+		expect(payload.patch).toBe(`candidate-${REVISION}-one-w2.patch`);
+		expect(payload.stats).toBe(`candidate-${REVISION}-one-w2.json`);
+		expect(payload.historical).toBeUndefined();
 		expect(payload.diff).toContain("+export const one = 1;");
 		expect(payload.statsJson?.task).toBe("one");
 		expect(payload.statsJson?.wave).toBe(2);
 		expect(payload.statsJson?.files[0]).toEqual({ path: "src/one.ts", status: "A", insertions: 1, deletions: 0, binary: false });
-		expect(payload.bytes).toBe(Buffer.byteLength(await readFile(join(root, ".orch", "artifacts", "task-one.patch"), "utf8")));
+		expect(payload.bytes).toBe(Buffer.byteLength(await readFile(join(root, ".orch", "artifacts", payload.patch), "utf8")));
 		expect(payload.truncated).toBe(false);
 	});
 
-	it("resolves the newest quarantined wave patch (+stats) for a quarantined task", async () => {
-		await writeFile(join(root, ".orch", "artifacts", "quarantined-two-w3.patch"), "diff --git a/late b/late\n--- a/late\n+++ b/late\n@@ -0,0 +1 +0,0 @@\n", "utf8");
+	it("resolves the newest candidate wave patch for a task with several waves", async () => {
+		await writeFile(join(root, ".orch", "artifacts", `candidate-${REVISION}-two-w3.patch`), "diff --git a/late b/late\n--- a/late\n+++ b/late\n@@ -0,0 +1 +0,0 @@\n", "utf8");
 		const res = await get("/api/tasks/two/diff");
 		expect(res.status).toBe(200);
 		const payload = (await res.json()) as TaskDiffPayload;
-		expect(payload.patch).toBe("quarantined-two-w3.patch");
+		expect(payload.patch).toBe(`candidate-${REVISION}-two-w3.patch`);
 		expect(payload.diff).toContain("late");
+	});
+
+	it("a revision exists but the task has no candidate artifact → 404; a legacy same-named patch is NEVER current", async () => {
+		const res = await get("/api/tasks/stale/diff");
+		expect(res.status).toBe(404);
+		const payload = (await res.json()) as { error: string };
+		expect(payload.error).toContain("no diff artifacts for task stale");
+	});
+
+	it("with NO known revision, a legacy artifact is served but labeled historical (no receipt)", async () => {
+		// drop the plan revision from the side-car (pre-P14 project posture)
+		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({ phase: "idle", ts: Date.now() }), "utf8");
+		try {
+			const res = await get("/api/tasks/legacy/diff");
+			expect(res.status).toBe(200);
+			const payload = (await res.json()) as TaskDiffPayload;
+			expect(payload.patch).toBe("task-legacy.patch");
+			expect(payload.historical).toBe(true);
+		} finally {
+			await writeFile(join(root, ".orch", "status.json"), JSON.stringify({ planRevision: REVISION, phase: "idle", ts: Date.now() }), "utf8");
+		}
 	});
 
 	it("404 for a task without artifacts; 404 names stay plain", async () => {
@@ -145,32 +187,41 @@ describe("GET /api/tasks/:id/diff (persisted)", () => {
 		const res = await get("/api/tasks/one/diff?download=1");
 		expect(res.status).toBe(200);
 		expect(res.headers.get("content-type")).toContain("application/octet-stream");
-		expect(res.headers.get("content-disposition")).toContain("task-one.patch");
+		expect(res.headers.get("content-disposition")).toContain(`candidate-${REVISION}-one-w2.patch`);
 		const text = await res.text();
 		expect(text).toContain("diff --git a/src/one.ts");
 	});
 });
 
-describe("GET /api/tasks/:id/diff/live", () => {
+describe("GET /api/tasks/:id/diff/live (P15: latest frozen checkpoint, tree-to-tree)", () => {
 	it("409 when nothing is running", async () => {
+		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({ planRevision: REVISION, phase: "idle", ts: Date.now() }), "utf8");
 		const res = await get("/api/tasks/one/diff/live");
 		expect(res.status).toBe(409);
-		const body = (await res.json()) as { error: string; detail?: { phase: string } };
+		const body = (await res.json()) as { error: string; phase?: string };
 		expect(body.error).toMatch(/not the current in-flight task/);
-		expect((body as { phase?: string }).phase).toBe("unknown");
+		expect(body.phase).toBe("idle");
 	});
 
-	it("200 mid-wave: the tree vs the task baseline, engine-owned paths excluded", async () => {
-		// a real baseline of the current tree; then three changes: a display file,
-		// router.md (excluded), and an .orch side-car (excluded)
-		const baseline = await captureBaselineTree(root);
+	it("200 mid-wave: the frozen checkpoint's own trees, engine-owned paths excluded, later operator edits excluded", async () => {
+		// two REAL trees: the checkpoint's base and candidate. The candidate tree
+		// contains src/live.ts; AFTER the capture an operator edit lands in the
+		// working tree — a tree-to-tree read can never see it.
+		const baseTree = await captureBaselineTree(root);
+		await mkdir(join(root, "src"), { recursive: true });
 		await writeFile(join(root, "src", "live.ts"), "export const LIVE = true;\n", "utf8");
+		const candidateTree = await captureBaselineTree(root);
 		const routerBefore = await readFile(join(root, "router.md"), "utf8").catch(() => "");
 		await writeFile(join(root, "router.md"), `${routerBefore}\n<!-- engine touches the mirror -->\n`, "utf8");
+		// the LATER operator checkout edit (after both trees were captured)
+		await writeFile(join(root, "src", "operator-later.ts"), "export const LATER = true;\n", "utf8");
+		const frozenAt = 1_730_000_000_000;
 		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({
+			planRevision: REVISION,
 			phase: "wave-running",
 			task: { id: "t-live", wave: 1, status: "running", startedAt: Date.now() },
-			tasks: [{ id: "t-live", status: "in_progress", waveCount: 1, title: "live", baselineTreeSha: baseline }],
+			tasks: [{ id: "t-live", status: "in_progress", waveCount: 1, title: "live" }],
+			checkpoint: { wave: 1, baseTree, candidateTree, asOf: frozenAt },
 			ts: Date.now(),
 		}), "utf8");
 
@@ -180,6 +231,7 @@ describe("GET /api/tasks/:id/diff/live", () => {
 			task: string;
 			wave: number;
 			baselineTreeSha: string;
+			frozenAt: number;
 			bytes: number;
 			truncated: boolean;
 			diff: string;
@@ -187,27 +239,45 @@ describe("GET /api/tasks/:id/diff/live", () => {
 		};
 		expect(payload.task).toBe("t-live");
 		expect(payload.wave).toBe(1);
-		expect(payload.baselineTreeSha).toBe(baseline);
+		expect(payload.baselineTreeSha).toBe(baseTree);
+		expect(payload.frozenAt).toBe(frozenAt);
 		expect(payload.diff).toContain("+export const LIVE = true;");
 		expect(payload.diff).not.toContain("engine touches the mirror");
+		expect(payload.diff).not.toContain("operator-later"); // later checkout edit: not a task change
 		expect(payload.diff).not.toContain("src/one.ts"); // seeded diff artifact is not tree state
 		expect(payload.stats.files.map((f) => `${f.path}:${f.status}`)).toEqual(["src/live.ts:A"]);
-
-		// the engine-owned write never lands in the patch either
-		const redownload = await get("/api/tasks/t-live/diff/live");
-		expect((await redownload.json()) as { diff: string }).toBeTruthy();
 
 		// cleanup: nothing persisted by the live path
 		const artifacts = await readFile(join(root, ".orch", "artifacts", "task-t-live.patch"), "utf8").catch(() => "<absent>");
 		expect(artifacts).toBe("<absent>");
 	});
 
-	it("200 (empty) when the in-flight wave has not changed anything yet", async () => {
-		const baseline = await captureBaselineTree(root);
+	it("409 with the reason before the first checkpoint (in flight, no frozen candidate yet)", async () => {
 		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({
+			planRevision: REVISION,
+			phase: "wave-running",
+			task: { id: "t-early", wave: 1, status: "running", startedAt: Date.now() },
+			tasks: [{ id: "t-early", status: "in_progress", waveCount: 1, title: "early" }],
+			ts: Date.now(),
+		}), "utf8");
+		const res = await get("/api/tasks/t-early/diff/live");
+		expect(res.status).toBe(409);
+		const body = (await res.json()) as { error: string };
+		expect(body.error).toMatch(/no frozen checkpoint yet/);
+		expect(body.error).toMatch(/before its first checkpoint/);
+	});
+
+	it("200 (empty + note) when the checkpoint trees carry no displayable delta", async () => {
+		// engine-owned-only churn between the two captured trees
+		const baseTree = await captureBaselineTree(root);
+		await writeFile(join(root, "router.md"), "checkpoint churn only\n", "utf8");
+		const candidateTree = await captureBaselineTree(root);
+		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({
+			planRevision: REVISION,
 			phase: "wave-running",
 			task: { id: "t-quiet", wave: 1, status: "running", startedAt: Date.now() },
-			tasks: [{ id: "t-quiet", status: "in_progress", waveCount: 1, title: "quiet", baselineTreeSha: baseline }],
+			tasks: [{ id: "t-quiet", status: "in_progress", waveCount: 1, title: "quiet" }],
+			checkpoint: { wave: 1, baseTree, candidateTree, asOf: Date.now() },
 			ts: Date.now(),
 		}), "utf8");
 		const res = await get("/api/tasks/t-quiet/diff/live");
@@ -219,11 +289,11 @@ describe("GET /api/tasks/:id/diff/live", () => {
 	});
 
 	it("409 when the task is not the in-flight one (another task holds the wave)", async () => {
-		const baseline = await captureBaselineTree(root);
 		await writeFile(join(root, ".orch", "status.json"), JSON.stringify({
+			planRevision: REVISION,
 			phase: "wave-running",
 			task: { id: "t-live", wave: 2, status: "running", startedAt: Date.now() },
-			tasks: [{ id: "t-live", status: "in_progress", waveCount: 2, title: "live", baselineTreeSha: baseline }],
+			tasks: [{ id: "t-live", status: "in_progress", waveCount: 2, title: "live" }],
 			ts: Date.now(),
 		}), "utf8");
 		const res = await get("/api/tasks/the-other/diff/live");
@@ -240,13 +310,13 @@ describe("GET /api/artifacts (§11.4)", () => {
 		expect(res.status).toBe(200);
 		const payload = (await res.json()) as { artifacts: { name: string; bytes: number }[] };
 		const names = payload.artifacts.map((a) => a.name);
-		expect(names).toContain("task-one.patch");
-		expect(names).toContain("task-one.json");
+		expect(names).toContain(`candidate-${REVISION}-one-w2.patch`);
+		expect(names).toContain(`candidate-${REVISION}-one-w2.json`);
 		expect(names).toContain("gate-huge-w9.log");
 	});
 
 	it("text artifact ≤ cap returns the body; oversized returns metadata + download", async () => {
-		const text = await get("/api/artifacts/task-one.patch");
+		const text = await get(`/api/artifacts/candidate-${REVISION}-one-w2.patch`);
 		expect(text.status).toBe(200);
 		expect(await text.text()).toContain("diff --git a/src/one.ts");
 

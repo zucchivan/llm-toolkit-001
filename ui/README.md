@@ -2,9 +2,10 @@
 
 A local, loopback-only web control surface for **one** `llm-toolkit-001` loop.
 It is a sub-product of the kit: own package, own lockfile, own version/CHANGELOG
-(`ui/PRD.md` is the full spec). The core M0-P14 driver now works on frozen
-candidates and receipted outcomes, but this UI has not yet activated receipt
-badges or checkpoint-only live diff. Scope of **M0**: a truthful, read-only,
+(`ui/PRD.md` is the full spec). The core M0-P14 driver works on frozen
+candidates and receipted outcomes, and this UI now renders what was observed:
+receipt-based review / checks / workspace-recovery / publication labels and a
+checkpoint-only live diff. Scope of **M0**: a truthful, read-only,
 attached view of a run started anywhere (terminal first-class). Scope of
 **M1**: full control — plan → review → approve & run → stop → handoff →
 verify → export, without touching the terminal. Scope of **M2**: diffs as
@@ -59,12 +60,14 @@ already there; `readout.seam` stays 1), no new deps.
 
 Appendix A.8 in `ui/PRD.md` is **approved design scope**. The revision-bound
 run confirmation and exit-2 policy-stop mapping shipped in M0-P06/0.11.0.
-M0-P14 has now switched the core serial driver to frozen candidates and
-receipted outcomes, added stage checkpoints and latest `planRevision`/
+M0-P14 switched the core serial driver to frozen candidates and receipted
+outcomes, added stage checkpoints and latest `planRevision`/
 `receiptStates`/checkpoint facts to the readout, and changed the result
-location. The UI has not activated receipt badges or checkpoint-only live
-reads; those remain M0-P15. Until then, a working-copy live preview is
-non-authoritative and must not attribute operator-checkout edits to a task.
+location. M0-P15 (this UI) now activates the reserved UI rows: receipt-derived
+badges (review / checks / workspace recovery / publication — "discarded" and
+"published" only ever on confirmed receipts) and a live diff that reads the
+requested task's latest frozen checkpoint tree-to-tree (409 with the reason
+before one exists; later operator-checkout edits are not task changes).
 Cache metrics remain reserved for M2-P03/P04, trusted installed-CLI resolution
 for M4-P04, and live-plan facts/`seam: 2`/package-only consumption for the
 separate M4-P01 amendment.
@@ -114,7 +117,16 @@ What M2 adds on top of M1 control (kit seam genome A.2/A.3 → root 0.2.2):
   per frozen candidate. It is the wave-local start-tree→candidate delta, not
   cumulative task history. Capture can fail or truncate; an artifact is not a
   receipt and is never a rollback input. Engine paths (`.orch/**`, `router.md`,
-  `PROMPT.md`) are excluded and text is capped at 5 MiB.
+  `PROMPT.md`) are excluded and text is capped at 5 MiB. The UI serves the
+  CURRENT revision's newest candidate only: with a revision known, a legacy
+  same-named artifact is never presented as current (404 instead); with no
+  revision known (pre-P14 project), a legacy patch is labeled
+  "historical — no receipt".
+- **Receipt labels (0.13.0, M0-P15)** — the report, the strip's quarantine
+  banner, and the diff drawer render four separate observed labels from the
+  readout's receipt projection: review, checks, workspace recovery,
+  publication (each "no receipt" when absent). Quarantine alone never says
+  "discarded"; approval alone never says "published".
 - **Diff drawer** — file list (status chip + `+N −M I`) + unified hunks with
   line coloring, lazy per-file, 2000-lines/file cap, binary/truncated notices,
   raw download; deep link `#/diff/<task>`; `Esc` closes. Open from task rows,
@@ -122,12 +134,12 @@ What M2 adds on top of M1 control (kit seam genome A.2/A.3 → root 0.2.2):
 - **Wave scope (0.8.0, Appendix A.7)** — the drawer can compare one wave's
   recorded start and candidate trees ("wave N — isolated to this wave"). M0-P14
   makes the candidate an immutable tree and writes a revision-qualified,
-  wave-local artifact. Receipt labels and checkpoint-only live diff are
-  deferred to P15.
-- **Live preview (pre-P15 limitation)** — the current live route still reads the
-  operator checkout rather than a frozen candidate. M0-P14 keeps worker edits
-  out of that checkout, so this preview is non-authoritative and must not be
-  attributed to a task; M0-P15 switches it to the requested checkpoint.
+  wave-local artifact.
+- **Live view (0.13.0, M0-P15)** — the live route reads the in-flight task's
+  LATEST FROZEN CHECKPOINT from the status side-car and diffs its immutable
+  base→candidate trees: no working-copy read, no staging, no temporary index,
+  nothing persisted. Before the first checkpoint it answers 409 with the
+  reason (never a fabricated patch); the drawer labels the freeze timestamp.
 
 What M3 adds around that core (§16 M3 polish):
 
@@ -149,11 +161,11 @@ What M3 adds around that core (§16 M3 polish):
   the completion report adds a per-task spend column.
 - **Kind empty/error states** — every panel (table, log, jobs, plan review,
   report, drawer) has a plain-words empty state; the diff drawer explains its
-  404/409/unreadable outcomes kindly; a quarantined task with no live wave
-  raises a quarantine explanation. The core now records workspace-disposal
-  receipts, but the UI badge remains a status projection until M0-P15 renders
-  those receipts directly. A `#/diff/<task>` deep link with no artifact draws
-  an explanation instead of nothing.
+  404/409/unreadable outcomes kindly (including the P15 "before the first
+  checkpoint" 409); a quarantined task with no live wave raises a quarantine
+  explanation whose workspace-recovery wording comes from the disposal receipt
+  — the status alone is not proof of rollback. A `#/diff/<task>` deep link with
+  no artifact draws an explanation instead of nothing.
 - **Task-table sort (§15.1)** — one toggle: plan order (stable while the run
   progresses) or failing-first by status (quarantined → in progress → todo →
   done, stable within a status). Row filtering shipped in 0.5.3 (M4-c, below).
@@ -206,9 +218,10 @@ What M3 adds around that core (§16 M3 polish):
 
 - The report's delivery stat says the CONFIGURED MODE, not just a row count:
   `none`, `commit`, `pr`, or `N delivery row(s) — mode unknown` (side-car
-  snapshot + unreadable config). Delivery rows now echo the core's `published`
-  or `not_requested` receipt state; the separate receipt-state projection is
-  not yet rendered as a badge (M0-P15).
+  snapshot + unreadable config). Delivery rows echo the core's `published`
+  or `not_requested` receipt state, and the P15 receipt block renders the
+  publication label separately from review — "not delivered" and "accepted"
+  never merge.
 - **Read-only on purpose.** Per §5 delivery stays a config + CLI decision:
   the mode lives in `.orch/config.toml` and the CLI keeps every delivery
   path — including the `--deliver` run qualifier and host-origin/base preflight

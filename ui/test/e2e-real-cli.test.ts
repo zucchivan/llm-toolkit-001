@@ -17,7 +17,7 @@ import { readOnce } from "../server/readout.ts";
 import { jobsList, type JobRecord } from "../server/jobs.ts";
 import { resolveCli } from "../server/actions.ts";
 import { postAction, actionHeaders, waitFor, spawnSleeper } from "./actions-helper.ts";
-import { bakeConfiguredDemo, installDemoGates } from "./helpers.ts";
+import { bakeConfiguredDemo } from "./helpers.ts";
 
 const FAUX = process.env["KIT_FAUX"] === "1";
 
@@ -46,10 +46,10 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 	});
 
 	it("plan job → planned readout → run job completes the demo waves (+ per-task diffs)", { timeout: 300_000 }, async () => {
-		// project: demo PRD + the fixture's ONE recipe file (three behavioral
-		// gates; task 2's wave 1 ships a case-sensitive queryList) + one baseline commit
+		// project: demo PRD + the fixture's ONE recipe file and reviewed gate
+		// bytes, all committed into the baseline by the bake (P15 repair: frozen
+		// candidate workspaces must find evals/smoke-gate.cjs in the base tree)
 		root = await bakeConfiguredDemo();
-		await installDemoGates(root);
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-dist-"));
@@ -99,10 +99,13 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect(final.readout.usage.sessionUsd).toBeGreaterThanOrEqual(0);
 
 		// --- M2 cut 4: every done task has a diff ref + served patch data ---
+		// P15: the refs are revision-qualified candidate artifacts for the CURRENT
+		// plan revision (never legacy names — a replan reusing a task id must not
+		// resurrect an old patch)
 		for (const task of final.readout.tasks) {
 			expect(task.status).toBe("done");
-			expect(task.diff?.patch).toBe(`task-${task.id}.patch`);
-			expect(task.diff?.stats).toBe(`task-${task.id}.json`);
+			expect(task.diff?.patch).toMatch(new RegExp(`^candidate-${revision}-${task.id}-w\\d+\\.patch$`));
+			expect(task.diff?.stats).toBe(task.diff?.patch.replace(/\.patch$/, ".json"));
 			expect(task.diff!.bytes).toBeGreaterThan(0);
 			expect(task.diff!.truncated).toBe(false);
 			// stats side-car shape: task, wave, baseline, totals; the wave reflects
@@ -139,9 +142,9 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		expect(queryDrawer.diff).toContain("toLowerCase"); // the wave-2 repair landed
 		expect(queryDrawer.statsJson?.wave).toBe(2);
 
-		// diff artifacts exist per task on disk, byte-sized > 0
-		for (const id of ["list-parse", "list-query", "cli-render"]) {
-			expect((await stat(join(root, ".orch", "artifacts", `task-${id}.patch`))).size).toBeGreaterThan(0);
+		// revision-qualified candidate artifacts exist per task on disk, byte-sized > 0
+		for (const task of final.readout.tasks) {
+			expect((await stat(join(root, ".orch", "artifacts", task.diff!.patch!))).size).toBeGreaterThan(0);
 		}
 
 		// lock is free again: idempotence — our jobs list keeps BOTH records
@@ -180,12 +183,11 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 	});
 
 	it("live diff: exclusions + content mid-wave; 409 for tasks not in flight", { timeout: 300_000 }, async () => {
-		// own project + a slow gate recipe (generated layer, real precedence: the
-		// human recipes keep the three behavioral gates): the sleep runs INSIDE
-		// list-parse's wave (after src/list.ts is written) so the live-diff
-		// window has real content.
+		// the bake commits the demo gates into the baseline; the slow gate is a
+		// generated layer on top (real precedence: the human recipes keep the
+		// three behavioral gates): the sleep runs INSIDE list-parse's wave (after
+		// src/list.ts is written) so the live-diff window has real content.
 		root = await bakeConfiguredDemo();
-		await installDemoGates(root);
 		await mkdir(join(root, "evals"), { recursive: true });
 		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
 		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
@@ -268,7 +270,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// the wave resolves and the final readout keeps the persisted refs
 		const final = await waitFor(() => readOnce(root), (s) => s.readout.tasks.every((t) => t.status === "done" || t.status === "quarantined"), 240_000);
 		expect(final.readout.tasks.filter((t) => t.diff).length).toBeGreaterThanOrEqual(3);
-		expect((await stat(join(root, ".orch", "artifacts", "task-list-parse.patch"))).size).toBeGreaterThan(0);
+		expect((await stat(join(root, ".orch", "artifacts", final.readout.tasks.find((t) => t.id === "list-parse")!.diff!.patch!))).size).toBeGreaterThan(0);
 	});
 
 	it("attached stop refused: an unverifiable holder is answered with the reason and signal NOTHING (§7.2.1)", async () => {
@@ -309,11 +311,12 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 
 	it("attached stop verified: the UI SIGINTs the TERMINAL-spawned faux runner once — exit 130, resumable", { timeout: 300_000 }, async () => {
 		// a project with a slow gate: wave 1 of list-parse stalls 3s INSIDE the
-		// gate — the stop window. Plan through the UI first (approve stamp), then
-		// spawn the runner like a terminal would: the SAME entry resolveCli()
-		// picks for spawning jobs, cwd = the project root, detached from jobs.
+		// gate — the stop window. The bake committed the demo gates into the
+		// baseline; the slow gate layers on top. Plan through the UI first
+		// (approve stamp), then spawn the runner like a terminal would: the SAME
+		// entry resolveCli() picks for spawning jobs, cwd = the project root,
+		// detached from jobs.
 		root = await bakeConfiguredDemo();
-		await installDemoGates(root);
 		await mkdir(join(root, "evals"), { recursive: true });
 		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
 		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");

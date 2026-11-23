@@ -109,3 +109,73 @@ describe("CompletionReport — delivery section (A.6, read-only)", () => {
 		expect(screen.getByText("1 delivery row(s) — mode unknown")).toBeTruthy();
 	});
 });
+
+describe("CompletionReport — P15 receipt labels (observed, never derived)", () => {
+	const terminalTasks = [
+		{ id: "t1", title: "one", status: "done", waveCount: 1, dependsOn: [], targetPaths: [], priority: 1, feedback: 0, diff: { task: "t1", patch: "candidate-rev-t1-w1.patch", bytes: 10, truncated: false } },
+		{ id: "t2", title: "two", status: "quarantined", waveCount: 2, dependsOn: [], targetPaths: [], priority: 1, feedback: 1, diff: { task: "t2", patch: "candidate-rev-t2-w2.patch", bytes: 10, truncated: false } },
+	] as KitReadout["tasks"];
+
+	it("the four labels render separately from the latest receipt wave — accepted and not-delivered stay apart", () => {
+		render(CompletionReport, {
+			snapshot: readout({
+				tasks: terminalTasks,
+				// review succeeded…
+				receiptStates: { planRevision: "rev", taskId: "t1", wave: 1, gate: "pass", primary: "approve", acceptance: "accepted", delivery: "failed" },
+				// …while PR publication failed: shown separately, never merged
+			}),
+			jobs,
+			now: 1_730_000_200_000,
+			onExport: () => {},
+			onOpenDiff: () => {},
+		});
+		expect(document.body.textContent).toContain("review accepted");
+		expect(document.body.textContent).toContain("checks pass");
+		expect(document.body.textContent).toContain("publication failed");
+		expect(document.body.textContent).not.toContain("review approve");
+	});
+
+	it("a quarantine-only receipt state shows the recovery label as recorded — never 'rolled back'/'discarded'", () => {
+		render(CompletionReport, {
+			snapshot: readout({
+				tasks: terminalTasks,
+				receiptStates: { planRevision: "rev", taskId: "t2", wave: 2, gate: "fail", rollback: "pending" },
+			}),
+			jobs,
+			now: 1_730_000_200_000,
+			onExport: () => {},
+			onOpenDiff: () => {},
+		});
+		expect(document.body.textContent).toContain("workspace recovery pending");
+		expect(document.body.textContent).not.toContain("rolled back");
+		expect(document.body.textContent).not.toContain("discarded");
+		// the quarantined row's button is a plain 'patch' — the receipt lives in the drawer
+		const button = screen.getByRole("button", { name: "patch" });
+		expect(button.getAttribute("title")).not.toContain("rolled back");
+	});
+
+	it("a confirmed discard receipt is the only 'discarded'", () => {
+		render(CompletionReport, {
+			snapshot: readout({
+				tasks: terminalTasks,
+				receiptStates: { planRevision: "rev", taskId: "t2", wave: 2, gate: "fail", rollback: "discarded" },
+			}),
+			jobs,
+			now: 1_730_000_200_000,
+			onExport: () => {},
+			onOpenDiff: () => {},
+		});
+		expect(document.body.textContent).toContain("workspace recovery discarded");
+	});
+
+	it("no receipts at all → no receipts block (never fabricated)", () => {
+		render(CompletionReport, {
+			snapshot: readout({ tasks: terminalTasks }),
+			jobs,
+			now: 1_730_000_200_000,
+			onExport: () => {},
+			onOpenDiff: () => {},
+		});
+		expect(document.body.textContent).not.toContain("workspace recovery");
+	});
+});

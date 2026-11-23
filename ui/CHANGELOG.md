@@ -4,6 +4,49 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## 0.13.0 — M0-P15: render observed receipts; stop diffing the operator checkout
+
+The UI now renders what the M0-P14 core OBSERVED instead of deriving outcomes
+from task status, and every diff read is checkpoint-addressed. Read-only
+rendering surface plus the shared label derivation — no kit behavior change
+(`readout.seam` stays 1; kit 0.2.3); no new deps; no UI mutation routes.
+
+- **Four receipt labels, one shared derivation** — review, checks, workspace
+  recovery, and publication render as separate labels from the readout's
+  receipt projection, via the core's new `receiptLabels()`
+  (`src/engine/inspector.ts`). The CLI's status/inspect/export views render
+  the same words, so reports cannot drift. Each label keeps its recorded
+  state or "no receipt": a quarantined task alone never says "discarded",
+  an approval alone never says "published", and "not requested" /
+  "pending" / "unknown" survive verbatim. Review acceptance and a failed PR
+  publication stay separate labels everywhere.
+- **Receipt labels in the surfaces that matter** — the completion report gains
+  a receipts block (latest receipt wave + frozen checkpoint timestamp); the
+  strip's quarantine banner states the workspace-recovery label instead of
+  asserting a rollback; the diff drawer carries the recovery label; the
+  task-table/report button titles no longer infer "rolled back" from status.
+- **Live diff = latest frozen checkpoint, tree-to-tree** —
+  `GET /api/tasks/:id/diff/live` now reads only the status side-car's frozen
+  checkpoint and diffs its immutable base→candidate trees (pure
+  tree-to-tree plumbing: no working-copy read, no staging, no temporary
+  index, nothing persisted). Before the first checkpoint it answers 409 with
+  the reason — never a fabricated patch — and the drawer labels the freeze
+  timestamp. Later operator-checkout edits cannot leak into the view.
+- **Persisted diffs select the current revision** —
+  `GET /api/tasks/:id/diff` serves the CURRENT plan revision's newest
+  `candidate-<revision>-<task>-w<N>.patch` (mirroring the core readout's
+  selection). A legacy pre-revision patch is served only when no revision is
+  known at all, labeled "historical — no receipt" — and is never selected as
+  current, in particular never for a new revision reusing a task id (that
+  case is a plain 404).
+- **CLI parity** — `status`, `inspect`, and the export report render the same
+  four labels (plus the frozen-checkpoint line) from the same derivation.
+- **E2E bake repair (the P15 strict-path defect)** — `bakeConfiguredDemo`
+  now commits the reviewed gate bytes (`evals/smoke-gate.cjs` + the fixture's
+  ONE recipe file) INTO the baseline before any planning, so M0-P14
+  frozen-candidate workspaces can execute the gates; `evals/` stays a
+  protected review control.
+
 ## 0.12.0 — M0-P08: the demo bake is falsifiable at runtime
 
 The demo mode's bake now installs the fixture's behavioral gates, so what the

@@ -6,6 +6,13 @@
 import type { ReadoutSnapshot, JobsPayload, RoleModelInfo } from "./api.ts";
 import type { JobRecord } from "../../server/jobs.ts";
 import type { KitReadout, KitTaskView, KitUsage, HealthCheck, ConvSummary, ConvEntryView, DeliveryRow, DeliveryView } from "../../../src/engine/inspector.ts";
+import { receiptLabels } from "../../../src/engine/inspector.ts";
+
+// P15: the four receipt-derived labels are THE CORE's derivation
+// (inspector.ts) — re-exported so components and the CLI views render the
+// same words from one source.
+export { receiptLabels, receiptLabelsLine } from "../../../src/engine/inspector.ts";
+export type { ReceiptLabels } from "../../../src/engine/inspector.ts";
 import type { RouterTask, WaveRow } from "../../../src/engine/infos.ts";
 import type { RoleName } from "../../../src/config.ts";
 
@@ -298,8 +305,10 @@ export interface DiffDrawerState {
 	live: boolean;
 	/** task.waveCount for "cumulative since baseline, N waves" */
 	waves: number;
-	/** quarantined → the tree was rolled back; the drawer shows the rollback badge */
-	rolledBack: boolean;
+	/** P15: the receipt-derived workspace-recovery label — "discarded" ONLY when
+	 *  the rollback receipt confirms it; a quarantined status alone yields "no
+	 *  receipt", never "rolled back". */
+	workspaceRecovery: string;
 }
 
 /** Drawer state for one task id (or undefined when the task is unknown). */
@@ -307,11 +316,13 @@ export function diffDrawerState(snapshot: ReadoutSnapshot | undefined, task: str
 	if (!snapshot || !task) return undefined;
 	const t = snapshot.readout.tasks.find((x) => x.id === task);
 	if (!t) return undefined;
+	const states = snapshot.readout.receiptStates;
+	const recovery = states?.taskId === task ? receiptLabels(states).recovery : "no receipt";
 	return {
 		task,
 		live: t.status === "in_progress" || snapshot.readout.live?.task === task,
 		waves: Math.max(1, t.waveCount),
-		rolledBack: t.status === "quarantined",
+		workspaceRecovery: recovery,
 	};
 }
 
@@ -335,6 +346,10 @@ export function latestDiffTask(artifacts: Array<{ name: string; kind: string; mt
 		.sort((a, b) => b.mtimeMs - a.mtimeMs);
 	const name = patches[0]?.name;
 	if (!name) return undefined;
+	// P15 revision-qualified candidates: candidate-<revision>-<task>-w<N>.patch
+	// (the readout's own selection class — the revision prefix never leaks out).
+	const candidate = /^candidate-[0-9a-fA-F-]{36}-(.+)-w\d+\.patch$/.exec(name);
+	if (candidate) return candidate[1];
 	if (name.startsWith("task-")) return name.slice("task-".length, -".patch".length);
 	return name.slice("quarantined-".length).replace(/-w\d+\.patch$/, "");
 }

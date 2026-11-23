@@ -157,9 +157,25 @@ Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) o
   OS containment; use trusted projects and fixtures only. Gate and probe
   recipes also inherit the CLI's environment (PATH/HOME included) until the
   M1 sandbox boundary lands.
-- Budget stops use recorded provider/catalog costs or configured rate estimates.
-  They are not a hard provider-bill cap and cannot prevent an already admitted
-  in-flight request from exceeding the ceiling.
+- Budget stops guard every paid submission (M0-P16): one `admitSubmission`
+  gate admits the planner conversation, every implementer retry, each verifier
+  pass, and one-off `verify`, refusing at `>=` of `budgets.sessionUsd` — a zero
+  ceiling refuses all paid work — and recording the stop with no call. A
+  `Models` dispatch guard covers every provider dispatch inside a submission,
+  including tool follow-ups, SDK-level transport retries, and compaction
+  calls. Pricing uses provider/catalog cost first, then config rates; an
+  unpriced cache delta or a previously used class with no price anywhere
+  pauses submissions with a distinct reason instead of approximating or
+  labeling it free (fixtures/replays on the faux provider may report
+  simulated zero). A budget stop is a pause, never a reject: the paused stage
+  checkpoint and any verified candidate persist, and raising
+  `budgets.sessionUsd` resumes the same pass — a terminal failure is never
+  replayed and its request key never reused. Resume after an interrupted
+  submission reconciles the same request first; prior usage is always
+  counted, so resume never double-charges. Recorded spend is a session
+  estimate, not a hard provider-bill cap: hidden transport retries and
+  external services inside a provider implementation are only visible once
+  usage lands, and one admitted in-flight request can overrun the ceiling.
 - Quarantine retains the frozen candidate for review and discards only the
   owned private workspace. A rollback receipt is `discarded` only after the
   workspace is observed absent and the accepted integration ref unchanged;

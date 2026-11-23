@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { atomicWrite } from "../util/fsx.ts";
 import type { ProjectPaths } from "../engine/harness.ts";
 import type { KitReadout } from "../engine/inspector.ts";
+import { receiptLabelsLine } from "../engine/inspector.ts";
 
 export interface ExportInput {
 	readout: KitReadout;
@@ -48,6 +49,17 @@ function renderHtml(report: ReturnType<typeof structuredReport>): string {
 	const health = (report.health ?? [])
 		.map((check) => `<tr class="${check.ok ? "ok" : String(check.severity)}"><td>${escapeHtml(String(check.id))}</td><td>${check.ok ? "·" : "✗"}</td><td>${escapeHtml(String(check.detail))}</td></tr>`)
 		.join("\n");
+	// P15: the four observed receipt labels (review / checks / workspace
+	// recovery / publication) — the same line the status/inspect panels and
+	// the UI render; a missing receipt stays "no receipt", never inferred.
+	const states = report.receiptStates as KitReadout["receiptStates"];
+	const checkpoint = report.checkpoint as KitReadout["checkpoint"];
+	const receipts = states
+		? `<p>latest wave ${escapeHtml(states.taskId)} w${states.wave}: ${escapeHtml(receiptLabelsLine(states))}</p>`
+			+ (checkpoint
+				? `<p class="meta">frozen checkpoint: wave ${checkpoint.wave} · ${escapeHtml(checkpoint.baseTree.slice(0, 12))}… → ${escapeHtml(checkpoint.candidateTree.slice(0, 12))}… · asOf ${escapeHtml(new Date(checkpoint.asOf).toISOString())}</p>`
+				: "")
+		: "";
 	const spend = Number(usage?.sessionUsd ?? 0);
 	const ceiling = Number(usage?.ceilingUsd ?? 0);
 	return `<!doctype html>
@@ -65,7 +77,7 @@ tr.error td{background:#ffe0e0}
 <p class="meta">generated ${escapeHtml(report.generatedAt)} · kit ${escapeHtml(String(report.identity?.kit ?? "?"))} · pi-durable ${escapeHtml(String(report.identity?.piDurable ?? "?"))} · phase ${escapeHtml(String(report.phase ?? "?"))}${report.degraded ? " · DEGRADED (side-cars only)" : ""} · budget $${spend.toFixed(2)}${ceiling > 0 ? ` of $${ceiling.toFixed(2)}` : ""} · ${(usage?.wavesExecuted ?? 0)} wave(s)</p>
 <h2>tasks</h2>
 <table><tr><th>task</th><th>status</th><th>waves</th><th>title</th></tr>${rows}</table>
-<h2>wave timeline</h2>
+${receipts ? `<h2>receipts</h2>\n${receipts}\n` : ""}<h2>wave timeline</h2>
 <table><tr><th>task</th><th>wave</th><th>started</th><th>duration</th><th>outcome</th></tr>${spans}</table>
 <h2>usage by model</h2>
 <table><tr><th>provider/model</th><th>USD</th></tr>${Object.entries(usage?.byModel ?? {}).map(([key, model]) => `<tr><td>${escapeHtml(key)}</td><td>$${Number(model.usd).toFixed(4)}</td></tr>`).join("\n")}</table>

@@ -21,14 +21,21 @@ export interface TaskDiffPayload {
 	diff: string;
 	statsJson?: DisplayDiffStats;
 	baselineTreeSha?: string;
+	/** P15: a legacy pre-revision artifact — display only, no receipt backs it. */
+	historical?: boolean;
 }
 
-/** GET /api/tasks/:id/diff/live wire shape (computed on demand, never persisted). */
+/** GET /api/tasks/:id/diff/live wire shape (M0-P15: the latest frozen checkpoint,
+ *  tree-to-tree; computed on demand, never persisted). */
 export interface LiveDiffPayload {
 	at: number;
 	task: string;
+	/** the frozen checkpoint's wave (may be a previous wave while a retry is mid-flight). */
 	wave: number;
+	/** the checkpoint's base tree (start-of-wave tree). */
 	baselineTreeSha: string;
+	/** the checkpoint's freeze timestamp — the drawer's "frozen at" label. */
+	frozenAt: number;
 	bytes: number;
 	truncated: boolean;
 	diff: string;
@@ -68,6 +75,10 @@ export interface DiffDoc {
 	/** A.7: the wave's own trees when the doc is wave-scoped */
 	startTreeSha?: string;
 	endTreeSha?: string;
+	/** P15: the live doc's checkpoint freeze timestamp ("frozen at" label). */
+	frozenAt?: number;
+	/** P15: a legacy persisted artifact — display only, no receipt backs it. */
+	historical?: boolean;
 }
 
 export function normalize(live: LiveDiffPayload): DiffDoc {
@@ -79,6 +90,7 @@ export function normalize(live: LiveDiffPayload): DiffDoc {
 		bytes: live.bytes,
 		truncated: live.truncated,
 		statsFiles: live.stats.files,
+		frozenAt: live.frozenAt,
 		...(live.note !== undefined ? { note: live.note } : {}),
 	};
 }
@@ -109,6 +121,7 @@ export function normalizePersisted(p: TaskDiffPayload): DiffDoc {
 		truncated: p.truncated,
 		statsJson: p.statsJson,
 		...(p.baselineTreeSha !== undefined ? { baselineTreeSha: p.baselineTreeSha } : {}),
+		...(p.historical === true ? { historical: true } : {}),
 	};
 }
 

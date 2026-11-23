@@ -32,6 +32,9 @@ import {
 	type AssessVerifierOptions, type VerifierObservation,
 } from "./verifier-assessment.ts";
 import type { ExecutionContext, TaskExecutionContext, TaskReadContext } from "./workspace.ts";
+import {
+	admitSubmission, BudgetAdmissionError, isBudgetDenial, recordBudgetStop, type AdmissionCheckpoint,
+} from "./model-admission.ts";
 
 export type Verdict = "approve" | "reject" | "needs_human";
 
@@ -135,8 +138,12 @@ export interface VerifyOptions {
 	submissionRecovery?: Partial<Record<VerifyPassName, VerifySubmissionRecovery>>;
 	/** Stable request identities for a new pass; required wave callers derive these from the checkpoint key. */
 	submissionKeys?: Partial<Record<VerifyPassName, string>>;
-	/** Persist the conversation/request tuple before the first submit call. */
+	/** Persist the conversation/request tuple before the first submit call (and
+	 *  again with the new key when a terminal failure is resubmitted). */
 	onSubmissionPrepared?: (pass: VerifyPassName, conversationId: number, submissionKey: string) => Promise<void>;
+	/** Mint the NEW request identity for a resubmitted pass after its checkpointed
+	 *  request reconciled to a terminal failure (never reusing that key). */
+	resubmitAttemptKey?: (pass: VerifyPassName, baseKey: string) => string;
 	/** Atomically checkpoint a committed pass receipt with its reviewed outcome. */
 	checkpointForPass?: (pass: VerifyPassName, conversationId: number, submissionKey: string, result: VerifyResult) => Checkpoint;
 	/** Runs after the pass receipt commits and before another pass is dispatched. */
@@ -248,9 +255,21 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 		});
 	};
 	const passPrompt = (pass: VerifyPassName) => pass === "primary" ? VERIFY_ROLE_BRIEF : SKEPTIC_ROLE_BRIEF;
+	// M0-P16: every pass is a paid submission under the single admission gate.
+	const checkpointCtx = (): AdmissionCheckpoint => ({
+		planRevision: options.waveIdentity?.planRevision,
+		taskId: task.id,
+		wave: options.waveIdentity?.wave,
+	});
+	const admitPass = async (pass: VerifyPassName): Promise<void> => {
+		const stage = options.waveIdentity ? pass : "verify";
+		const admission = await admitSubmission(kit, stage, checkpointCtx());
+		if (!admission.admitted) throw new BudgetAdmissionError(admission.reason);
+	};
+	let fallbackAttempt = 0;
 	const runPass = async (pass: VerifyPassName): Promise<VerifyResult> => {
 		const recovery = options.submissionRecovery?.[pass];
-		const submissionKey = recovery?.submissionKey ?? options.submissionKeys?.[pass] ?? `verify-${task.id}-${pass}-${Date.now()}`;
+		let submissionKey = recovery?.submissionKey ?? options.submissionKeys?.[pass] ?? `verify-${task.id}-${pass}-${Date.now()}`;
 		let conv = recovery ? await kitConv.find(recovery.conversationId) : undefined;
 		if (recovery && !conv) throw new Error(`checkpointed ${pass} verifier conversation ${recovery.conversationId} is unavailable; refusing a new submission`);
 		conv ??= await kitConv.createUnit({
@@ -262,8 +281,33 @@ export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary:
 			executionContext,
 		});
 		const conversationId = idOfConversation(conv);
-		if (!recovery) await options.onSubmissionPrepared?.(pass, conversationId, submissionKey);
-		const outcome = await kitConv.submitAndAwait(conv, submissionKey, content);
+		if (!recovery) {
+			await options.onSubmissionPrepared?.(pass, conversationId, submissionKey);
+			// M0-P16: a FRESH pass is admitted before its first call.
+			await admitPass(pass);
+		}
+		let outcome = await kitConv.submitAndAwait(conv, submissionKey, content);
+		if (recovery && outcome.status === "unanswered") {
+			// Reconcile-first: the same request was reacquired by its exact
+			// identity. A TERMINAL failure under it — a model error or a past
+			// budget denial — is never replayed and its key is never reused:
+			// checkpoint a NEW submission attempt for THIS pass only (prior usage
+			// stays counted) and dispatch it. Whether the pause still holds is
+			// the admission's call: it refuses (recording the stop) while the
+			// ceiling is still breached and admits after the human raises it.
+			const newKey = options.resubmitAttemptKey?.(pass, submissionKey) ?? `${submissionKey}#r${++fallbackAttempt}`;
+			submissionKey = newKey;
+			await options.onSubmissionPrepared?.(pass, conversationId, submissionKey);
+			await admitPass(pass);
+			outcome = await kitConv.submitAndAwait(conv, submissionKey, content);
+		}
+		if (outcome.status === "unanswered" && (isBudgetDenial(outcome.detail) || isBudgetDenial(outcome.reason))) {
+			// A denial inside the pass (next tool follow-up, SDK retry, or
+			// compaction dispatch paused by the guard) is a budget pause — never
+			// a model failure and never a verdict: no pass receipt is written.
+			const reason = await recordBudgetStop(kit, options.waveIdentity ? pass : "verify", checkpointCtx(), "a provider dispatch inside the pass was paused by budget admission (tool follow-up, retry, or compaction)");
+			throw new BudgetAdmissionError(reason);
+		}
 		const raw = parseVerdictStrict(outcome.answer ?? "");
 		const result = await enforceCriterionEvidence(raw, task.acceptance, evidenceContext, refuse);
 		await persistPass(pass, result, outcome.usage, conversationId, submissionKey);
