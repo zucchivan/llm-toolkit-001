@@ -7,7 +7,7 @@
  * wave 2 — the completed program then satisfies the §0 invocation.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { readFile, writeFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, mkdtemp, rm, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initProject } from "../src/init.ts";
@@ -20,6 +20,8 @@ import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit, installDemoGates } from "./demo-project.ts";
 import { readJson, atomicWriteJson } from "../src/util/fsx.ts";
+import { publishHandoffNote } from "../src/engine/handoffs.ts";
+import { HandoffDoc } from "../src/engine/infos.ts";
 import { exec } from "../src/util/exec.ts";
 
 // The product sources the wave driver's gates actually execute — the parser
@@ -243,15 +245,28 @@ describe("e2e smoke: fixture plan → run --approve (scripted faux)", () => {
 		const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
 		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
 
-		// Queue the note exactly like the `handoff` CLI does (atomic side-car).
+			// The pre-P17 side-car (old CLI shape) imports once into the inbox (M0-P17).
 		await atomicWriteJson(kit.loop.paths.pendingHandoff, { ts: Date.now(), notes: ["keep tree clean"] });
+		// And a note written exactly like the new `handoff` CLI does: one atomically
+		// published unique file (no read-modify-write race with a running driver).
+		const noteId = await publishHandoffNote(kit.loop.paths, "also watch the gate output");
 
 		await runWaves(kit, { approve: { planRevision: planOutcome.planRevision }, tasksFilter: [] });
 		const dumped = await readSessionState(kit.loop.harness);
 		expect(dumped.rows.some((r) => r.kind === "handoff" && r.verb === "handoff-ingested" && (r.detail ?? "").includes("keep tree clean"))).toBe(true);
-		// The handoff file is removed after ingestion (single process lock respected).
+		expect(dumped.rows.some((r) => r.kind === "handoff" && r.verb === "handoff-ingested" && (r.detail ?? "").includes("also watch the gate output"))).toBe(true);
+		// Both notes consumed once at wave 1: ids + text are durably bound to the
+		// pending wave, the legacy side-car is gone, and the inbox is empty.
+		const handoffs = await kit.loop.harness.snapshot(HandoffDoc, BACKGROUND_CONTEXT);
+		expect(handoffs?.bindings).toHaveLength(1);
+		expect(handoffs?.bindings[0]?.wave).toBe(1);
+		expect(handoffs?.bindings[0]?.notes.join(" | ")).toContain("keep tree clean");
+		expect(handoffs?.bindings[0]?.notes.join(" | ")).toContain("also watch the gate output");
+		expect(handoffs?.bindings[0]?.noteIds).toContain(noteId);
+		expect(handoffs?.consumedIds).toHaveLength(2);
 		await kit.loop.close();
 		kit.lock.release();
+		expect(await readdir(join(project.root, ".orch", "handoffs", "inbox"))).toEqual([]);
 		await expect(readFile(join(project.root, ".orch", "pending-handoff.json"), "utf8")).rejects.toThrow();
 	});
 

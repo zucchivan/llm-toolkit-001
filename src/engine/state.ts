@@ -6,15 +6,16 @@
  */
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { BACKGROUND_CONTEXT } from "./kit.ts";
-import { RouterDoc, RunStatusDoc, WaveLogDoc, syncSideCars, renderRouterMd } from "./infos.ts";
+import { BACKGROUND_CONTEXT, convId } from "./kit.ts";
+import { RouterDoc, RunStatusDoc, WaveLogDoc, HandoffDoc, syncSideCars, renderRouterMd } from "./infos.ts";
+import { GovernorSleep } from "./tasks.ts";
 import { checkpointKey, latestFrozenCheckpoint, latestReceiptStates, receiptKey, ReceiptsDoc } from "./receipts.ts";
 import type { Checkpoint, CheckpointEvent, JournalReceiptEvent, ReceiptEvent, ReceiptIdentity, ReceiptsDocValue } from "./receipts.ts";
 import type { ArchivedPlanRef, PlanIdentity } from "./plans.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
 import type { LoopAndLock } from "./harness.ts";
-import type { RouterDocValue, RouterTask, RunStatusDocValue, WaveRow } from "./infos.ts";
+import type { HandoffDocValue, RouterDocValue, RouterTask, RunStatusDocValue, WaveRow } from "./infos.ts";
 import { flushStated } from "./harness.ts";
 import type { ProjectPaths, ReportRow, StatusPayloads } from "./harness.ts";
 import type { Session, Draft } from "./kit.ts";
@@ -259,8 +260,33 @@ export async function approvalMirrorRefusal(loopAndLock: LoopAndLock, state: Ses
 
 export type ReceiptAttempt = {
 	identity: ReceiptIdentity;
+	/** Optional DETERMINISTIC operation id (M0-P18): a human resolution derives
+	 *  it from the request identity, so replaying the same request after a crash
+	 *  reconciles to the same receipt instead of minting a second decision. */
+	opId?: string;
 	build: (meta: { key: string; ordinal: number; opId: string; at: number }) => JournalReceiptEvent;
 };
+
+/** M0-P17: arm the rate-limit durable sleep ATOMICALLY — checked before the
+ *  durable task creation (budgets.maxSleepCycles) and created + recorded (task
+ *  id, deadline, per-task counter) inside ONE transaction. */
+export interface SleepArmRequest {
+	input: { until: number; reason: string };
+	/** The implementer conversation that owns the sleep task. */
+	conversationId: number;
+	/** The RouterTask whose per-task sleep counter increments in this commit. */
+	taskId: string;
+	/** Wave facts for the governor row this commit appends on a successful arm. */
+	wave?: number;
+	/** Short reason echoed in the row. */
+	reason?: string;
+}
+
+export interface CommitResult {
+	/** The created sleep task id, or undefined when the per-task sleep budget
+	 *  was already exhausted and NO new timer was created (M0-P17). */
+	sleepTaskId?: number;
+}
 
 export interface StateInput {
 	/** Mutate the RouterDoc draft inside the commit. Edits apply last. */
@@ -279,6 +305,13 @@ export interface StateInput {
 	checkpoints?: Checkpoint[];
 	/** Wave-log rows appended inside the commit (then mirrored to JSONL). */
 	rows?: WaveRow[];
+	/** M0-P17: create + record the rate-limit sleep task and bump the per-task
+	 *  sleep counter in THIS transaction. Applied first; the recorded id lands
+	 *  on RunStatusDoc only when creation succeeded. */
+	sleepTask?: SleepArmRequest;
+	/** M0-P17: bind this wave's consumed handoff note ids + text in the same
+	 *  transaction that starts the wave (mutates the HandoffDoc draft). */
+	handoffs?: (d: ChordDraft<HandoffDocValue>) => void;
 	/** What status.json should show after this commit. */
 	statusPhase?: StatusPhase;
 	/** Latest engine reports to carry into status.json. */
@@ -381,11 +414,43 @@ function composeStatusPayload(loopAndLock: LoopAndLock, input: PayloadInput): St
 	};
 }
 
-/** One atomic commit of the three docs; mirrors + status.json follow best-effort. */
-export async function commitState(loopAndLock: LoopAndLock, input: StateInput): Promise<void> {
+/** One atomic commit of the durable docs; mirrors + status.json follow best-effort.
+ *  Returns the created sleep task id when `sleepTask` armed a new timer (M0-P17). */
+export async function commitState(loopAndLock: LoopAndLock, input: StateInput): Promise<CommitResult> {
 	const harness = loopAndLock.loop.harness;
+	let createdSleepTaskId: number | undefined;
 	await harness.commit(
 		async (tx) => {
+			// M0-P17: the sleep arm runs FIRST so the durable task, its recorded id,
+			// and the per-task counter can never exist without each other. The cap
+			// check precedes the durable task creation inside the same transaction.
+			let ownerSleepCycles: number | undefined;
+			if (input.sleepTask) {
+				const cap = loopAndLock.loop.config.budgets.maxSleepCycles;
+				const routerDraft = await tx.doc(RouterDoc);
+				const owner = routerDraft.tasks.find((entry) => entry.id === input.sleepTask!.taskId);
+				const used = owner?.sleepCycles ?? 0;
+				if (owner && used < cap) {
+					const created = await (tx as { createTask: (t: unknown, i: unknown, o: unknown) => Promise<unknown> }).createTask(
+						GovernorSleep,
+						input.sleepTask.input,
+						{ ownership: { kind: "conversation" }, conversationId: convId(input.sleepTask.conversationId) },
+					);
+					createdSleepTaskId = created as unknown as number;
+					owner.sleepCycles = used + 1;
+					ownerSleepCycles = used + 1;
+					const wlDraft = await tx.doc(WaveLogDoc);
+					wlDraft.rows.push({
+						ts: Date.now(),
+						kind: "governor",
+						task: input.sleepTask.taskId,
+						...(input.sleepTask.wave !== undefined ? { wave: input.sleepTask.wave } : {}),
+						verb: "rate-limit-sleep",
+						reason: input.sleepTask.reason ?? input.sleepTask.input.reason,
+						detail: `durable sleep task #${createdSleepTaskId} until ${new Date(input.sleepTask.input.until).toISOString()} (sleep ${used + 1}/${cap})`,
+					});
+				}
+			}
 			if (input.router) {
 				const draft = await tx.doc(RouterDoc);
 				applyInput(draft, input.router);
@@ -393,6 +458,17 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 			if (input.runStatus) {
 				const draft = await tx.doc(RunStatusDoc);
 				applyInput(draft, input.runStatus);
+				if (input.sleepTask && createdSleepTaskId !== undefined && ownerSleepCycles !== undefined) {
+					draft.sleepTaskId = createdSleepTaskId;
+					draft.sleepUntil = input.sleepTask.input.until;
+					// Display mirror of the owner task's counter (the durable truth is
+					// RouterTask.sleepCycles). Never reset on a mere timer wake.
+					draft.sleepCycleCount = ownerSleepCycles;
+				}
+			}
+			if (input.handoffs) {
+				const draft = await tx.doc(HandoffDoc);
+				input.handoffs(draft);
 			}
 			if (input.rows?.length) {
 				const wlDraft = await tx.doc(WaveLogDoc);
@@ -411,7 +487,7 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 						const recordedOrdinal = recDraft.events.reduce((max, event) =>
 							"key" in event && event.key === key ? Math.max(max, event.ordinal) : max, 0);
 						const ordinal = Math.max(latest[key]?.ordinal ?? 0, recordedOrdinal) + 1;
-						const opId = randomUUID();
+						const opId = attempt.opId ?? randomUUID();
 						const at = Date.now();
 						const event = attempt.build({ key, ordinal, opId, at });
 						if (event.key !== key || event.ordinal !== ordinal || event.opId !== opId || event.at !== at) {
@@ -454,6 +530,7 @@ export async function commitState(loopAndLock: LoopAndLock, input: StateInput): 
 		receiptsAfter: receiptsAfter ?? { version: 1, events: [] },
 		input,
 	});
+	return createdSleepTaskId !== undefined ? { sleepTaskId: createdSleepTaskId } : {};
 }
 
 /** Apply data or mutator to a doc draft. */

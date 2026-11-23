@@ -118,7 +118,7 @@ These are host-side path and data-flow distinctions only. The injected literal r
 
 ## M0-P11 — criterion evidence + reviewed passes (`loop.receipts`)
 
-**`src/engine/receipts.ts`** defines the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[], latest?, latestCheckpoints?}`). P11 records GATE and PASS; P12 additively adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY journal events; P14 adds checkpoint events for each wave/stage. Journal wrappers carry a stable `planRevision/taskId/wave/stage` key and unique per-key attempt ordinal. `commitState({receiptAttempts, checkpoints})` appends the events and advances their latest pointers in the SAME harness commit as accompanying state changes. Raw output/tails stay out of documents (the gate log and wave log carry them).
+**`src/engine/receipts.ts`** defines the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[], latest?, latestCheckpoints?}`). P11 records GATE and PASS; P12 additively adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY journal events; P14 adds checkpoint events for each wave/stage; P18 adds the `resolution` journal kind (the binding human decision, see `src/engine/resolution.ts`). Journal wrappers carry a stable `planRevision/taskId/wave/stage` key and unique per-key attempt ordinal; `ReceiptAttempt.opId` may pin a DETERMINISTIC operation id. `commitState({receiptAttempts, checkpoints})` appends the events and advances their latest pointers in the SAME harness commit as accompanying state changes. Raw output/tails stay out of documents (the gate log and wave log carry them).
 
 - `GateReceipt` = wave key + `{id, tree, controlsSha256?, failureHash?, checks}`: the frozen candidate plus every `GateCheck` `{id, kind: scope|recipe, outcome: pass|fail|skip|error, exit, ms}` observed on it. The optional `failureHash` supports the duplicate-gate breaker without storing output. The driver commits one per wave, including failed-gate waves. `controlsSha256` is absent when the plan has no approved control bundle (absent ≠ empty).
 - `PassReceipt` = wave key + `{id, tree, gateId, policy, review}`: one read-only pass — `ReviewPass = {pass: primary|skeptic|human, verdict, criteria: CriterionResult[], notes, conversationId?}` — bound to the candidate tree, the wave's gate receipt, and the effective verification policy (`always`/`never` from `[gates] skepticSecondPass`; `risk-v1` arrives with routing). Each pass is committed BEFORE the next pass is dispatched; the verdict row's additive `receipt` field carries the pass receipt id.
@@ -156,6 +156,86 @@ The active serial driver resolves the checked tree from `TaskExecutionContext.ca
 
 Local result refs: the private integration head is `refs/kit/<revision>/accepted`; immutable per-wave integration commits are pinned below `refs/kit/<revision>/integration-objects/`; commit mode publishes the named local branch `refs/heads/kit/<revision>/result`. For `none`, the operator may inspect the result with a separate `git worktree add --detach <new-dir> refs/kit/<revision>/accepted`; the prepared operation itself does not create that worktree. Test fault injection is exposed at every receipt-commit and ref/disposal effect boundary. Effect-receipt write failures propagate and leave a pending/unknown receipt for reconciliation; display-artifact writes remain best-effort.
 
+## src/engine/handoffs.ts (M0-P17)
+
+- `publishHandoffNote(paths, note)`: the `handoff` CLI's ENTIRE write path —
+  one atomically published `<uuid>.json` note file per invocation under the
+  inbox (no read-modify-write race); notes over `HANDOFF_NOTE_MAX_CHARS`
+  (2,000) refuse with `HandoffNoteTooLongError` (CLI exit 1)
+- `readHandoffClaim(paths, {excludeIds})`: valid inbox notes oldest (ts,id)
+  first up to `HANDOFF_CLAIM_MAX_CHARS` (3,000) in total, stopping at the
+  first overflow (excess stays queued); already-consumed ids surface as
+  `duplicates`; unparseable/mismatched/oversized files surface as `invalid`
+- the driver's wave-start transaction binds `taken` ids + text via
+  `commitState(kit, { handoffs, … })` (`HandoffDoc.bindings` +
+  `consumedIds`, both capped) and appends `handoffClaimRows` (`handoff-ingested`,
+  `handoff-invalid`, `handoff-queued` rows); `settleHandoffClaim` runs AFTER
+  the commit (unlink consumed + duplicates, move invalid to `invalid/`),
+  `discardConsumedHandoffNotes` unlinks a resumed wave's already-bound files
+- `importLegacyHandoff(kit)`: one-time import of the pre-P17 side-car under
+  the owner lock, guarded by the file's sha256 in
+  `RunStatusDoc.handoffImportedSha256`; legacy note ids derive from the hash
+  so a crash re-import overwrites the same filenames (no duplicates); the
+  hash is recorded even when the file is diagnosed as malformed
+
+## src/engine/resolution.ts (M0-P18)
+
+The binding HUMAN path (§3 "Human path"). `resolve` is the only command that
+returns a `quarantined` task to work, and the only place a human — not a model —
+authorizes a candidate tree. It never dispatches a model, never edits the
+operator checkout, never force-dones a task, and never publishes remotely.
+
+- `runResolution(kit, {planRevision, taskId, action, reason, tree?, evidence?})`
+  — validates, in order: the CURRENT plan revision, the current grant (the task
+  must be inside `grant.selected`; a resolution never broadens a grant), the
+  task existing in the plan, a reviewed base commit, and the latest SEALED
+  (`terminal`, `complete`) wave checkpoint (an `unknown` checkpoint anywhere
+  refuses: uncertain effects are never manually approvable). Every refusal is a
+  `ResolutionRefusal` whose message names the remedy.
+- Shared recovery preconditions: the accepted integration head is unchanged
+  (it names the wave's recorded `parent`, or is still ABSENT because the first
+  acceptance lazily creates it at the reviewed base commit), the wave's
+  rollback receipt is `discarded`, and
+  `inspectCheckpointedWorkspace` observes the recorded lease `absent`.
+- `--retry`: one commit sets the task back to `todo`, clears `blockReason`,
+  `lastGateHash`, `sleepCycles` (the M0-P17 durable sleep counter starts fresh)
+  and `RunStatusDoc.consecutiveErrors`, appends the human feedback entry, a
+  `resolution` receipt, and a `terminal`/`retry` checkpoint whose `parent` is
+  the unchanged accepted head. The next authorized `run` therefore starts
+  `waveCount + 1` from that head (never the failed candidate) with a fresh
+  attempt quota; every earlier receipt, wave and feedback entry is preserved.
+- `--accept-tree <oid>`: ONLY for a `needs_human` quarantine
+  (`RouterTask.blockReason`) with that wave's PINNED candidate (the retained
+  checkpoint candidate AND the lease candidate pin must both match). Unchanged
+  lineage/controls are required (the wave's gate receipt must cover the same
+  tree and the current `controlsSha256`). Deterministic gates are RERUN on the
+  exact frozen candidate in a disposable private lease/read view (parent→candidate
+  scope, reviewed recipe bundle, no operator checkout), and every check must
+  pass. `--evidence` is a regular local JSON file ≤ 64 KiB shaped exactly
+  `{criteria: CriterionResult[]}`, validated by `review.ts` against the RERUN
+  gate receipt and the frozen tree. The commit appends the new gate receipt,
+  an `AcceptanceReceipt` with `authority: "human"`, `policy: "human-v1"`,
+  `required: ["human"]` and the human pass, the `resolution` receipt, and an
+  `integrate`/`pending` checkpoint; the task becomes `in_progress` (accepted is
+  NOT done). `integrateAcceptedCandidate` then drives LOCAL integration only.
+- Idempotency: `resolutionOperationId` derives a deterministic SHA256 over
+  the canonical request identity (revision, task, wave, action, reason, tree,
+  evidence digest) and is recorded as the receipt `opId`
+  (`ReceiptAttempt.opId`). Replaying the same request reconciles to the
+  recorded decision — returning `idempotent: true` and completing any missing
+  integration step — instead of minting a second decision.
+- `loadResolutionEvidence(file)`/`validateResolutionReason(reason)` are the
+  CLI's input bounds (regular file, no symlink, ≤64 KiB, UTF-8 JSON, single
+  `criteria` key, preserved malformed entries; reason 1–300 chars).
+- `receipts.ts` gains the `resolution` journal kind (`Resolution` payload:
+  `{...wave, action, reason, evidenceSha256?, tree?}`) and
+  `ReceiptStateView.resolution`; `state.ts` gains `ReceiptAttempt.opId`;
+  `workspace.ts` gains `inspectCheckpointedWorkspace(root, identity, taskId,
+  leaseId)` (handle-free observation of a checkpointed lease + its candidate
+  pin). `waves.ts` reconciles a durable HUMAN acceptance on resume: it does not
+  require model pass receipts and never re-derives verifier authority, so the
+  authorized run only integrates/publishes and records `done`.
+
 ## src/engine/harness.ts
 
 - `HarnessOptions`: `models` (`Models`, via the kit.ts seam), `registry`, `env`
@@ -167,6 +247,13 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
 - storage single-owner: `.orch/lock` via `O_EXCL` + live-PID check
   (`src/util/lockfile.ts`) BEFORE any sqlite open; `status --follow` therefore
   reads side-cars, never storage, while a run is live
+- `ProjectPaths` carries the handoff surfaces (M0-P17):
+  `handoffInbox` = `.orch/handoffs/inbox/` (one `<uuid>.json` note per file,
+  written by the `handoff` CLI), `handoffInvalid` = `.orch/handoffs/invalid/`
+  (diagnosed invalid notes), and the legacy `pendingHandoff`
+  = `.orch/pending-handoff.json` (read once by the import, never written by
+  the current CLI); `LoopHarness.now()` is the injectable clock (fake in
+  tests) every scheduled deadline reads
 - `Session.snapshot(token, cx)` reads (`RouterDoc`/`RunStatusDoc`/`WaveLogDoc`),
   `session.commit(async (tx) => …)` writes them (`tx.doc(...)` drafts)
 - version assert: `PD_VERSION` (this module) compared against the installed
@@ -202,20 +289,26 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
 - `defineDoc` session-scoped docs (via the kit.ts seam, which supplies both
   `defineDoc` and the `SessionDocToken` type): `RouterDoc` (`loop.router` at
   payload version 2: tasks id/title/spec/dependsOn/acceptance/targetPaths/
-  priority/status/waveCount/convId/baselineTreeSha/lastGateHash/feedback;
+  priority/status/waveCount/convId/baselineTreeSha/lastGateHash/sleepCycles
+  (M0-P17: the task's durable rate-limit sleep counter)/feedback;
   phase empty→planned→running→complete; plus `identity` — the CURRENT plan's
   `PlanIdentity`, absent only on legacy v1 plans — and `archived`, references
   to replaced plans, most recent first),
   `WaveLogDoc` (`loop.wavelog`, still version 1: append-only rows mirrored to
   `.orch/wave-log.jsonl`), `RunStatusDoc` (`loop.run` at payload version 2:
   prdPath/prdSha/budgetSpentUsd/activeAlert/sleepTaskId/sleepUntil/
-  sleepCycleCount/kitVersion — recorded as the creating kit's identity and
-  never rewritten for older rows — plus the ADR 01 grant triple
-  `approvedPlanRevision` + `approvedSelected` (granted task ids, sorted
-  unique) + `humanApprovedAt`: a stamp authorizes a run only when all three
-  legs are present and the revision names the RouterDoc's CURRENT
+  sleepCycleCount (M0-P17: display mirror of the last-armed task's per-task
+  counter; never reset on a timer wake)/handoffImportedSha256 (legacy
+  pending-handoff.json imports, one hash each)/kitVersion — recorded as the
+  creating kit's identity and never rewritten for older rows — plus the ADR 01
+  grant triple `approvedPlanRevision` + `approvedSelected` (granted task ids,
+  sorted unique) + `humanApprovedAt`: a stamp authorizes a run only when all
+  three legs are present and the revision names the RouterDoc's CURRENT
   planRevision, so a timestamp alone or a pre-grant v2 pair authorizes no
-  run)
+  run), and `HandoffDoc` (`loop.handoffs`, M0-P17: `consumedIds` — every
+  consumed handoff note id, the crash-duplicate guard — and `bindings`, the
+  recent per-wave claims binding consumed note ids + text to a pending wave
+  in the wave-start transaction)
 - pure v1→v2 migrations on the pinned `defineDoc` contract:
   `migrateRouterDoc` keeps historical rows readable and invents no identity
   (an unmigrated legacy plan never runs — the operator replans), and
@@ -276,7 +369,7 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   the lock), then ONE `commitState` writes the grant
   `{planRevision, selected, humanApprovedAt}` + the phase flip planned→running
   + the review row. Old CLI clients and pre-grant v2 stamps authorize nothing.
-- `runWaves` admission happens BEFORE any handoff ingestion, sleep wait,
+- `runWaves` admission happens BEFORE any handoff import, sleep wait,
   budget read, or wave: `--approve` mints the grant through `approveGrant`; a
   bare resume requires the stored grant (via `grantRefusal`), inherits its
   exact selection, and never consults the mirror. An explicit set without
@@ -292,6 +385,19 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   `remainingPlanIds`, `quarantined`, `blockedIds`; `DriverExit` is
   `plan-complete | selection-complete | blocked | recovery-required | budget | sleeping`
   (fulfilled 0, policy/recovery/budget 2, sleeping 42, refusals 1, SIGINT 130).
+
+### Wave-boundary handoff claims (M0-P17)
+
+- `runWaves` starts by importing the legacy `.orch/pending-handoff.json` once
+  (`importLegacyHandoff`, owner lock, content-hash guarded). At each WAVE
+  boundary the driver claims the oldest (ts,id) inbox notes up to 3,000 chars
+  total and binds the consumed ids + text to the pending wave in the SAME
+  commit that starts the wave (`commitState` `handoffs` mutator →
+  `HandoffDoc`); note files unlink after the commit, so a crash between
+  commit and unlink is ignored on resume (the binding is durable; duplicates
+  are unlinked, never redelivered). Notes arriving after the claim (or left
+  queued by the char budget) apply to the NEXT wave. A resumed wave replays
+  its own binding's text and never re-claims.
 
 ### M0-P14 serial candidate/checkpoint flow
 
@@ -345,8 +451,12 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   `reason`, reading `LiveDoc.snapshot` for `runFailure.detail`)
 - `Conversation.reset(undefined, ctx)` before wave N>1 after a failed wave —
   failed debugging turns stay in storage (auditable) but out of the window
-- `harness.commit(async (tx) => tx.createTask(GovernorSleep, …), ctx)` with
-  `ownership: {kind:"conversation"}, conversationId` arms the rate-limit sleep
+- the rate-limit sleep arms ATOMICALLY (M0-P17): `commitState(kit, { sleepTask,
+  … })` checks the per-task counter (`RouterTask.sleepCycles`) against
+  `budgets.maxSleepCycles` INSIDE the transaction and creates the
+  `GovernorSleep` task (`ownership: {kind:"conversation"}, conversationId`)
+  together with its recorded id, deadline, and counter — or creates nothing
+  when the budget is exhausted
 - report intake: `onReport` rows surfaced into wave-log (`task_interrupted`,
   `task_faulted` …)
 
@@ -438,9 +548,15 @@ rows. This remains trusted-project host execution, not an OS sandbox.
 - rate-limit detection (`looksLikeRateLimit`) + reset parsing
   (`parseResetDelay`, e.g. "resets in 30m", "retry after", 429 reset fields);
   sleep via `tasks.ts` `kit.sleep`
+- `sleepBudgetState(kit, taskId)` reads the per-task budget `{used, cap,
+  exhausted}` from `RouterTask.sleepCycles` vs `budgets.maxSleepCycles`;
+  `armRateLimitSleep` pre-checks it and returns `undefined` (no timer) when
+  exhausted — the driver quarantines once instead of arming
 - sleep resume across restarts: `harness.getTask` + `resume()` +
   `waitForTask` on re-open (timers wake due sleeps while the process lives; the
-  injected fake clock covers tests)
+  injected fake clock covers tests). A wake clears only the RunStatusDoc
+  pointer/deadline/alert — never the consecutive-error streak (only an
+  answered submission resets that) and never the per-task sleep counter
 
 ## src/engine/delivery.ts
 
@@ -525,3 +641,10 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   0 fulfilled · 2 stopped/recovery-required · 42 sleeping · 1 invalid/error/busy · 130 SIGINT.
   `none` prints the detached accepted-ref checkout command; `commit` names its
   local result ref. PR publication is not merge.
+- `resolve` parses STRICTLY and refuses non-exclusive forms (exactly one of
+  `--retry` / `--accept-tree`, `--evidence` only with `--accept-tree`; all of
+  `--revision`, `--task`, `--reason` required). Exit codes: `0` resolved (or
+  already recorded — idempotent) · `1` refused/blocked with the remedy printed.
+  It closes the harness and releases `.orch/lock` in `finally`, so every early
+  return (refusal, budget stop, error) leaves no handle behind; `verify` does
+  the same and never mutates task disposition.

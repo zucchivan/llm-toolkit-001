@@ -169,6 +169,9 @@ export type ReceiptStateView = WaveKey & {
 	integration?: IntegrationReceipt["state"];
 	rollback?: RollbackReceipt["state"];
 	delivery?: DeliveryReceipt["state"];
+	/** M0-P18: the human decision recorded for this wave, if any. It explains
+	 *  (never replaces) the gate/pass/acceptance receipts around it. */
+	resolution?: Resolution["action"];
 };
 
 /** Last frozen wave candidate exposed to status/readout consumers. */
@@ -185,9 +188,11 @@ export type ReceiptPayloads = {
 	checkpoint: Checkpoint;
 };
 
-/** The four mutable journal stages get an address and per-key attempt ordinal.
- *  P11 gate/pass events intentionally retain their original wrapper shape. */
-export type JournalReceiptKind = "acceptance" | "integrate" | "rollback" | "delivery";
+/** The mutable journal stages get an address and per-key attempt ordinal.
+ *  P11 gate/pass events intentionally retain their original wrapper shape.
+ *  M0-P18 adds `resolution`: the binding human decision (retry / accept-tree)
+ *  on one blocked wave, recorded under a deterministic operation id. */
+export type JournalReceiptKind = "acceptance" | "integrate" | "rollback" | "delivery" | "resolution";
 export type JournalReceiptEvent = {
 	[K in JournalReceiptKind]: { kind: K; opId: string; at: number; key: string; ordinal: number; value: ReceiptPayloads[K] }
 }[JournalReceiptKind];
@@ -292,6 +297,8 @@ export function receiptStatesForWave(doc: ReceiptsDocValue, wave: WaveKey): Rece
 	if (rollback?.kind === "rollback") view.rollback = rollback.value.state;
 	const delivery = latestJournalEvent(doc, receiptKey({ ...wave, stage: "delivery" }));
 	if (delivery?.kind === "delivery") view.delivery = delivery.value.state;
+	const resolution = latestJournalEvent(doc, receiptKey({ ...wave, stage: "resolution" }));
+	if (resolution?.kind === "resolution") view.resolution = resolution.value.action;
 	return view;
 }
 

@@ -127,6 +127,15 @@ What M2 adds on top of M1 control (kit seam genome A.2/A.3 → root 0.2.2):
   readout's receipt projection: review, checks, workspace recovery,
   publication (each "no receipt" when absent). Quarantine alone never says
   "discarded"; approval alone never says "published".
+- **Unblocking is a CLI decision, never a UI action (M0-P18)** — a quarantined
+  task is resolved by the operator at the CLI (`llm-toolkit-001 resolve`), so
+  the drawer and the report show the copyable instructions and the CLI's
+  refusal/remedy text instead of a button: the `--retry` form for a failed
+  wave, and `--accept-tree <oid> --evidence FILE` only for a `needs_human`
+  block (the candidate OID is the checkpointed candidate the drawer already
+  displays). There is no in-app resolution, acceptance, evidence editor or
+  "force done", and the UI never writes task status, receipts or integration
+  refs; `run` remains the only action that finishes the work.
 - **Diff drawer** — file list (status chip + `+N −M I`) + unified hunks with
   line coloring, lazy per-file, 2000-lines/file cap, binary/truncated notices,
   raw download; deep link `#/diff/<task>`; `Esc` closes. Open from task rows,
@@ -391,8 +400,9 @@ kept out of default `npm test` (it is gated on `KIT_FAUX=1` and runs as
 - Mutations do NOT go through the lock: `POST /api/actions` spawns one detached
   CLI job (`.orch/ui/jobs/<id>.json` + `.log`). plan/run/verify/export need a
   free lock (the server probes it with the same brief retry, then answers 409
-  with the holder pid/phase); handoff rides the atomic side-car and is safe
-  during a run; stop signals a UI job's CLI pid — or, `target: "attached"`,
+  with the holder pid/phase); handoff spawns the CLI's one-note-per-file
+  atomic writer (M0-P17) and is safe during a run; stop signals a UI job's
+  CLI pid — or, `target: "attached"`,
   a terminal-started run after the §7.2.1 identity verification (one
   re-verified SIGINT; every failed check is a reason, never a signal). On
   server start, dead-pid

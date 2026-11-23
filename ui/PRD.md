@@ -161,7 +161,7 @@ The UI exposes exactly these mutations. Every one maps to a CLI invocation
 | Approve & run | `run --approve --revision <uuid> --tasks <id>…` | router planned/running with a visible plan revision; no other run active | the human approval stamp: the exact `{planRevision, selected}` tuple the dialog displayed (M0-P06) |
 | Run selected | `run --approve --revision <uuid> --tasks <id>…` (checked ids only) | plan reviewed; selection non-empty; revision visible | subset of `todo` tasks; the same tuple rule — empty selection never becomes run-all |
 | Stop | SIGINT to the active job | a running UI job, or a terminal-started run whose §7.2.1 identity verification passes | graceful; state stays resumable (exit 130); exactly one re-verified signal |
-| Handoff | `handoff "<note>"` | always (atomic side-car, safe during a run) | queued for the next wave |
+| Handoff | `handoff "<note>"` | always (publishes one atomically written note file; safe during a run) | claimed by the driver at a later wave boundary (oldest first, ≤ 3,000 chars per wave; M0-P17) |
 | Verify | `verify --task <id>` | no run active; task has a retained candidate checkpoint | one-off read-only check of that candidate |
 | Export | `export` | no run active | writes `.orch/artifacts/report.{json,html}` |
 
@@ -370,8 +370,16 @@ authoritative gate.
   "discarded" only on a confirmed discard receipt; task status or patch alone
   is not proof of rollback.
 - Dependent tasks blocked by it are marked as blocked-by-dependency.
-- Available next actions: Handoff, Verify, Export; there is no "retry
-  quarantined" in the loop, and the UI must not invent one.
+- Available next actions: Handoff, Verify, Export. There is no in-app
+  resolution action and the UI must not invent one: unblocking a task is the
+  operator's HUMAN decision at the CLI (M0-P18 `resolve`), so the drawer shows
+  the copyable instructions instead —
+  `llm-toolkit-001 resolve --revision <uuid> --task <id> --retry --reason TEXT`,
+  and, only for a `needs_human` block, the
+  `--accept-tree <oid> --evidence FILE` form — followed by `run`. No editable
+  web authority, no “force done”, and no evidence editor belong in the UI.
+  The UI renders the block reason and the refusal/remedy text the CLI prints;
+  it never writes a resolution, an acceptance, or an integration ref.
 
 ### 8.5 Sleep (exit 42)
 
@@ -525,7 +533,9 @@ Rules:
 
 - One mutating job at a time. `plan`/`run`/`verify`/`export` need the lock; if
   the lock is held or a job is active, `409` with the holder PID/phase.
-- `handoff` is allowed during a run; it writes only the atomic side-car.
+- `handoff` is allowed during a run; it spawns the CLI, whose writer publishes
+  one atomically written note file under `.orch/handoffs/inbox/` — no inline
+  writer, no shared queue file (M0-P17).
 - `stop` acts on a job launched by this server (`target: "job"`, the
   default), or — with `target: "attached"` — on the terminal-started run
   whose §7.2.1 verification passes. Anything unverifiable stays unsignalled:

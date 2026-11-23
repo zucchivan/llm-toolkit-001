@@ -160,6 +160,46 @@ safe to run.
   not stored. Uncertain, conflicting, stale, missing-key, malformed, and network
   outcomes remain `unknown` and cannot change feedback, retries, quarantine,
   task/adoption state, delivery, human approvals, or any command execution.
+- **user handoff notes (M0-P17)** — `handoff "note"` publishes ONE atomically
+  written note file under `.orch/handoffs/inbox/<uuid>.json` (≤ 2,000 chars;
+  one file per invocation, so concurrent writers never race a shared queue).
+  At each wave boundary the driver claims the oldest (ts,id) notes up to
+  3,000 chars in total and binds the consumed ids AND text to that pending
+  wave in the same state transaction that starts it (`HandoffDoc`); the files
+  unlink only after the commit lands, so a crash between commit and unlink is
+  a no-op on resume: the note is already bound — never lost, never redelivered
+  to a later wave. Notes arriving after a wave's claim (including budget
+  overflow left queued) apply to the NEXT wave. The pre-P17
+  `.orch/pending-handoff.json` side-car imports once per unique content hash
+  under the owner lock; invalid notes are diagnosed and quarantined under
+  `.orch/handoffs/invalid/`. The UI keeps spawning the `handoff` CLI; it has
+  no inline writer.
+- **human resolution (M0-P18)** — `resolve` is the ONLY way a blocked
+  (`quarantined`) task returns to work, and the only place a human — not a
+  model — authorizes a tree. It requires the current plan revision, the current
+  grant covering the task (it never broadens a grant), an eligible task state
+  (quarantined, sealed wave), and verified recovery (rollback `discarded`, owned
+  lease observed absent, unchanged accepted integration head).
+  `resolve --revision R --task T --retry --reason TEXT` opens ONE fresh retry
+  cycle: the task goes back to `todo`, `blockReason`/`lastGateHash`/
+  `consecutiveErrors` are cleared, the task's durable sleep counter
+  (`sleepCycles`) starts fresh, and the next wave is `waveCount + 1` starting
+  from the CURRENT accepted head — never the failed candidate. Every earlier
+  receipt, wave and feedback entry is preserved, and nothing is dispatched:
+  the next authorized `run` does the work.
+  `resolve --revision R --task T --accept-tree OID --evidence FILE --reason TEXT`
+  is only for an inconclusive verifier block (`needs_human`, a typed
+  `RouterTask.blockReason`, never a fifth status) with that wave's pinned
+  candidate: lineage and the reviewed control bundle must be unchanged, the
+  deterministic gates are RERUN on the exact frozen candidate, and the evidence
+  document must prove every reviewed criterion. The recorded acceptance carries
+  `authority: "human"` (policy `human-v1`) — never model approval — integrates
+  locally, and leaves publication to an authorized `run` (PR still needs
+  `--deliver`). Both forms derive a deterministic operation id from the request
+  identity + tree + reason/evidence digest, so replaying one (a crash, or an
+  operator rerunning it) reconciles instead of deciding twice. Every refusal
+  prints the remedy. `verify --task` remains diagnostic: it writes review/usage
+  history but never sets a task's status or unblocks dependents.
 - **deliver** — acceptance, integration, workspace recovery, and publication
   are separate receipted effects. `none` records `not_requested` and leaves the
   accepted lineage at `refs/kit/<revision>/accepted`; inspect it in a separate
@@ -217,13 +257,22 @@ All decisions append to `.orch/wave-log.jsonl` with a `reason`.
   (`lastGateHash`) → immediate quarantine.
 - **Consecutive-error breaker** (`budgets.maxConsecutiveErrors`): unanswered
   run failures increment the persisted counter; reaching the cap quarantines
-  with an alert. M0-P14 does not reset it on an answered wave, so it is not a
-  strict back-to-back failure window.
-- **Rate-limit sleep**: rate-limit-shaped errors parse a reset delay (or fall
-  back to 30 min) and arm a DURABLE sleep task (`kit.sleep` via
-  `runtime.sleepUntil`) — the driver exits 42; the next `run` waits out the
-  sleep (real clock or the injected fake one) and resumes without cron code.
-  `budgets.maxSleepCycles` caps the round-trips per task.
+  with an alert. M0-P17: a successful ANSWERED submission resets the streak
+  (never a mere timer wake), so a later task does not inherit an earlier
+  task's transient failures.
+- **Rate-limit sleep (bounded, M0-P17)**: rate-limit-shaped errors parse a
+  reset delay (or fall back to 30 min). Each task owns a durable sleep counter
+  (`RouterTask.sleepCycles`), checked BEFORE the durable sleep task
+  (`kit.sleep` via `runtime.sleepUntil`) is created and incremented in the
+  SAME transaction that records the task id and deadline. The counter is
+  never reset just because a timer woke — it clears for the next task or an
+  explicitly granted human retry. `budgets.maxSleepCycles` (incl. 0) caps the
+  round-trips per task across restarts; when the cap is reached NO new timer
+  is created — the wave quarantines once (exit 2) instead. A rate-limited
+  submission is terminal: the invocation ends (exit 42) after checkpointing
+  the NEXT attempt's unique request key under the same task's counter, so the
+  post-sleep resume dispatches a fresh request instead of replaying the same
+  request id forever.
 
 ## Quarantine + workspace recovery
 
@@ -234,6 +283,17 @@ integration ref is unchanged. It does not reset, clean, stage, or restore the
 operator checkout. A failed/unknown disposal is blocking: the task cannot be
 done and dependents cannot start. Revision-qualified flat candidate artifacts
 are display evidence only; checkpoint/rollback receipts are the recovery facts.
+
+A quarantined task does not decay into “done” and no model may self-accept it.
+Two binding human decisions exist (`resolve`, above): `--retry` requeues the
+wave from the accepted head with a fresh attempt quota, and `--accept-tree`
+records a `human-v1` acceptance of a retained `needs_human` candidate after
+re-running the deterministic gates on it. Both are refused without a matching
+revision, the current grant, eligible task state, and verified recovery; both
+are idempotent; and neither publishes. `quarantined` therefore means “waiting
+for a human decision or a repair”, not “finished”: a run keeps reporting the
+blocked ids with exit 2 until either a resolution or an authorized wider grant
+changes the durable state.
 
 ## Visibility
 

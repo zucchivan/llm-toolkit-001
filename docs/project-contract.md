@@ -199,7 +199,11 @@ the ONLY outcome that flips the router phase to complete, recorded once) or
 selection-complete (the granted subset is fulfilled; the remaining plan
 work is named and the phase stays open) · `2` policy stop — quarantine,
 unsatisfiable selection, budget stop, or unresolved/uncertain effect reported
-as `recovery-required` · `42` sleeping · `1` invalid input/lock/hard error ·
+as `recovery-required` · `42` sleeping — a rate-limit durable sleep is armed;
+the per-task sleep counter (`budgets.maxSleepCycles`, incl. 0) is checked
+BEFORE the timer is created, never reset by a wake, and a cap-exhausted task
+quarantines once (exit 2) with no new timer · `1` invalid input (including a
+handoff note over 2,000 chars)/lock/hard error ·
 `130` SIGINT.
 
 Failed plan parsing or identity-input failures (git, paths, controls) leave
@@ -242,7 +246,90 @@ unchanged in `none`, `commit`, and `pr` modes. Result locations:
 
 `verify --task <id>` is diagnostic only: it reads the newest retained candidate
 for the current plan revision and refuses if no candidate exists. It does not
-read current operator-checkout edits or change task disposition.
+read current operator-checkout edits or change task disposition — approving a
+one-off verification never marks a task done, never unblocks a dependent and
+never advances the integration ref.
+
+## Human resolution contract (M0-P18)
+
+A `quarantined` task is unblocked only by a human decision recorded through the
+CLI. Two copyable forms exist; both require `--revision` (the CURRENT reviewed
+plan revision), `--task` (a task inside the CURRENT grant) and `--reason`
+(1–300 characters). Any other combination is refused with a remedy and exit 1.
+
+```bash
+# 1. retry: one fresh cycle from the current accepted head
+llm-toolkit-001 resolve --revision <uuid> --task <id> --retry \
+  --reason "reviewed the failing gate output; the parser fix is in scope"
+
+# 2. accept-tree: only for an inconclusive verifier (needs_human)
+llm-toolkit-001 resolve --revision <uuid> --task <id> --accept-tree <tree-oid> \
+  --evidence evidence.json --reason "read the diff; the executed gate proves criterion 1"
+
+llm-toolkit-001 run            # the authorized run does the work / finishes publication
+```
+
+The candidate OID for `--accept-tree` is the retained frozen candidate shown by
+`inspect --json` (`checkpoint.candidateTree`) and by the quarantine row.
+
+Evidence document (regular local file, UTF-8 JSON, at most 64 KiB, no symlink,
+exactly one top-level key):
+
+```json
+{
+  "criteria": [
+    { "id": "1", "status": "pass", "evidence": [{ "kind": "gate", "id": "gate-list" }] },
+    { "id": "2", "status": "pass", "evidence": [{ "kind": "line", "path": "src/list.ts", "line": 12 }] }
+  ]
+}
+```
+
+- `id` is the criterion's reviewed 1-based acceptance index (never renumbered
+  after review). Missing, duplicated, or unknown ids are refused.
+- A `gate` reference names a recipe that actually EXECUTED and PASSED on the
+  rerun; scope alone is never evidence. A `line` reference must exist in a
+  regular UTF-8 blob of the frozen candidate.
+- Malformed entries are preserved and refused, never filtered.
+
+What `resolve` will refuse (each with the remedy printed):
+
+- a revision that is not the current plan revision, a missing/incomplete
+  grant, or a task outside the grant (a resolution never widens a grant);
+- a task that is not `quarantined`, or whose latest wave is not sealed
+  (`terminal` checkpoint), or any `unknown` checkpoint (uncertain effects are
+  never manually approvable);
+- a moved accepted integration head, a rollback receipt that is not
+  `discarded`, or a workspace lease still present (the wave is not fenced);
+- `--accept-tree` on anything but a `needs_human` block, a tree that is not
+  that wave's pinned candidate, changed reviewed controls, any deterministic
+  gate that fails or skips, and any evidence that does not prove every
+  criterion.
+
+What each decision writes:
+
+- `--retry`: task back to `todo`, `sleepCycles` = 0 (the `budgets.maxSleepCycles`
+  counter starts fresh), `lastGateHash` and `consecutiveErrors` cleared, a human
+  feedback entry, a `resolution` receipt, and a `terminal`/`retry` checkpoint
+  whose parent is the unchanged accepted head. The next authorized `run` starts
+  `wave + 1` from that head with a fresh attempt quota. Nothing is dispatched
+  and no integration/publication effect changes.
+- `--accept-tree`: a new gate receipt for the rerun, an acceptance receipt with
+  `authority: "human"`, `policy: "human-v1"`, `required: ["human"]`, a
+  `resolution` receipt, and LOCAL integration (private one-parent commit + the
+  `refs/kit/<revision>/accepted` compare-and-swap). The task becomes
+  `in_progress`, not `done`: `commit`/`pr` publication still happens only in an
+  authorized `run` (PR needs `--deliver`, and nothing is ever merged).
+- Both forms are idempotent: the operation id is a deterministic digest of
+  (revision, task, wave, action, reason, tree, evidence digest), so replaying a
+  request reconciles to the recorded decision — including finishing an
+  interrupted local integration — instead of recording a second one.
+
+`resolve` never reads or edits the operator checkout, never replays a truncated
+quarantine patch, never force-dones a task and never delivers remotely. It is
+the only thing that unblocks a dependent task B of a blocked task A: a `run`
+keeps stopping with exit 2 and naming the ids until the human retry or the
+human acceptance changes the durable state (an accepted tree also becomes the
+integration head B's wave starts from).
 
 ## Read-only observation
 
@@ -393,7 +480,9 @@ warned about.
 ├── durable.sqlite*      # pi-durable storage (private; WAL; local-only)
 ├── status.json          # atomic status payload (private; status --follow reads this)
 ├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (paper trail; ignored by default)
-├── pending-handoff.json # queued handoff note (private; handoff command)
+├── handoffs/inbox/      # queued handoff notes, ONE atomically published <uuid>.json each (private; handoff command)
+├── handoffs/invalid/    # diagnosed invalid/unreadable notes quarantined here (private)
+├── pending-handoff.json # pre-P17 queue; imported once into handoffs/inbox/ (private; legacy only)
 └── artifacts/           # gate logs, revision-qualified candidate patches, exports (private)
 
 router.md                # RouterDoc mirror (paper trail; not plan input; ignored by default)

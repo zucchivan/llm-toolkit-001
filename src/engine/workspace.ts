@@ -555,6 +555,53 @@ export async function discard(ownedLease: OwnedLease): Promise<void> {
 	data.disposed = true;
 }
 
+/**
+ * Observe a CHECKPOINTED task workspace without an in-memory lease handle
+ * (M0-P18 human resolution). The lease id comes from the durable checkpoint, so
+ * the caller never supplies a filesystem path: this module recomputes the
+ * private location, refuses a replaced/symlinked component, and reports whether
+ * the owned lease directory is still PRESENT. A resolution may only proceed on
+ * a CONFIRMED FENCED DISCARD (`lease: "absent"`); a present directory means a
+ * live/unsealed workspace and stops the human path.
+ *
+ * The retained candidate pin is read too, so `resolve --accept-tree` can prove
+ * the requested tree is the one this wave froze.
+ */
+export type CheckpointedWorkspaceState = Readonly<{
+	lease: "present" | "absent";
+	/** The pinned frozen candidate of this lease, when one was frozen. */
+	candidate?: GitOid;
+}>;
+
+export async function inspectCheckpointedWorkspace(
+	root: string,
+	identity: PlanIdentity,
+	taskId: string,
+	leaseId: string,
+): Promise<CheckpointedWorkspaceState> {
+	if (!UUID_RE.test(leaseId)) throw new Error("checkpointed workspace observation requires the recorded lowercase lease UUID");
+	const actual = await canonicalRoot(root);
+	const refBase = workspaceRef(identity, taskId, leaseId);
+	const state = await privateWorkRoot(actual);
+	const privateRoot = join(state, identity.planRevision, taskId, leaseId);
+	assertInside(state, privateRoot);
+	for (const directory of [join(state, identity.planRevision), join(state, identity.planRevision, taskId)]) {
+		const info = await lstat(directory).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+		if (info && (!info.isDirectory() || info.isSymbolicLink())) {
+			throw new Error(`checkpointed workspace parent is not a private real directory: ${directory}`);
+		}
+	}
+	const info = await lstat(privateRoot).catch((error: NodeJS.ErrnoException) => error.code === "ENOENT" ? null : Promise.reject(error));
+	if (info && (info.isSymbolicLink() || !info.isDirectory())) {
+		throw new Error("checkpointed workspace path was replaced by a non-directory or symbolic link");
+	}
+	const candidate = await readRef(actual, `${refBase}/candidate`);
+	return Object.freeze({
+		lease: info ? "present" as const : "absent" as const,
+		...(candidate ? { candidate } : {}),
+	});
+}
+
 /** Compare two immutable Git trees with exact path and executable-mode changes. */
 export async function diffTaskTrees(source: GitTreeSource, before: string, after: string): Promise<GitTreeChange[]> {
 	const root = await canonicalRoot(source.root);

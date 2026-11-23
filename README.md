@@ -122,12 +122,71 @@ primary approval followed by adversarial approval.
 | `run [--tasks id…]` | resume the stored grant bare (no re-approval); an explicitly supplied set must equal the grant exactly |
 | `status [--follow]` | task graph + budgets from `.orch/status.json` (when a run is locked) or storage |
 | `inspect [--json] [--health] [section…]` | full visibility snapshot: tasks, usage splits, wave timeline, conversations, artifacts, health; degrades to side-cars while a run holds the lock |
-| `verify --task id` | one-off read-only verification of the latest retained candidate; no operator-checkout fallback |
+| `verify --task id` | one-off read-only verification of the latest retained candidate; never changes task status or unblocks dependents |
+| `resolve --revision <uuid> --task id --retry --reason TEXT` | HUMAN retry: requeue the blocked task from the accepted head with a fresh attempt quota (clears its sleep counter, keeps history); dispatches nothing |
+| `resolve --revision <uuid> --task id --accept-tree <oid> --evidence FILE --reason TEXT` | HUMAN acceptance of a `needs_human` candidate: same tree, unchanged controls, gates rerun on it, evidence proves every criterion; integrates locally, never publishes |
 | `export` | per-project JSON+HTML report from storage into `.orch/artifacts/` |
-| `handoff "note"` | queue a note the driver ingests at the start of the next wave |
+| `handoff "note"` | publish one note file under `.orch/handoffs/inbox/` (≤ 2,000 chars, atomic, safe during a run); the driver claims the oldest notes up to 3,000 chars in total at each wave boundary — notes arriving after a wave's claim wait for the next wave |
 | `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
-Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) or `selection complete` (the granted subset is done; the plan's remaining work is named, the router phase stays open) · `2` policy stop — quarantine, blocked members, budget, or `recovery-required` for an uncertain effect · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` invalid input, refused grant, lock busy or error · `130` SIGINT.
+Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) or `selection complete` (the granted subset is done; the plan's remaining work is named, the router phase stays open) · `2` policy stop — quarantine (incl. a task whose bounded sleep budget is exhausted: `budgets.maxSleepCycles`, no new timer), blocked members, budget, or `recovery-required` for an uncertain effect · `42` sleeping (rate-limit durable sleep armed; the per-task sleep counter is checked before the timer is created and never reset by a wake — rerun `run`) · `1` invalid input (an over-long handoff note included), refused grant, lock busy or error · `130` SIGINT. `resolve` uses `0` resolved (or idempotently already recorded) and `1` refused — every refusal prints its remedy.
+
+### Unblocking a blocked task (the human path, M0-P18)
+
+A quarantine stops the selection with exit `2` and names the ids. Only a human
+turns it back into work — there is no “force done”, no editable web authority,
+and no model may accept its own tree.
+
+```bash
+# 1. retry: discard the failed attempt, run ONE fresh cycle from the accepted head
+llm-toolkit-001 resolve --revision <uuid> --task <id> --retry \
+  --reason "reviewed the failing gate output; the parser fix is in scope"
+
+# 2. accept-tree: ONLY for an inconclusive verifier (needs_human)
+#    (candidate OID: `inspect --json` → checkpoint.candidateTree)
+llm-toolkit-001 resolve --revision <uuid> --task <id> --accept-tree <tree-oid> \
+  --evidence evidence.json --reason "read the diff; the executed gate proves criterion 1"
+
+llm-toolkit-001 run    # the authorized run does the work / finishes publication
+```
+
+Evidence document (regular local file, UTF-8 JSON, ≤ 64 KiB, single
+`criteria` key — ids are the reviewed 1-based acceptance indices):
+
+```json
+{
+  "criteria": [
+    { "id": "1", "status": "pass", "evidence": [{ "kind": "gate", "id": "gate-list" }] },
+    { "id": "2", "status": "pass", "evidence": [{ "kind": "line", "path": "src/list.ts", "line": 12 }] }
+  ]
+}
+```
+
+Rules, each enforced BEFORE anything is written:
+
+- The revision must be the CURRENT plan revision and the task must be inside the
+  CURRENT grant — a resolution never broadens a grant.
+- The task must be `quarantined` with a sealed wave, and recovery must be
+  verified: rollback receipt `discarded`, owned workspace lease observed absent,
+  accepted integration head unchanged. An `unknown` checkpoint or a moved head
+  refuses (uncertain effects are never manually approvable).
+- `--retry` requeues from the current accepted head (not the failed candidate),
+  keeps every receipt/wave/feedback entry, clears the duplicate-failure hash,
+  the transport-error streak and the task's durable sleep counter (`sleepCycles`,
+  so `budgets.maxSleepCycles` starts fresh), and dispatches nothing.
+- `--accept-tree` needs a `needs_human` block (a typed `blockReason`, never a
+  fifth status) with that wave's PINNED candidate, unchanged lineage and
+  reviewed controls. The deterministic gates are rerun on the exact frozen
+  candidate — a failing or skipped check is never proof — and the evidence must
+  prove every reviewed criterion against that rerun receipt.
+- A human acceptance records `authority: "human"` (policy `human-v1`), not model
+  approval, and drives LOCAL integration only. `commit`/`pr` publication still
+  happens solely in an authorized `run`; a PR needs `--deliver`, and nothing is
+  ever merged.
+- Both forms are idempotent (a deterministic operation id from revision, task,
+  wave, action, reason, tree and evidence digest), so replaying a request after
+  a crash — or by hand — reconciles instead of deciding twice.
+- `verify --task` stays diagnostic: it never mutates a task's disposition.
 
 ### Current behavior and limits
 
@@ -180,7 +239,9 @@ Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) o
   owned private workspace. A rollback receipt is `discarded` only after the
   workspace is observed absent and the accepted integration ref unchanged;
   failed/unknown disposal blocks the task and its dependents. Candidate patches
-  are display evidence, never rollback inputs.
+  are display evidence, never rollback inputs. A quarantined task is unblocked
+  only by the human `resolve` path above (retry or a `needs_human`
+  accept-tree) or by a repair in a later authorized run.
 - Read-only views (`status`, `inspect`, `export`, and the web UI's reads) open
   durable storage with the harness's `readOnly` option while still holding
   `.orch/lock`: zero model/tool calls, no scheduling, no task progress, and
@@ -554,7 +615,9 @@ PRD →[plan, one conversation, read-only]→ RouterDoc + router.md (planned)
   done with plan work remaining ⇒ selection-complete, phase stays open.
   budgets/breakers: session USD ceiling (exit 2), wave warn, zero-progress from
   start-of-wave tree→candidate, duplicate gate-failure hash, consecutive-error
-  cap, rate-limit durable sleep (exit 42). Malformed/inconclusive/unproven
+  cap (an answered submission resets the streak), BOUNDED rate-limit durable
+  sleep (exit 42; `budgets.maxSleepCycles` per task, cap ⇒ quarantine once with
+  no new timer). Malformed/inconclusive/unproven
   verdicts ⇒ needs_human (never approval)
 delivery: none (accepted ref; default) | commit (named local result branch) |
   pr (stacked create-only refs; requires preflight + --deliver; never merges)

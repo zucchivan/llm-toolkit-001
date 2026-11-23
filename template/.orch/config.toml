@@ -38,8 +38,12 @@ sessionUsd = 10.0            # paid-submission ceiling: planner, every implement
                              # one admitted in-flight request can overrun, and there is no cost reservation.
                              # Resume by raising this value and rerunning `run` — the paused stage continues.
 waveUsdWarn = 2.0            # warn row when one submission attempt's before→after spend delta crosses this
-maxConsecutiveErrors = 3     # persistent unanswered-run counter; cap ⇒ quarantine (not reset by answered waves in M0-P14)
-maxSleepCycles = 3           # rate-limit sleep round-trips per task across restarts
+maxConsecutiveErrors = 3     # persistent unanswered-run counter; cap ⇒ quarantine. An ANSWERED submission resets
+                             # the streak (M0-P17), so a later task never inherits an earlier task's failures.
+maxSleepCycles = 3           # rate-limit sleep round-trips PER TASK across restarts (M0-P17). Counted durably on
+                             # the task, checked before the sleep task is created, and never reset just because a
+                             # timer woke; cap exhausted (incl. 0) ⇒ no new timer — the wave quarantines once. Each
+                             # task starts its own counter at 0; a replan mints fresh tasks.
 
 [gates]
 timeoutSec = 120             # per recipe

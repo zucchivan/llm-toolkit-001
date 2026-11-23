@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * llm-toolkit-001 — durable agent implementation loop CLI.
- * Commands: init · gates · plan · run · status · verify · export · handoff.
+ * Commands: init · gates · plan · run · status · verify · resolve · export · handoff.
  * Arg parsing: node:util parseArgs (strict) — no heavy framework.
  * Process exit codes (run): 0 fulfilled (whole plan or granted subset) ·
  * 2 policy stop (quarantine/budget/recovery-required) · 42 sleeping until provider reset ·
@@ -34,7 +34,9 @@ import { renderStatusPanel } from "./views/status.ts";
 import { writeExports } from "./views/export.ts";
 import { runVerify } from "./engine/verifier.ts";
 import { BudgetAdmissionError } from "./engine/model-admission.ts";
-import { readJson, atomicWriteJson } from "./util/fsx.ts";
+import { runResolution, loadResolutionEvidence, validateResolutionReason, ResolutionRefusal } from "./engine/resolution.ts";
+import { readJson } from "./util/fsx.ts";
+import { publishHandoffNote, HandoffNoteTooLongError } from "./engine/handoffs.ts";
 import { runGatesCli } from "./adoption/cli.ts";
 
 const CLI_NAME = pjson.name ?? "llm-toolkit-001";
@@ -74,6 +76,9 @@ function main(): void {
 			break;
 		case "verify":
 			void cmdVerify(rest);
+			break;
+		case "resolve":
+			void cmdResolve(rest);
 			break;
 		case "export":
 			void cmdExport();
@@ -539,6 +544,121 @@ async function cmdVerify(argv: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// resolve — the binding HUMAN path for a blocked task (M0-P18, §3 Human path)
+// ---------------------------------------------------------------------------
+
+/**
+ * `resolve` is the only command that turns a quarantined task back into work.
+ * It is a HUMAN decision, so it takes an attributed local reason, a matching
+ * revision and the current grant, and it never dispatches a model:
+ *
+ *   resolve --revision R --task T --retry --reason TEXT
+ *     one fresh retry cycle from the current accepted head (clears the task's
+ *     sleep counter and duplicate-failure hash, keeps wave history); no work
+ *     runs until an authorized `run`.
+ *
+ *   resolve --revision R --task T --accept-tree OID --evidence FILE --reason TEXT
+ *     only for an inconclusive `needs_human` quarantine with the SAME retained
+ *     candidate, unchanged lineage/controls and all deterministic gates rerun
+ *     passing on it. Evidence is `{"criteria":[…]}`, ≤64 KiB. Records human
+ *     authority and drives LOCAL integration; publication stays with `run`.
+ *
+ * Both forms are idempotent (deterministic operation id). Lock and workspace
+ * close/release always happen in `finally`, including every early return.
+ */
+async function cmdResolve(argv: string[]): Promise<void> {
+	let values: { revision?: string; task?: string; retry?: boolean; "accept-tree"?: string; evidence?: string; reason?: string };
+	try {
+		({ values } = parseArgs({
+			args: argv,
+			options: {
+				revision: { type: "string" },
+				task: { type: "string" },
+				retry: { type: "boolean", default: false },
+				"accept-tree": { type: "string" },
+				evidence: { type: "string" },
+				reason: { type: "string" },
+			},
+			strict: true,
+			allowPositionals: false,
+		}));
+	} catch (err) {
+		we.error(`${c.red}resolve refused${RESET}: ${(err as Error).message}\n${RESOLVE_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
+	const retry = values.retry === true;
+	const acceptTree = values["accept-tree"];
+	// Strict EXCLUSIVE flags: exactly one action, and evidence belongs only to accept-tree.
+	if (retry === (acceptTree !== undefined)) {
+		we.error(`${c.red}resolve refused${RESET}: pass exactly one of --retry or --accept-tree <oid>\n${RESOLVE_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
+	if (retry && values.evidence !== undefined) {
+		we.error(`${c.red}resolve refused${RESET}: --evidence belongs to --accept-tree; a retry discards, it never accepts a tree`);
+		process.exitCode = 1;
+		return;
+	}
+	if (!retry && values.evidence === undefined) {
+		we.error(`${c.red}resolve refused${RESET}: --accept-tree needs --evidence FILE ({"criteria":[…]} proving every reviewed criterion) and --reason TEXT\n${RESOLVE_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
+	if (values.revision === undefined || values.task === undefined || values.reason === undefined) {
+		we.error(`${c.red}resolve refused${RESET}: --revision, --task and --reason are all required\n${RESOLVE_USAGE()}`);
+		process.exitCode = 1;
+		return;
+	}
+
+	let kit: Awaited<ReturnType<typeof openProjectHarness>> | undefined;
+	try {
+		const reason = validateResolutionReason(values.reason);
+		const evidence = !retry && values.evidence !== undefined ? await loadResolutionEvidence(values.evidence) : undefined;
+		kit = await openProjectHarness(resolve(procCwd()), "resolve");
+		const outcome = await runResolution(kit, {
+			planRevision: values.revision,
+			taskId: values.task,
+			action: retry ? "retry" : "accept-tree",
+			reason,
+			...(acceptTree !== undefined ? { tree: acceptTree } : {}),
+			...(evidence !== undefined ? { evidence } : {}),
+		});
+		if (outcome.idempotent) {
+			we.log(`${c.cyan}already resolved${RESET} — operation ${outcome.operationId.slice(0, 12)}… is recorded for ${outcome.taskId} wave ${outcome.wave}; nothing changed.`);
+		} else if (outcome.action === "retry") {
+			we.log(`${c.green}RESOLVED (human retry)${RESET} — ${outcome.taskId} wave ${outcome.wave} requeued from the accepted head with fresh attempt quota.`);
+			we.log(`  operation: ${outcome.operationId}`);
+		} else {
+			we.log(`${c.green}RESOLVED (human accept-tree)${RESET} — ${outcome.taskId} wave ${outcome.wave} accepted at ${outcome.commit} (human authority, not model approval).`);
+			we.log(`  operation: ${outcome.operationId}`);
+			if (outcome.acceptanceId) we.log(`  acceptance receipt: ${outcome.acceptanceId}`);
+			we.log(`  integrated locally; no publication happened (remote delivery needs an authorized run).`);
+		}
+		for (const step of outcome.nextSteps) we.log(`  next: ${c.cyan}${step}${RESET}`);
+	} catch (err) {
+		if (err instanceof ResolutionRefusal) {
+			// A blocked human path prints the remedy; it never guesses a next state.
+			we.error(`${c.red}resolve refused${RESET}: ${err.message}`);
+			process.exitCode = 1;
+			return;
+		}
+		fail(err, "resolve");
+	} finally {
+		// ALL early returns above and refusals below pass through here exactly once.
+		if (kit) {
+			await kit.loop.close().catch(() => {});
+			kit.lock.release();
+		}
+	}
+}
+
+function RESOLVE_USAGE(): string {
+	return `  ${CLI_NAME} resolve --revision <uuid> --task <id> --retry --reason TEXT
+  ${CLI_NAME} resolve --revision <uuid> --task <id> --accept-tree <oid> --evidence FILE --reason TEXT`;
+}
+
+// ---------------------------------------------------------------------------
 // export + handoff
 // ---------------------------------------------------------------------------
 
@@ -576,12 +696,18 @@ async function cmdHandoff(argv: string[]): Promise<void> {
 	}
 	try {
 		const paths = projectPaths(resolve(procCwd()));
-		// Safe while another process runs: atomic local side-car (§3.1).
-		const existing = await readJson<{ notes: string[] }>(paths.pendingHandoff) ?? { notes: [] };
-		existing.notes.push(note);
-		await atomicWriteJson(paths.pendingHandoff, { notes: existing.notes, ts: Date.now() });
+		// Safe while another process runs (even the driver): ONE atomically
+		// published note file per invocation — no shared queue, no read-modify-
+		// write race (M0-P17). The driver claims the oldest notes at each wave
+		// boundary; notes arriving after a wave's claim wait for the next wave.
+		await publishHandoffNote(paths, note);
 		we.log(`handoff note queued for the next wave: ${note}`);
 	} catch (err) {
+		if (err instanceof HandoffNoteTooLongError) {
+			we.error(err.message);
+			process.exitCode = 1;
+			return;
+		}
 		fail(err, "handoff");
 	}
 }
@@ -698,7 +824,14 @@ function HELP(): string {
   ${CLI_NAME} inspect [--json] [--health] [section…]
                                           # full visibility: tasks, usage, conversations,
                                           # timeline, artifacts, health (degrades to side-cars)
-  ${CLI_NAME} verify --task id            # one-off read-only verification (works after manual edits)
+  ${CLI_NAME} verify --task id            # one-off read-only verification (never changes task status)
+  ${CLI_NAME} resolve --revision <uuid> --task <id> --retry --reason TEXT
+                                          # HUMAN retry: requeue a blocked task from the accepted
+                                          # head, fresh attempt quota + sleep counter, no dispatch
+  ${CLI_NAME} resolve --revision <uuid> --task <id> --accept-tree <oid> --evidence FILE --reason TEXT
+                                          # HUMAN acceptance of a needs_human candidate: same tree,
+                                          # unchanged controls, gates rerun, evidence {"criteria":[…]};
+                                          # integrates locally, never publishes
   ${CLI_NAME} export                      # HTML/JSON report into .orch/artifacts/
   ${CLI_NAME} handoff "note"              # queue a note the next wave ingests
   ${CLI_NAME} ui [--port n] [--no-open]    # the web UI (sub-product, ui/PRD.md); spawns llm-toolkit-ui

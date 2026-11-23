@@ -7,7 +7,7 @@
  */
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { atomicWrite, atomicWriteJson, readJson } from "../util/fsx.ts";
+import { atomicWrite, atomicWriteJson } from "../util/fsx.ts";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import type { Conversation } from "./kit.ts";
 import { ConversationKit } from "./conversations.ts";
@@ -16,7 +16,8 @@ import {
 	commitState, readSessionState, grantRefusal, readGrant, approvalMirrorRefusal, resolveGrantSelection,
 } from "./state.ts";
 import type { Grant, SessionState } from "./state.ts";
-import type { RouterTask, RunStatusDocValue, WaveRow, TaskFeedback } from "./infos.ts";
+import type { RouterTask, RunStatusDocValue, WaveRow, TaskFeedback, TaskBlockReason } from "./infos.ts";
+import { HANDOFF_BINDING_HISTORY, HANDOFF_CONSUMED_ID_CAP, HandoffDoc } from "./infos.ts";
 import { recipeBundleFromTree, runGates } from "./gates.ts";
 import type { GateOutcome, GateResult } from "./gates.ts";
 import { renderRouterMd } from "./infos.ts";
@@ -27,7 +28,11 @@ import type { Checkpoint, CheckpointStage, GateCheck, GateReceipt, ReceiptEvent,
 import {
 	assessFailureTriage, persistFailureTriageAssessment, type FailureTriageEvidence,
 } from "./failure-triage.ts";
-import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, waitOutSleep } from "./governor.ts";
+import { armRateLimitSleep, looksLikeRateLimit, parseResetDelay, sleepBudgetState, waitOutSleep } from "./governor.ts";
+import {
+	discardConsumedHandoffNotes, handoffClaimRows, importLegacyHandoff, readHandoffClaim, settleHandoffClaim,
+} from "./handoffs.ts";
+import type { HandoffClaim } from "./handoffs.ts";
 import {
 	admitSubmission, BudgetAdmissionError, isBudgetDenial, recordBudgetStop, refreshAdmissionHighWater,
 } from "./model-admission.ts";
@@ -286,18 +291,10 @@ export async function runWaves(
 		grant = readGrant(initial.runStatus)!; // grantRefusal refuses an incomplete grant
 	}
 
-	// Ingest a queued user handoff note (§3.1) before the next wave starts.
-	// The CLI writes {ts, notes: string[]} (multi-note queue); read both shapes.
-	const handoffRaw = await readJson<{ ts: number; notes: string[]; note?: string }>(kit.loop.paths.pendingHandoff);
-	const handoff = handoffRaw
-		? { note: (handoffRaw.notes?.length ? handoffRaw.notes.join("; ") : (handoffRaw.note ?? "")).slice(0, 3000), ts: handoffRaw.ts }
-		: undefined;
-	if (handoff?.note) {
-		await commitState(kit, {
-			rows: [{ ts: Date.now(), kind: "handoff", task: "session", verb: "handoff-ingested", detail: handoff.note }],
-		});
-		await import("node:fs/promises").then((fs) => fs.rm(kit.loop.paths.pendingHandoff, { force: true }));
-	}
+	// M0-P17: the legacy pending-handoff.json queue imports ONCE into the
+	// durable inbox (content-hash guarded, under the owner lock). Wave claims
+	// happen per wave boundary inside driveTaskWaves — not here.
+	await importLegacyHandoff(kit);
 
 	// Resume a live rate-limit sleep from a previous run, if any.
 	await refreshAdmissionHighWater(kit);
@@ -405,7 +402,6 @@ export async function runWaves(
 		let outcome: DriverExit | "done" | "quarantined" | "recovery-required";
 		try {
 			outcome = await driveTaskWaves(kit, task, {
-				handoffNote: handoff?.note,
 				onEvent: emit,
 				deliverExplicit: options.deliverExplicit,
 				judgmentClient: options.judgmentClient,
@@ -487,7 +483,6 @@ async function implementerBudgetPause(
 // ---------------------------------------------------------------------------
 
 export interface TaskWavesOptions {
-	handoffNote?: string;
 	onEvent?: (e: ProgressEvent) => void;
 	deliverExplicit?: boolean;
 	judgmentClient?: JudgmentClient;
@@ -662,6 +657,10 @@ async function finishFailedCandidate(input: {
 	feedbackIds: string[];
 	outcome: "retry" | "quarantined";
 	cause: string;
+	/** M0-P18: a typed block reason (currently `needs_human`) rides the
+	 *  quarantined task so `resolve --accept-tree` can tell an inconclusive
+	 *  verifier verdict from every other failure. Never a fifth status. */
+	blockReason?: TaskBlockReason;
 	feedback?: TaskFeedback;
 	rows?: WaveRow[];
 	opts: TaskWavesOptions;
@@ -729,6 +728,8 @@ async function finishFailedCandidate(input: {
 			const current = draft.tasks.find((entry) => entry.id === task.id)!;
 			current.waveCount = Math.max(current.waveCount, wave.wave);
 			current.status = outcome === "retry" ? "todo" : "quarantined";
+			if (outcome === "quarantined" && input.blockReason) current.blockReason = input.blockReason;
+			else delete current.blockReason;
 			if (input.feedback && !current.feedback.some((entry) => entry.wave === wave.wave && entry.from === input.feedback!.from)) {
 				current.feedback.push(input.feedback);
 			}
@@ -846,7 +847,26 @@ export async function driveTaskWaves(
 			code: values.code,
 		});
 
+		// M0-P17: this wave's handoff binding. A RESUMED wave already owns a
+		// durable binding (its text rides the wave input; note files a crash left
+		// behind are duplicates — ignored and unlinked). A NEW wave claims the
+		// oldest queued notes at its start commit below. Notes arriving after the
+		// claim apply to the NEXT wave.
+		let waveClaim: HandoffClaim | undefined;
+		let waveHandoff: { ids: string[]; notes: string[] } | undefined;
+		const handoffDoc = await kit.loop.harness.snapshot(HandoffDoc, BACKGROUND_CONTEXT);
+		if (active) {
+			const binding = handoffDoc?.bindings.find((entry) =>
+				entry.planRevision === waveKey.planRevision && entry.taskId === waveKey.taskId && entry.wave === waveKey.wave);
+			if (binding?.notes.length) {
+				waveHandoff = { ids: binding.noteIds, notes: binding.notes };
+				await discardConsumedHandoffNotes(kit.loop.paths, binding.noteIds);
+			}
+		}
+
 		let implementationOutcome: Awaited<ReturnType<ConversationKit["submitAndAwait"]>> | undefined;
+		let sleepCapExhausted = false;
+		let sleepBudget: Awaited<ReturnType<typeof sleepBudgetState>> | undefined;
 		let usageBefore = { usd: 0, totalTokens: 0 };
 		const resumeImplement = active?.stage === "implement" && active.state === "pending";
 		const startImplement = !active;
@@ -861,6 +881,16 @@ export async function driveTaskWaves(
 				if (!foundConversation) throw new RecoveryRequiredError(`task ${task.id} wave ${wave} implementer conversation ${active.conversationId} is unavailable`);
 				conversation = foundConversation;
 				requestId = active.submissionKey;
+				// M0-P17: a MINTED attempt key (#aN suffix) names a submission that was
+				// checkpointed but never dispatched under admission (recorded while a
+				// durable sleep was armed, or between its checkpoint and first
+				// dispatch) — it is a NEW paid submission: admit it before the first
+				// dispatch. The wave's BASE key is an in-flight reconciliation
+				// instead: settle the same request first, never re-admit it.
+				if (requestId !== submissionKey(waveKey, "implement")) {
+					const wakeAdmission = await admitSubmission(kit, "implement", { planRevision: identity.planRevision, taskId: current.id, wave });
+					if (!wakeAdmission.admitted) return "budget";
+				}
 			} else {
 				const initialView = await materializeRead({ root, oid: startTree }, controls);
 				const initialContext = await createTaskExecutionContext({
@@ -877,6 +907,14 @@ export async function driveTaskWaves(
 				});
 				conversation = await openTaskConversation(kit, convKit, current, initialContext);
 				requestId = submissionKey(waveKey, "implement");
+				// M0-P17: claim the wave's handoff notes NOW and bind the consumed
+				// ids + text to THIS pending wave in the SAME transaction that
+				// starts it (consume-once). The files unlink only after the commit.
+				waveClaim = await readHandoffClaim(kit.loop.paths, { excludeIds: handoffDoc?.consumedIds });
+				if (waveClaim.taken.length) {
+					waveHandoff = { ids: waveClaim.taken.map((note) => note.id), notes: waveClaim.taken.map((note) => note.note) };
+				}
+				const claimed = waveClaim;
 				const startedAt = Date.now();
 				await commitState(kit, {
 					router: (draft) => {
@@ -888,6 +926,25 @@ export async function driveTaskWaves(
 					checkpoints: [stageCheckpoint("implement", "pending", {
 						conversationId: Number(conversation.id), submissionKey: requestId, outcome: "submitted",
 					})],
+					handoffs: (draft) => {
+						if (claimed.taken.length) {
+							draft.consumedIds.push(...claimed.taken.map((note) => note.id));
+							draft.bindings.push({
+								planRevision: identity.planRevision,
+								taskId: current.id,
+								wave,
+								noteIds: claimed.taken.map((note) => note.id),
+								notes: claimed.taken.map((note) => note.note),
+								at: startedAt,
+							});
+							if (draft.bindings.length > HANDOFF_BINDING_HISTORY) {
+								draft.bindings.splice(0, draft.bindings.length - HANDOFF_BINDING_HISTORY);
+							}
+						}
+						if (draft.consumedIds.length > HANDOFF_CONSUMED_ID_CAP) {
+							draft.consumedIds.splice(0, draft.consumedIds.length - HANDOFF_CONSUMED_ID_CAP);
+						}
+					},
 					rows: [{
 						ts: startedAt,
 						kind: "wave",
@@ -896,10 +953,12 @@ export async function driveTaskWaves(
 						verb: "start",
 						treeSha: startTree,
 						planRevision: identity.planRevision,
-				}],
+					}, ...handoffClaimRows(claimed, wave)],
 					statusPhase: { phase: "wave-running", task: current.id, wave, startedAt },
 				});
 				emit({ kind: "wave-start", taskId: current.id, wave, message: `wave ${wave} starting for ${current.id}` });
+				// Binding committed — the note files are consumed; unlink them now.
+				await settleHandoffClaim(kit.loop.paths, claimed);
 				await discardWorkspace(initialView).catch(() => {});
 			}
 			let promptMd = await readFile(join(lease.workspacePath, "PROMPT.md"), "utf8").catch(() => undefined);
@@ -908,7 +967,9 @@ export async function driveTaskWaves(
 				promptMd = await readFile(join(promptView.viewPath, "PROMPT.md"), "utf8").catch(() => undefined);
 				await discardWorkspace(promptView).catch(() => {});
 			}
-			const waveInput = await assembleWaveInput(current, wave, opts.handoffNote, promptMd);
+			// The wave's handoff text comes from this wave's durable binding (M0-P17)
+			// — a resumed wave replays exactly what its start commit claimed.
+			const waveInput = await assembleWaveInput(current, wave, waveHandoff?.notes.join("; "), promptMd);
 			if (startImplement) {
 				// M0-P16: the paid submission is admitted BEFORE any call. A refusal
 				// records the stop and pauses with no call — the wave never starts.
@@ -929,9 +990,10 @@ export async function driveTaskWaves(
 				// (prior usage stays counted) and dispatch it. Whether the pause
 				// still holds is the admission's call: it refuses (recording the
 				// stop) while the ceiling is still breached and admits after the
-				// human raises it. Rate-limit failures keep the durable-sleep path.
+				// human raises it. Rate-limit failures mint the next attempt key and
+				// arm the bounded durable sleep (M0-P17).
 				if (!looksLikeRateLimit(implementationOutcome.detail) && !looksLikeRateLimit(implementationOutcome.reason)) {
-					const attemptKey = nextSubmissionAttemptKey(active.submissionKey!, receipts, waveKey, "implement");
+					const attemptKey = nextSubmissionAttemptKey(submissionKey(waveKey, "implement"), receipts, waveKey, "implement");
 					await commitState(kit, {
 						checkpoints: [stageCheckpoint("implement", "pending", {
 							conversationId: Number(conversation.id), submissionKey: attemptKey, outcome: "submitted",
@@ -954,23 +1016,52 @@ export async function driveTaskWaves(
 				if (looksLikeRateLimit(implementationOutcome.detail) || looksLikeRateLimit(implementationOutcome.reason)) {
 					const reason = implementationOutcome.reason ?? "rate limit";
 					const delay = parseResetDelay(implementationOutcome.detail) ?? parseResetDelay(reason) ?? 30 * 60;
-					await armRateLimitSleep(kit, {
-						until: Date.now() + delay * 1000,
-						reason: String(implementationOutcome.detail ?? reason).slice(0, 120),
-						taskId: current.id,
-						wave,
-						conversationId: Number(conversation.id),
-					});
-					await commitState(kit, {
-						runStatus: (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); },
-						rows: [
-							{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? reason).slice(0, 200), planRevision: identity.planRevision },
-							waveEndRow(current.id, wave, "sleeping", startTree, { planRevision: identity.planRevision }),
-						],
-						statusPhase: { phase: "idle", message: `${current.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
-					});
-					emit({ kind: "sleeping", taskId: current.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
-					return "sleeping";
+					// M0-P17: check the PER-TASK sleep budget BEFORE any timer exists.
+					const budget = await sleepBudgetState(kit, current.id);
+					if (budget.exhausted) {
+						// Cap reached: no new timer, ever. The wave stops ONCE with the
+						// task quarantined; the next task starts its counter at 0 and an
+						// explicitly granted human retry clears it.
+						sleepCapExhausted = true;
+						sleepBudget = budget;
+					} else {
+						// M0-P17: a rate-limited submission is terminal — never replayed
+						// forever under the same request id. Record the NEXT attempt's
+						// unique key (same task's counter) so the post-sleep resume
+						// dispatches a fresh request, then arm the bounded durable sleep
+						// and end this invocation (exit 42).
+						const attemptKey = nextSubmissionAttemptKey(submissionKey(waveKey, "implement"), await receiptSnapshot(kit), waveKey, "implement");
+						await commitState(kit, {
+							checkpoints: [stageCheckpoint("implement", "pending", {
+								conversationId: Number(conversation.id), submissionKey: attemptKey, outcome: "submitted",
+							})],
+						});
+						requestId = attemptKey;
+						const armed = await armRateLimitSleep(kit, {
+							until: kit.loop.now() + delay * 1000,
+							reason: String(implementationOutcome.detail ?? reason).slice(0, 120),
+							taskId: current.id,
+							wave,
+							conversationId: Number(conversation.id),
+						});
+						if (armed === undefined) {
+							// Defensive (unreachable while one run owns the lock): the
+							// in-commit cap check refused the arm — treat as exhausted.
+							sleepCapExhausted = true;
+							sleepBudget = budget;
+						} else {
+							await commitState(kit, {
+								runStatus: (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); },
+								rows: [
+									{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? reason).slice(0, 200), planRevision: identity.planRevision },
+									waveEndRow(current.id, wave, "sleeping", startTree, { planRevision: identity.planRevision }),
+								],
+								statusPhase: { phase: "idle", message: `${current.id} wave ${wave}: rate limit — durable sleep armed; rerun \`run\` to resume` },
+							});
+							emit({ kind: "sleeping", taskId: current.id, wave, message: "rate limit — durable sleep armed; rerun `run` to resume (exit 42)" });
+							return "sleeping";
+						}
+					}
 				}
 			}
 		}
@@ -999,23 +1090,46 @@ export async function driveTaskWaves(
 		if (unfinishedImplementation) {
 			if (!implementationOutcome) throw new RecoveryRequiredError(`task ${current.id} wave ${wave} has no reconciled implementation result`);
 			if (implementationOutcome.status === "unanswered") {
-				const latestState = await readSessionState(kit.loop.harness);
-				const nextErrors = latestState.runStatus.consecutiveErrors + 1;
-				implementationFailure = nextErrors >= kit.loop.config.budgets.maxConsecutiveErrors ? "quarantined" : "retry";
-				runFailureText = `run failed: ${implementationOutcome.reason ?? "unanswered"}`;
-				runStatusUpdate = (draft) => {
-					draft.consecutiveErrors = nextErrors;
-					draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd);
-					if (implementationFailure === "quarantined") draft.activeAlert = `${kit.loop.config.budgets.maxConsecutiveErrors} consecutive run failures — quarantining ${current.id}`;
-				};
-				runFailureRows = [{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: `run-failed:${implementationOutcome.reason ?? "unanswered"}`, detail: String(implementationOutcome.detail ?? "").slice(0, 200), planRevision: identity.planRevision }];
+				if (sleepCapExhausted) {
+					// M0-P17: the per-task sleep budget is exhausted — the wave
+					// quarantines ONCE with no new timer; the consecutive-error
+					// breaker does not govern this stop. The counter still records
+					// the unanswered transport failure.
+					implementationFailure = "quarantined";
+					runFailureText = `rate-limit sleep budget exhausted (${sleepBudget!.cap} durable sleep${sleepBudget!.cap === 1 ? "" : "s"} consumed by this task)`;
+					runStatusUpdate = (draft) => {
+						draft.consecutiveErrors += 1;
+						draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd);
+						draft.activeAlert = `rate-limit sleep budget exhausted for ${current.id} — quarantining (no new sleep timer)`;
+					};
+					runFailureRows = [
+						{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: "run-failed:rate-limit", detail: String(implementationOutcome.detail ?? "").slice(0, 200), planRevision: identity.planRevision },
+						{ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "sleep-budget-quarantine", detail: `${sleepBudget!.used}/${sleepBudget!.cap} durable sleeps consumed — no new timer`, planRevision: identity.planRevision },
+					];
+				} else {
+					const latestState = await readSessionState(kit.loop.harness);
+					const nextErrors = latestState.runStatus.consecutiveErrors + 1;
+					implementationFailure = nextErrors >= kit.loop.config.budgets.maxConsecutiveErrors ? "quarantined" : "retry";
+					runFailureText = `run failed: ${implementationOutcome.reason ?? "unanswered"}`;
+					runStatusUpdate = (draft) => {
+						draft.consecutiveErrors = nextErrors;
+						draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd);
+						if (implementationFailure === "quarantined") draft.activeAlert = `${kit.loop.config.budgets.maxConsecutiveErrors} consecutive run failures — quarantining ${current.id}`;
+					};
+					runFailureRows = [{ ts: Date.now(), kind: "engine", task: current.id, wave, verb: `run-failed:${implementationOutcome.reason ?? "unanswered"}`, detail: String(implementationOutcome.detail ?? "").slice(0, 200), planRevision: identity.planRevision }];
+				}
 			} else {
 				// The accumulator keeps the conversation's cumulative (session-sum)
 				// spend — prior usage is always counted; resume never double-charges.
 				// The warn, in contrast, uses the ACTUAL before→after delta of this
 				// submission attempt (submitAndAwait reads the usage doc after the
 				// run settles), never the cumulative sum.
-				runStatusUpdate = (draft) => { draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd); };
+				runStatusUpdate = (draft) => {
+					draft.budgetSpentUsd = Math.max(draft.budgetSpentUsd, implementationOutcome!.usage.usd);
+					// M0-P17: a successful ANSWERED submission resets the consecutive
+					// transport-failure streak — a later task never inherits it.
+					draft.consecutiveErrors = 0;
+				};
 				const waveDelta = Math.max(0, implementationOutcome.usage.usd - usageBefore.usd);
 				if (waveDelta > kit.loop.config.budgets.waveUsdWarn) {
 					runFailureRows.push({ ts: Date.now(), kind: "governor", task: current.id, wave, verb: "wave-usd-warn", detail: `$${waveDelta.toFixed(4)} this-wave delta (conversation total $${implementationOutcome.usage.usd.toFixed(4)}) > $${kit.loop.config.budgets.waveUsdWarn} warn`, planRevision: identity.planRevision });
@@ -1197,15 +1311,21 @@ export async function driveTaskWaves(
 		const primaryEvent = passReceiptForWave(afterGateReceipts, waveKey, "primary", candidate, gateReceipt.value.id);
 		const skepticEvent = passReceiptForWave(afterGateReceipts, waveKey, "skeptic", candidate, gateReceipt.value.id);
 		const skepticRequired = kit.loop.config.gates.skepticSecondPass;
-		const acceptanceExists = afterGateReceipts.events.some((event) => event.kind === "acceptance"
-			&& event.value.planRevision === waveKey.planRevision && event.value.taskId === waveKey.taskId
-			&& event.value.wave === waveKey.wave && event.value.tree === candidate);
+		const acceptanceEvent = afterGateReceipts.events.filter((event): event is Extract<ReceiptEvent, { kind: "acceptance" }> =>
+			event.kind === "acceptance" && event.value.planRevision === waveKey.planRevision
+				&& event.value.taskId === waveKey.taskId && event.value.wave === waveKey.wave && event.value.tree === candidate,
+		).at(-1);
+		const acceptanceExists = acceptanceEvent !== undefined;
+		// M0-P18: a HUMAN acceptance (resolve --accept-tree) is already the binding
+		// decision about this tree — model passes are neither required nor re-derived.
+		const humanAcceptance = acceptanceEvent?.value.authority === "human" ? acceptanceEvent.value : undefined;
 		let verdict: VerifyResult | undefined;
 		if (acceptanceExists || active?.stage === "integrate" || active?.stage === "publish") {
-			if (!primaryEvent || primaryEvent.value.review.verdict !== "approve" || (skepticRequired && (!skepticEvent || skepticEvent.value.review.verdict !== "approve"))) {
+			if (!humanAcceptance
+				&& (!primaryEvent || primaryEvent.value.review.verdict !== "approve" || (skepticRequired && (!skepticEvent || skepticEvent.value.review.verdict !== "approve")))) {
 				throw new RecoveryRequiredError(`integration checkpoint for ${current.id} wave ${wave} is missing its approving pass receipts`);
 			}
-			verdict = { verdict: "approve", criteria: [], notes: "reusing receipted approval" };
+			verdict = { verdict: "approve", criteria: [], notes: humanAcceptance ? `human acceptance: ${humanAcceptance.reason ?? ""}`.slice(0, 300) : "reusing receipted approval" };
 		} else {
 			const completePassSet = !!primaryEvent && (primaryEvent.value.review.verdict !== "approve" || !skepticRequired || !!skepticEvent);
 			if (completePassSet) {
@@ -1294,6 +1414,7 @@ export async function driveTaskWaves(
 				kit, task: current, wave: waveKey, parent, startTree, candidate, fencedWorkspace,
 				feedbackIds, outcome: retry ? "retry" : "quarantined",
 				cause: verdict.verdict === "needs_human" ? "verifier needs a human" : retry ? "verifier rejected" : "verifier rejects exhausted the wave retry limit",
+				...(verdict.verdict === "needs_human" ? { blockReason: "needs_human" as const } : {}),
 				...(feedback ? { feedback } : {}),
 				rows: [{ ts: Date.now(), kind: "verdict", task: current.id, wave, verb: `reject:${wave}`, verdict: verdict.verdict, detail: verdict.notes, planRevision: identity.planRevision }],
 				opts,
@@ -1305,14 +1426,16 @@ export async function driveTaskWaves(
 		const policy = skepticRequired ? "always" : "never";
 		const required = skepticRequired ? ["primary", "skeptic"] as const : ["primary"] as const;
 		await commitState(kit, { checkpoints: [stageCheckpoint("integrate", "pending", { candidate, outcome: "accepted" })] });
-		await acceptCandidate(kit, {
-			...waveKey,
-			parent,
-			tree: candidate,
-			policy,
-			required: [...required],
-			...(identity.controlsSha256 !== undefined ? { controlsSha256: identity.controlsSha256 } : {}),
-		}, opts.prPublication ?? {});
+		if (!humanAcceptance) {
+			await acceptCandidate(kit, {
+				...waveKey,
+				parent,
+				tree: candidate,
+				policy,
+				required: [...required],
+				...(identity.controlsSha256 !== undefined ? { controlsSha256: identity.controlsSha256 } : {}),
+			}, opts.prPublication ?? {});
+		}
 		await driverFault(opts, "after-acceptance");
 		const integrated = await integrateAcceptedCandidate(kit, waveKey, opts.prPublication ?? {});
 		await commitState(kit, {
@@ -1362,6 +1485,7 @@ export async function driveTaskWaves(
 			router: (draft) => {
 				const row = draft.tasks.find((entry) => entry.id === current.id)!;
 				row.status = "done";
+				delete row.blockReason;
 				row.waveCount = Math.max(row.waveCount, wave);
 			},
 			checkpoints: [stageCheckpoint("terminal", "complete", { candidate, outcome: "accepted" })],

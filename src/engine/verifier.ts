@@ -152,6 +152,15 @@ export interface VerifyOptions {
 	jevShadow?: Omit<AssessVerifierOptions, "enabled"> & { enabled?: boolean };
 }
 
+/**
+ * Run the read-only verifier pass(es) for one checked tree.
+ *
+ * M0-P18: this records REVIEW HISTORY only — pass receipts and verdict rows. It
+ * never writes a task status, never clears a `blockReason`, never records an
+ * acceptance and never advances the integration ref, so a one-off
+ * `verify --task` cannot mark a task done or unblock a dependent. Only the
+ * driver (`run`) or an explicit human decision (`resolve`) may do that.
+ */
 export async function runVerify(kit: LoopAndLock, task: VerifyTask, gateSummary: string, options: VerifyOptions = {}): Promise<VerifyResult> {
 	const executionContext = options.executionContext;
 	if (executionContext && executionContext.controlPaths.root !== kit.loop.paths.root) throw new Error("execution context control root does not match the open project harness");

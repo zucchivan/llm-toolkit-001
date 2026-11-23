@@ -1,17 +1,24 @@
 /**
  * Governor (§4.5): budget ceilings, zero-progress / duplicate-failure circuit
- * breakers, consecutive-error breaker, and the rate-limit durable sleep.
+ * breakers, consecutive-error breaker, and the BOUNDED rate-limit durable
+ * sleep (M0-P17).
  *
  * The sleep is a durably committed task (`kit.sleep`) using runtime.sleepUntil:
  * it survives restarts, is woken by the harness clock when due, and any later
  * `run` that opens the storage waits for it before picking work back up.
  * Exit-code 42 = "sleeping until provider reset"; rerun `<kit> run` to resume.
+ *
+ * M0-P17 bounding: each task owns a durable sleep counter (RouterTask
+ * .sleepCycles) checked BEFORE a timer is created and incremented atomically
+ * with it. `budgets.maxSleepCycles` (incl. 0) exhausted means no new timer is
+ * ever created for that task — the wave stops once (quarantine) instead.
+ * Waking the timer resets nothing: the consecutive-error streak clears only on
+ * a successful answered submission, and the sleep counter clears for the next
+ * task or an explicitly granted human retry.
  */
 import { defineTask, BACKGROUND_CONTEXT } from "./kit.ts";
 import type { LoopAndLock, LoopHarness } from "./harness.ts";
 import { commitState, readSessionState } from "./state.ts";
-import { convId } from "./kit.ts";
-import type { WaveRow } from "./infos.ts";
 
 // ---------------------------------------------------------------------------
 // Budget accounting
@@ -81,64 +88,70 @@ export function parseResetDelay(detail: unknown): number | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Rate-limit durable sleep task
+// Rate-limit durable sleep task (M0-P17: bounded per-task sleeps)
 // ---------------------------------------------------------------------------
 
 export { GovernorSleep } from "./tasks.ts";
 import { GovernorSleep } from "./tasks.ts";
 
 /**
- * Arm the rate-limit sleep: create (or reuse) the durable sleep task, record it
- * in RunStatusDoc, append governor rows, and let the caller close/exit 42.
+ * The per-task durable-sleep budget (M0-P17): `RouterTask.sleepCycles` counts
+ * the sleep timers THIS task has consumed across restarts; the cap is
+ * `budgets.maxSleepCycles`. Exhausting it means no NEW timer is ever created —
+ * the caller stops the task once (quarantine) instead of arming again.
+ */
+export interface SleepBudget {
+	used: number;
+	cap: number;
+	exhausted: boolean;
+}
+
+export async function sleepBudgetState(kit: LoopAndLock, taskId: string): Promise<SleepBudget> {
+	const state = await readSessionState(kit.loop.harness);
+	const used = state.router.tasks.find((entry) => entry.id === taskId)?.sleepCycles ?? 0;
+	const cap = kit.loop.config.budgets.maxSleepCycles;
+	return { used, cap, exhausted: used >= cap };
+}
+
+/**
+ * Arm the rate-limit sleep: create the durable sleep task and record its id,
+ * deadline, and the per-task counter in ONE atomic commit — but ONLY after
+ * checking the per-task sleep budget first. When the budget is exhausted (cap
+ * reached, including a zero cap), NO new timer is created and `undefined` is
+ * returned: the caller stops the task once (quarantine/blocked) instead of
+ * arming again. The counter is never reset because a timer woke; it clears for
+ * the next task (each task starts at 0) or an explicitly granted human retry.
  */
 export async function armRateLimitSleep(
 	kit: LoopAndLock,
 	params: { until: number; reason: string; taskId: string; wave: number; conversationId: number },
-): Promise<number> {
-	const harness = kit.loop.harness;
+): Promise<number | undefined> {
+	const budget = await sleepBudgetState(kit, params.taskId);
+	if (budget.exhausted) return undefined; // cap reached — no new timer, ever
 	const sleepingUntil = params.until;
-	const sleepTaskId = await harness.commit(async (tx: unknown) => {
-		const created = await (tx as { createTask: (t: unknown, i: unknown, o: unknown) => Promise<unknown> }).createTask(
-			GovernorSleep,
-			{ until: sleepingUntil, reason: params.reason },
-			{ ownership: { kind: "conversation" }, conversationId: convId(params.conversationId) },
-		);
-		return created as unknown as number;
-	}, BACKGROUND_CONTEXT);
-
-	await commitState(kit, {
+	const result = await commitState(kit, {
 		runStatus: (d) => {
-			d.sleepTaskId = sleepTaskId;
-			d.sleepUntil = sleepingUntil;
-			d.sleepCycleCount += 1;
 			d.activeAlert = `rate limit: ${params.reason} — sleeping until ${new Date(sleepingUntil).toISOString()}`;
 			d.consecutiveErrors += 1;
 		},
-		rows: sleepRows(params, sleepingUntil, sleepTaskId),
+		sleepTask: {
+			input: { until: sleepingUntil, reason: params.reason },
+			conversationId: params.conversationId,
+			taskId: params.taskId,
+			wave: params.wave,
+			reason: params.reason,
+		},
 		statusPhase: { phase: "idle", message: `sleeping until ${new Date(sleepingUntil).toISOString()} (rate limit)` },
 	});
-	return sleepTaskId;
+	return result.sleepTaskId;
 }
 
-function sleepRows(
-	params: { until: number; reason: string; taskId: string; wave: number },
-	sleepingUntil: number,
-	sleepTaskId: number,
-): WaveRow[] {
-	return [
-		{
-			ts: Date.now(),
-			kind: "governor",
-			task: params.taskId,
-			wave: params.wave,
-			verb: "rate-limit-sleep",
-			reason: params.reason,
-			detail: `durable sleep task #${sleepTaskId} until ${new Date(sleepingUntil).toISOString()}`,
-		},
-	];
-}
-
-/** A live sleep from a previous run: wait for it (timers wake it when due). */
+/**
+ * A live sleep from a previous run: wait for it (timers wake it when due).
+ * M0-P17: waking the timer does NOT reset the consecutive-error streak (only a
+ * successful answered submission does) and does NOT reset the per-task sleep
+ * counter (it clears for the next task or an explicitly granted human retry).
+ */
 export async function waitOutSleep(kit: LoopAndLock): Promise<boolean> {
 	const state = await readSessionState(kit.loop.harness);
 	const id = state.runStatus.sleepTaskId;
@@ -151,7 +164,6 @@ export async function waitOutSleep(kit: LoopAndLock): Promise<boolean> {
 				delete d.sleepTaskId;
 				delete d.sleepUntil;
 				delete d.activeAlert;
-				d.consecutiveErrors = 0;
 			},
 			rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "sleep-clear", detail: "sleep task already terminal" }],
 		});
@@ -164,7 +176,6 @@ export async function waitOutSleep(kit: LoopAndLock): Promise<boolean> {
 			delete d.sleepTaskId;
 			delete d.sleepUntil;
 			delete d.activeAlert;
-			d.sleepCycleCount = 0;
 		},
 		rows: [{ ts: Date.now(), kind: "governor", task: "session", verb: "sleep-woke", detail: "resumed after rate-limit sleep" }],
 	});

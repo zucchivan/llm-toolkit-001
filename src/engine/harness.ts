@@ -107,6 +107,11 @@ export interface ProjectPaths {
 	lock: string;
 	status: string;
 	pendingHandoff: string;
+	/** M0-P17: one atomically published note per file, written by the `handoff`
+	 *  CLI and claimed by the driver at each wave boundary. */
+	handoffInbox: string;
+	/** M0-P17: diagnosed invalid/unparseable notes are quarantined here. */
+	handoffInvalid: string;
 	waveLog: string;
 	database: string;
 	artifacts: string;
@@ -122,6 +127,8 @@ export function projectPaths(root: string): ProjectPaths {
 		lock: join(orch, "lock"),
 		status: join(orch, "status.json"),
 		pendingHandoff: join(orch, "pending-handoff.json"),
+		handoffInbox: join(orch, "handoffs", "inbox"),
+		handoffInvalid: join(orch, "handoffs", "invalid"),
 		waveLog: join(orch, "wave-log.jsonl"),
 		database: join(orch, "durable.sqlite"),
 		artifacts: join(orch, "artifacts"),
@@ -264,6 +271,10 @@ export interface LoopHarness {
 	config: KitConfig;
 	paths: ProjectPaths;
 	harness: Harness;
+	/** The kit's clock: the injected `now` (tests pass a fake clock) or the wall
+	 *  clock. Everything that SCHEDULES durable time (the rate-limit sleep's
+	 *  absolute deadline) reads this, so a fake-clock run stays wakeable. */
+	now(): number;
 	models: Models;
 	/** Handle kit tools; ConversationKit selects these per role. */
 	toolBox: { read: ToolRegistration; write: ToolRegistration; edit: ToolRegistration; bash: ToolRegistration };
@@ -369,12 +380,15 @@ export async function openProjectHarness(
 			},
 		}, BACKGROUND_CONTEXT);
 
+		const clockNow = opts.now ?? ((): number => Date.now());
+
 		return {
 			lock,
 			loop: {
 				config,
 				paths,
 				harness,
+				now: clockNow,
 				models,
 				toolBox: { read: tools[0]!, write: tools[1]!, edit: tools[2]!, bash: tools[3]! },
 				reports,

@@ -36,6 +36,14 @@ export type TaskFeedback = {
 	ts: number;
 }
 
+/**
+ * Typed block reason on a `quarantined` task (M0-P18). It is NEVER a fifth
+ * status: `needs_human` is the inconclusive-verifier block that a human may
+ * accept by tree (`resolve --accept-tree`); every other quarantine is retried
+ * (`resolve --retry`) or repaired by a wider/again-funded run.
+ */
+export type TaskBlockReason = "needs_human";
+
 export type RouterTask = {
 	id: string;
 	title: string;
@@ -57,6 +65,14 @@ export type RouterTask = {
 	baselineTreeSha?: string;
 	/** SHA of the last failing gate output — duplicate-error breaker. */
 	lastGateHash?: string;
+	/** M0-P17: durable rate-limit sleeps consumed by THIS task across restarts
+	 *  (never reset because a timer woke; cleared only by the next task starting
+	 *  fresh at 0 or an explicitly granted human retry). */
+	sleepCycles?: number;
+	/** M0-P18: why a quarantined task is blocked (absent for an ordinary
+	 *  failure). Cleared by a human resolution and by any later wave that
+	 *  leaves the task non-quarantined. */
+	blockReason?: TaskBlockReason;
 	feedback: TaskFeedback[];
 }
 
@@ -182,6 +198,10 @@ export type RunStatusDocValue = {
 	/** Cumulative estimated spend, USD. */
 	budgetSpentUsd: number;
 	activeAlert?: string;
+	/** M0-P17: content hashes of legacy `.orch/pending-handoff.json` queues
+	 *  already imported into `.orch/handoffs/inbox/` (each hash imports once,
+	 *  under the owner lock; duplicates after a crash are ignored). */
+	handoffImportedSha256?: string[];
 	/** Live sleep task (rate-limit breaker) the next run waits for before resuming. */
 	sleepTaskId?: number;
 	sleepUntil?: number;
@@ -189,6 +209,50 @@ export type RunStatusDocValue = {
 	consecutiveErrors: number;
 	kitVersion: string;
 }
+
+// ---------------------------------------------------------------------------
+// HandoffDoc — wave-addressed handoff bindings (M0-P17)
+// ---------------------------------------------------------------------------
+
+/** One wave's durable claim of consumed handoff notes (M0-P17). The binding
+ *  lands in the SAME state transaction that starts the wave, so the consumed
+ *  text survives the post-commit inbox unlink; a crash between commit and
+ *  unlink leaves the note files behind and the resume ignores them as
+ *  duplicates instead of losing or redelivering the note. */
+export type HandoffBinding = {
+	planRevision: string;
+	taskId: string;
+	wave: number;
+	/** Consumed note ids (the inbox file names, without `.json`). */
+	noteIds: string[];
+	/** Consumed note texts in claim order (≤ HANDOFF_CLAIM_MAX_CHARS total). */
+	notes: string[];
+	/** Epoch ms of the claim. */
+	at: number;
+};
+
+export type HandoffDocValue = {
+	version: 1;
+	/** Every consumed note id ever (oldest first) — the duplicate guard for
+	 *  note files that a crash left in the inbox. Bounded: oldest entries are
+	 *  dropped past the cap (an id can never be reused by a writer; uuid or
+	 *  content-hash). */
+	consumedIds: string[];
+	/** Recent wave bindings, oldest first (capped history; the resume looks up
+	 *  the ACTIVE wave's binding here). */
+	bindings: HandoffBinding[];
+};
+
+export const HANDOFF_CONSUMED_ID_CAP = 1000;
+export const HANDOFF_BINDING_HISTORY = 20;
+
+export const HandoffDoc: SessionDocToken<HandoffDocValue> = defineDoc({
+	kind: "loop.handoffs",
+	version: 1,
+	scope: "session",
+	initial: () => ({ version: 1, consumedIds: [], bindings: [] }),
+	checkpointWhen: () => true,
+});
 
 export const RunStatusDoc: SessionDocToken<RunStatusDocValue> = defineDoc({
 	kind: "loop.run",

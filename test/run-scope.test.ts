@@ -14,7 +14,7 @@
  * (test/plan-revision-helpers.ts); driver-level rules run in-process.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
@@ -470,5 +470,85 @@ describe("run-scope (driver): the grant is the exact triple, mirror-bound on app
 		// No wave started.
 		const rows = await waveLogRows(root);
 		expect(rows.filter((r) => r["kind"] === "wave" && r["task"] === "list-parse" && r["verb"] === "start")).toEqual([]);
+	}, 120_000);
+});
+
+// ---------------------------------------------------------------------------
+// M0-P18: a human resolution never broadens a grant
+// ---------------------------------------------------------------------------
+
+describe("run-scope: resolve never broadens the stored grant (M0-P18)", () => {
+	it("refuses a resolution outside the grant, keeps the grant triple intact across a retry, and still reports selection-complete", async () => {
+		const { runResolution } = await import("../src/engine/resolution.ts");
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml().replace("retryLimit = 2", "retryLimit = 0"));
+		await mkdir(join(project.root, "evals"), { recursive: true });
+		await writeFile(
+			join(project.root, "eval-gate.cjs"),
+			`const fs = require("node:fs");\nconst files = fs.existsSync("src") ? fs.readdirSync("src").map((f) => "src/" + f) : [];\nprocess.exit(files.some((p) => fs.readFileSync(p, "utf8").includes("BROKEN")) ? 1 : 0);\n`,
+			"utf8",
+		);
+		await writeFile(join(project.root, "evals", "recipes.toml"), `[gate-ok]\ncmd = "node eval-gate.cjs"\n`, "utf8");
+		await initProject(project.root);
+		await gitInit(project.root);
+
+		const { models, faux } = buildFauxModels([]);
+		faux.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				tasks: [
+					{ id: "t1", title: "one", spec: "write src/one.ts", dependsOn: [], acceptance: ["crit 1"], targetPaths: ["src/"], priority: 2 },
+					{ id: "t2", title: "two", spec: "write src/two.ts", dependsOn: [], acceptance: ["crit 2"], targetPaths: ["src/"], priority: 1 },
+				],
+			}), { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1; // BROKEN\n" })], { stopReason: "toolUse" }),
+		fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+		]);
+		const kit = await openProjectHarness(project.root, "test", { modelsOverride: models });
+		const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
+		const planned = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+		const summary = await runWaves(kit, { approve: { planRevision: planned.planRevision, tasks: ["t1"] }, tasksFilter: ["t1"] });
+		expect(summary.exit).toBe("blocked");
+
+		const before = await readSessionState(kit.loop.harness);
+		const grantBefore = readGrant(before.runStatus);
+		expect(grantBefore?.selected).toEqual(["t1"]);
+
+		// A resolution outside the grant is refused: it never admits t2.
+		await expect(runResolution(kit, {
+			planRevision: planned.planRevision, taskId: "t2", action: "retry", reason: "widen the grant by hand",
+		})).rejects.toThrow(/is outside the current grant \(t1\)/);
+		expect((await readSessionState(kit.loop.harness)).router.tasks.find((t) => t.id === "t2")?.status).toBe("todo");
+
+		// A retry of the GRANTED task leaves the grant triple byte-identical.
+		const outcome = await runResolution(kit, {
+			planRevision: planned.planRevision, taskId: "t1", action: "retry", reason: "retry the granted task only",
+		});
+		expect(outcome.idempotent).toBe(false);
+		const after = await readSessionState(kit.loop.harness);
+		expect(readGrant(after.runStatus)).toEqual(grantBefore);
+		expect(after.router.identity?.planRevision).toBe(planned.planRevision);
+		expect(after.runStatus.humanApprovedAt).toBe(grantBefore?.humanApprovedAt);
+
+		// An explicit resume set that is not the grant is still refused.
+		const refusal = grantRefusal(after, { tasks: ["t1", "t2"] });
+		expect(refusal).toMatch(/does not equal the stored grant \(t1\)/);
+		await expect(runWaves(kit, { tasksFilter: ["t1", "t2"] })).rejects.toThrow(/does not equal the stored grant/);
+
+		// The retried wave repairs the task; the plan still has work outside the grant.
+		faux.appendResponses([
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1;\n" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "gate", id: "gate-ok" }] }], notes: "gate proves crit 1" }), { stopReason: "stop" }),
+			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "gate", id: "gate-ok" }] }], notes: "skeptic: no refutation" }), { stopReason: "stop" }),
+		]);
+		const resumed = await runWaves(kit, { tasksFilter: [] });
+		expect(resumed.exit).toBe("selection-complete");
+		expect(resumed.complete).toBe(false);
+		expect(resumed.remainingPlanIds).toEqual(["t2"]);
+		const final = await readSessionState(kit.loop.harness);
+		expect(readGrant(final.runStatus)).toEqual(grantBefore);
+		expect(final.router.phase).not.toBe("complete");
+		await kit.loop.close();
+		kit.lock.release();
 	}, 120_000);
 });
