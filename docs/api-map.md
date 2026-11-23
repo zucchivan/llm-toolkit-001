@@ -86,47 +86,47 @@ harness.ts defines it on top of `defineDoc` (see its section below). Tests
 reach the seam through `test/kit-types.ts`, the only test-side window (faux
 subpath types included); they never import the SDK packages directly.
 
-## Prepared task-tree helpers — `src/engine/{workspace,controls}.ts` and `src/util/git-objects.ts` (M0-P09)
+## Task-tree helpers — `src/engine/{workspace,controls}.ts` and `src/util/git-objects.ts` (M0-P09, active via P14)
 
-**Prepared internal plumbing only; NOT ACTIVE in the driver until M0-P14.** These functions must not be treated as an execution sandbox or as a replacement for the current serial driver. No caller has permission to inspect/copy a dirty operator checkout into a task.
+**M0-P14 active serial-driver path.** The existing serial selector/gate flow now uses these helpers to create and verify one immutable candidate at a time. They are host-side Git/workspace plumbing, not an execution sandbox or OS-containment boundary. No caller may inspect/copy a dirty operator checkout into a task.
 
-- `openTask({root, oid}, identity, id)` resolves a full commit/tree OID and materializes a private writable projection under `.orch/work/<revision>/<task>/<lease>/`; it never uses the operator index, working tree, or a Git worktree. The workspace contains no `.git`. It pins the parent tree beneath `refs/kit/...` (not `refs/heads`) and returns an opaque owned lease plus the exact projected and deliberately excluded parent paths.
+- `openTask({root, oid}, identity, id, {scopeBaseOid?})` resolves a full commit/tree OID and materializes a private writable projection under `.orch/work/<revision>/<task>/<lease>/`; `oid` is this wave's start tree and `scopeBaseOid` is the unchanged integration parent used for whole-candidate scope. It never uses the operator index, working tree, or a Git worktree. The workspace contains no `.git`. It pins the parent tree beneath `refs/kit/...` (not `refs/heads`) and returns an opaque owned lease plus the exact projected and deliberately excluded parent paths. `resumeTask(..., leaseId)` reattaches only a checkpointed lease and reports a previously pinned candidate; it never recaptures the operator checkout.
 - `createTaskControls({root, targetPaths, deniedPaths?, readOnlyPaths?})` validates immutable project-relative controls. `matchesPath` is the shared in-process matcher: exact literal file, trailing-`/` directory prefix, `*` within one component, `**` across components. It never invokes a shell. Empty target list means all *admissible* paths; reserved/denied paths always win. `.orch/**`, secrets, `.git/**` and paper-trail files are hidden; `evals/**`, `PROMPT.md`, Git/delivery controls and optional configured read-only paths are projected read-only and cannot be admitted as changes. `classifyProjectPath` from `src/hygiene.ts` participates in admission.
 - `materializeRead({root, oid}, controls)` resolves an immutable tree, makes only safe regular-file entries read-only in a private view, pins the tree, and reports the paths projected/excluded. It does not expose Git metadata or private `.orch` state.
-- The host must first fence every writer, then call `fenceWorkspace(lease, controls)`. This is an explicit host assertion, not a worker/process-kill implementation. `freeze(fencedWorkspace)` starts from the pinned parent in a unique `GIT_INDEX_FILE` under `.orch/work`, hashes exact bytes with `--no-filters`, applies NUL-delimited index records, writes a tree, checks the **entire** tree delta against controls, pins the result, and returns a checked tree OID plus exact create/modify/delete/mode changes. A malformed path, unsupported object, symlink, hard link, limit, or failed Git command throws; there is no partial/empty fallback.
+- The host must first fence every writer, then call `fenceWorkspace(lease, controls)`. This is an explicit host assertion, not a worker/process-kill implementation. `freeze(fencedWorkspace)` starts from the wave's pinned start tree in a unique `GIT_INDEX_FILE` under `.orch/work`, hashes exact bytes with `--no-filters`, applies NUL-delimited index records, writes a tree, checks admissible paths against both the whole integration-parent→candidate scope and the start-of-wave→candidate progress delta, pins the result, and returns a checked tree OID plus exact per-wave create/modify/delete/mode changes. A malformed path, unsupported object, symlink, hard link, limit, or failed Git command throws; there is no partial/empty fallback.
 - `discard(ownedLease)` accepts only an opaque handle created by this module. It has no caller-provided root/path and removes only that lease's private directory; it never resets/cleans/restores a checkout or deletes pinned objects. Tree helpers in `src/util/git-objects.ts` use full OIDs, checked subprocess results, byte-capped reads, private throwaway indexes, and private `refs/kit/...` pins. No branch is published for `delivery=none`.
 - `diffTrees` / `diffTaskTrees` compare immutable trees, including binary object IDs and executable modes; they do not stage/display-diff a worktree.
 
 ## M0-P10 — control, execution, and read roots
 
-**Prepared internal call plumbing only. It is not active in the production driver before P14 and is not an OS sandbox or containment boundary.** The explicit `TaskExecutionContext` in `src/engine/workspace.ts` separates three authorities:
+**Active in the M0-P14 serial driver; still not an OS sandbox or containment boundary.** The explicit `TaskExecutionContext` in `src/engine/workspace.ts` separates three authorities:
 
 - **Control root:** `controlPaths: ProjectPaths` remains host-owned. Durable SQLite, config, status, router mirror, gate/verifier logs, assessment artifacts, and other `.orch` outputs resolve here.
 - **Execution root:** `writableWorkspace` is an opaque P09 task lease for an implementer. Role setup receives the host-created context, which includes the exact `planRevision`, selected task IDs, task ID, lease ID, and parent/start/candidate OIDs; it does not accept a caller-selected host cwd. Coding conversations use the lease projection; read-only conversations use the candidate view.
 - **Read root:** `frozenReadView` must be an owned read projection whose tree equals `candidateOid`. New-context `runVerify` builds its changed-file list, summary, display patch, and Jev assessment patch from `startOid → candidateOid` via `diffDisplayTrees`; no display-stage operation or working-tree fallback is used. Gate processes also execute with the frozen candidate view as cwd.
 
-A context carries a captured `ImmutableRecipeBundle`: the exact UTF-8 bytes (and absent-vs-empty state) of `evals/recipes.auto.toml` and `evals/recipes.toml`, plus their SHA256 and reviewed source tree. `recipeBundleFromTree(root, reviewedTreeOid)` reads those bytes only from immutable Git objects; the context requires that source tree to equal the task start tree. `runGates` parses only these bytes for a new context; it writes the gate log under the control root and uses the context's injected `execArgv` capability in the frozen view. `probeGates` can use an explicit frozen baseline context only after the ordinary interactive/`--yes` execution consent; it does not silently turn inspection into execution.
+A context carries a captured `ImmutableRecipeBundle`: the exact UTF-8 bytes (and absent-vs-empty state) of `evals/recipes.auto.toml` and `evals/recipes.toml`, plus their SHA256 and reviewed source tree. `recipeBundleFromTree(root, reviewedTreeOid)` reads those bytes only from immutable Git objects; the context requires that source tree to equal the task start tree. `runGates` parses only these bytes for a new context; it writes the gate log under the control root and uses the context's injected `execArgv` capability in the frozen candidate view. Scope is checked from integration parent→candidate; verifier diff/progress evidence is start-of-this-wave→candidate. `probeGates` can use an explicit frozen baseline context only after the ordinary interactive/`--yes` execution consent; it does not silently turn inspection into execution.
 
-Call seams: `ConversationKit.createUnit({ executionContext })`, `runGates(..., { context })`, `runVerify(..., { executionContext })`, and `probeGates(root, { executionContext })`. `createTaskExecutionContext` checks grant membership, root agreement, owned workspace/read-view kinds, candidate-tree equality, the recipe bundle digest, and exact recipe-byte equality against the immutable start tree. The legacy serial wave path explicitly uses `trustedCompatibilityContext` for trusted pre-cutover fixtures; it still operates on the old root and is removed at P14. The `inspector.readout` remains a control-root observer and does not read task source from the operator checkout. `readout.seam` stays at 1; no v2 read package is introduced.
+Call seams: `ConversationKit.createUnit({ executionContext })`, `runGates(..., { context })`, `runVerify(..., { executionContext })`, and `probeGates(root, { executionContext })`. `createTaskExecutionContext` checks grant membership, root agreement, owned workspace/read-view kinds, candidate-tree equality, the recipe bundle digest, and exact recipe-byte equality against the immutable start tree. Diagnostic `verify --task` opens a `TaskReadContext` for the newest retained candidate; it does not read task source from the operator checkout. The `inspector.readout` remains a control-root observer. `readout.seam` stays at 1; no v2 read package is introduced.
 
 These are host-side path and data-flow distinctions only. The injected literal runner may still be host execution; no sandbox backend, OS containment, isolation, or hostile-project safety claim is made in M0.
 
 ## M0-P11 — criterion evidence + reviewed passes (`loop.receipts`)
 
-**`src/engine/receipts.ts`** defines the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[], latest?: Record<key,{opId,ordinal}>}`). P11 records GATE and PASS; P12 additively adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY journal events. P12 event wrappers carry a stable `planRevision/taskId/wave/stage` key and a unique per-key attempt ordinal. `commitState({receiptAttempts})` allocates the ordinal, appends the event, and updates `latest` in the SAME harness commit as accompanying state changes. P11's gate/pass event shapes and `commitState({receipts})` behavior stay unchanged. Raw output/tails stay out of documents (the gate log and wave log carry them).
+**`src/engine/receipts.ts`** defines the `ReceiptsDoc` session doc (`loop.receipts`, payload version 1: `{version:1, events: ReceiptEvent[], latest?, latestCheckpoints?}`). P11 records GATE and PASS; P12 additively adds ACCEPTANCE, INTEGRATE, ROLLBACK, and DELIVERY journal events; P14 adds checkpoint events for each wave/stage. Journal wrappers carry a stable `planRevision/taskId/wave/stage` key and unique per-key attempt ordinal. `commitState({receiptAttempts, checkpoints})` appends the events and advances their latest pointers in the SAME harness commit as accompanying state changes. Raw output/tails stay out of documents (the gate log and wave log carry them).
 
-- `GateReceipt` = wave key + `{id, tree, controlsSha256?, checks}`: the checked tree plus every `GateCheck` `{id, kind: scope|recipe, outcome: pass|fail|skip|error, exit, ms}` observed on it. The driver commits one per wave, including failed-gate waves. `controlsSha256` is absent when the plan has no approved control bundle (absent ≠ empty).
+- `GateReceipt` = wave key + `{id, tree, controlsSha256?, failureHash?, checks}`: the frozen candidate plus every `GateCheck` `{id, kind: scope|recipe, outcome: pass|fail|skip|error, exit, ms}` observed on it. The optional `failureHash` supports the duplicate-gate breaker without storing output. The driver commits one per wave, including failed-gate waves. `controlsSha256` is absent when the plan has no approved control bundle (absent ≠ empty).
 - `PassReceipt` = wave key + `{id, tree, gateId, policy, review}`: one read-only pass — `ReviewPass = {pass: primary|skeptic|human, verdict, criteria: CriterionResult[], notes, conversationId?}` — bound to the candidate tree, the wave's gate receipt, and the effective verification policy (`always`/`never` from `[gates] skepticSecondPass`; `risk-v1` arrives with routing). Each pass is committed BEFORE the next pass is dispatched; the verdict row's additive `receipt` field carries the pass receipt id.
 
 **`src/engine/review.ts`** validates approving passes against the checked tree (§1 ADR 02). Every reviewed criterion must be marked pass and cite valid evidence: `{kind:"gate", id}` naming an executed, non-scope, non-skipped passing check from the gate receipt, or `{kind:"line", path, line}` naming an existing 1-based physical line in a regular UTF-8 text blob of the checked tree. Criterion ids are the exact 1-based indexes of the reviewed acceptance array; unknown/duplicate ids, missing entries, missing proof, empty criterion entries, or malformed reply shapes refuse. Neither reference is recomputed from the operator's checkout, and scope alone is never criterion evidence.
 
 **`src/engine/verifier.ts`** feeds the checked tree, gate receipt id and non-skipped outcomes to BOTH read-only passes independently; enforcement is symmetric (the skeptic previously had a completeness check the primary lacked). Malformed JSON and prose around the JSON object degrade to `needs_human` (one optional code fence is tolerated); reply criteria entries map 1:1 — malformed entries are preserved and refuse an approval, never silently filtered. A well-formed explicit `reject` stays reject without evidence. No skeptic dispatch happens after an invalid or nonapproving primary. The one-off `verify --task` diagnostic path passes no gate evidence (so no gate reference can be evidence) and records no wave-keyed pass receipts; it still writes its verdict rows.
 
-Prepared `runVerify({executionContext})` callers resolve the checked tree from the context's `candidateOid`; the trusted compatibility path (still the serial driver until P14) captures the wave content the gates inspected. `readout.seam` stays at 1; the new `receipt` WaveRow field is additive for v1 reads.
+The active serial driver resolves the checked tree from `TaskExecutionContext.candidateOid`; diagnostic `verify --task` opens a grant-free, read-only `TaskReadContext` for the newest retained candidate. Pass rows carry the P11 receipt id; wave rows/status add the current revision, receipt-state projection, and frozen-checkpoint OIDs additively. `CheckpointEvent` carries `{stage,state,outcome?,parent,startTree,candidate?,leaseId?,conversationId?,submissionKey?,grantedFeedbackIds}`; its per-wave/per-stage latest pointer is committed atomically with its event. `readout.seam` stays at 1.
 
 ## M0-P12 — integration journal + local publication (`src/engine/delivery.ts`)
 
-**Prepared host operations only; NOT driver-active before P14.** The existing serial driver's legacy `runDelivery` remains unchanged until cutover; callers must not infer that the P12 operations already govern ordinary `run`.
+**Active host operations in the M0-P14 serial driver.** These journaled operations, rather than direct root staging/restore, govern ordinary `run`.
 
 - `acceptCandidate(kit, {planRevision,taskId,wave,parent,tree,policy,required})` requires the current grant to include the task, a matching gate receipt, and each required approving pass receipt. It revalidates every pass's criterion evidence against the checked tree, pins the candidate tree under `refs/kit/`, and journals an acceptance event. An identical already-recorded acceptance is idempotent; a different candidate/parent for the same wave is recovery-required.
 - `integrateAcceptedCandidate(kit, waveKey)` creates a deterministic one-parent commit from the accepted tree and exact recorded parent, pins it at `refs/kit/<revision>/integration-objects/<task>/<wave>/commit`, then commits the integration intent before CAS-updating `refs/kit/<revision>/accepted`. Replays reuse the pinned/recorded OID. The commit tree and sole parent are read back, and the accepted ref is read back before `integrated` is recorded.
@@ -281,10 +281,41 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   plan task done) flips the router phase to complete exactly once; a
   satisfied subset reports `selection-complete` and leaves the phase open;
   a quarantined granted member stops the selection as a policy stop
-  (`exit: "blocked"` → CLI 2) with ids, never 0/complete. `RunSummaryInfo`
-  carries `grant`, `remainingPlanIds`, `quarantined`, `blockedIds`; `DriverExit`
-  is `plan-complete | selection-complete | blocked | budget | sleeping`
-  (0/0/2/2/42 at the CLI, 1 for refusals, 130 for SIGINT).
+  (`exit: "blocked"` → CLI 2) with ids, never 0/complete. An unresolved or
+  uncertain checkpoint returns `recovery-required` (CLI 2), leaves the task
+  non-done, and stops before dependents. `RunSummaryInfo` carries `grant`,
+  `remainingPlanIds`, `quarantined`, `blockedIds`; `DriverExit` is
+  `plan-complete | selection-complete | blocked | recovery-required | budget | sleeping`
+  (fulfilled 0, policy/recovery/budget 2, sleeping 42, refusals 1, SIGINT 130).
+
+### M0-P14 serial candidate/checkpoint flow
+
+For each task wave, `waves.ts` reads the current private accepted commit, opens a
+private lease from the wave start tree, checkpoints the implementer conversation
+and stable request id before submission, then fences and freezes the lease. Scope
+is integration-parent→candidate; progress/diff is start-of-this-wave→candidate.
+The gate and each verifier pass bind to that exact candidate and the reviewed
+recipe bundle. Pass receipts are committed before the next pass. An accepted
+candidate is journaled, integrated as a one-parent commit, and separately
+published as `none`, a named local result branch, or an authorized stacked PR.
+
+`loop.receipts` now includes latest-per-wave/per-stage checkpoints with
+`parent`, `startTree`, optional `candidate`, `leaseId`, `conversationId`, and
+`submissionKey`. On resume the driver reconciles the same implementer/verifier
+submission and existing gate/pass/integration/publication receipts; it does not
+start a second wave or pay for a completed pass. An unresolved gate effect,
+publication or workspace-disposal result stops with `recovery-required`; no task
+becomes done and no dependent task starts. Failed candidates stay pinned for
+review; only the private owned lease is discarded through the rollback receipt.
+The operator HEAD, index, staged/unstaged files and ignored files are never wave
+inputs or restore targets. Successful `none` mode leaves the accepted ref at
+`refs/kit/<revision>/accepted`; inspect it with a separate detached worktree.
+
+A one-off `verify --task` looks up the current revision's newest retained
+candidate and opens a read-only `TaskReadContext`. With no retained candidate it
+refuses; it never verifies the operator checkout. Checkpoint, receipt-state,
+planRevision, and candidate-artifact filenames are additive to status/readout
+rows. This remains trusted-project host execution, not an OS sandbox.
 
 ### Why plain code phases instead of hooks (both documented)
 
@@ -300,8 +331,10 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   riding on the owner conversation.
 
 - `createConversation({ ownership: {kind:"ownerless"}, agent, init }, ctx)` —
-  per-task implementer conversation; `agent.tools` array selects exactly the
-  kit tools; `init` writes the conversation-scoped `LoopGuardDoc`
+  one fresh implementer conversation per new wave; `agent.tools` selects exactly
+  the kit tools and `init` writes the conversation-scoped `LoopGuardDoc`. A
+  resumed wave reuses the checkpointed conversation and request id; a new wave
+  receives a new private lease/cwd.
 - `Conversation.submit({type:"input", content, requestId})` +
   `submission.wait(ctx)` → `SettledSubmissionRecord` (`done` | unanswered with
   `reason`, reading `LiveDoc.snapshot` for `runFailure.detail`)
@@ -344,13 +377,15 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   `safeRecipeCwdReal` in the runner, re-exported by `adoption/discovery.ts`;
   adoption compares/serializes recipes by canonical argv (`recipesEquivalent`,
   `recipeTomlCommand`), preserving legacy `cmd` rendering so unchanged
-  generated recipes keep their fingerprints. Logs land in
-  `.orch/artifacts/gate-*.log`. No-shell spawning and scope/tool guards are
+  generated recipes keep their fingerprints. Active wave logs land in flat,
+  revision/task/wave-qualified `.orch/artifacts/gate-<revision>-<task>-w<N>-*.log`
+  names; standalone probe logs retain their baseline name. No-shell spawning and scope/tool guards are
   not containment: recipes and project code execute on the host with the
   CLI's environment (the M1 sandbox boundary replaces that)
-- scope list from `util/git.ts` `treeChanges()` (deterministic: temp-index
-  baseline tree vs `git hash-object` of the worktree) — no `git add -N`
-  (index stays clean); engine-owned paths exempt
+- Active serial waves use immutable tree comparison through `diffTaskTrees`:
+  scope is the integration parent→candidate delta; progress is the wave's
+  startTree→candidate delta. `gates probe` retains its separate consented
+  baseline path. No wave gate stages or reads the operator index/worktree.
 
 ## src/engine/verifier.ts
 
@@ -373,17 +408,11 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
 
 ## src/engine/delivery.ts
 
-- The production serial driver still calls the legacy `runDelivery` path until
-  M0-P14: its old `none`/`commit`/`pr` behavior is not the prepared P12/P13
-  guarantee and must not be described as safe local publication. P12's
-  prepared host APIs are `acceptCandidate`, `integrateAcceptedCandidate`,
-  `publishLocalResult`, and `discardCandidateWorkspace`; P13 adds
-  `publishPullRequest`. These remain callable under the host lock but are not
-  wired into `waves.ts` yet.
+- `waves.ts` wires `acceptCandidate`, `integrateAcceptedCandidate`, `publishLocalResult`, `discardCandidateWorkspace`, and `publishPullRequest` at the serial candidate/review/integration/publication boundaries. Production `run` no longer stages, restores, checks out, or publishes from the operator worktree.
 
-### M0-P13 — verified stacked PR publication (prepared; not driver-active)
+### M0-P13 — verified stacked PR publication (active through M0-P14)
 
-- `publishPullRequest(kit, wave, options)` requires a current exact grant,
+- `preflightPullRequest(kit, {deliverExplicit, profilePath?})` validates explicit `--deliver`, the canonical host-approved origin, and the reviewed base branch without network effects. It runs before PR-mode grant approval or model dispatch. `publishPullRequest(kit, wave, options)` then requires a current exact grant,
   matching acceptance/integration receipts, an integrated commit with the
   accepted tree and exactly one recorded parent, `delivery.mode = "pr"`, and
   explicit `deliverExplicit: true` (the CLI's `--deliver` consent). It reads
@@ -422,10 +451,10 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   after a lost create response is acknowledged; a possibly attempted create
   with no observable PR stays unknown and is never blindly repeated. A lost
   remote-ref push response is reconciled by exact OID readback.
-- `test/pr-publication.test.ts` exercises the prepared operation with a local
-  bare Git remote and injected fake PR host; it makes no live network call and
-  reads no GitHub credential. The operation remains prepared until P14 wires
-  it into the serial driver.
+- `test/pr-publication.test.ts` exercises the publication operation with a
+  local bare Git remote and injected fake PR host; it makes no live network call
+  and reads no GitHub credential. `test/serial-lineage.test.ts` also exercises
+  A→B through the active serial driver in mock-PR mode.
 
 ## src/sandbox/host-profile.ts
 
@@ -443,7 +472,9 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
 
 - `status` panel reads `.orch/status.json` (produced by `flushStated` — atomic
   rename) when the lock is held elsewhere, else opens storage briefly under a
-  fresh lock; `export` renders report.json/report.html from the session state
+  fresh lock. The additive side-car fields include latest `planRevision`, the
+  latest `receiptStates`, and `{wave,baseTree,candidateTree,asOf}` for a frozen
+  candidate; `export` renders report.json/report.html from the session state.
 - `plan` prints the minted `plan revision` (and the replaced revision on a
   replan) after writing router.md, plus the exact grant command
   (`run --approve --revision <uuid>`); `run` refuses — before any wave or
@@ -453,5 +484,8 @@ Local result refs: the private integration head is `refs/kit/<revision>/accepted
   (`grantRefusal` + `approveGrant`/`approvalMirrorRefusal` in the driver)
 - arg parsing: `node:util parseArgs` only (no framework); `run` parses
   STRICTLY (no positionals, no unknown flags), repeats `--tasks` once per id
-  and requires `--revision` with `--approve`; exit codes 0 fulfilled ·
-  2 stopped short (quarantine/budget) · 42 sleeping · 1 error/busy · 130 SIGINT
+  and requires `--revision` with `--approve`. PR mode preflights `--deliver`,
+  the allowlisted origin, and reviewed base before work starts. Exit codes:
+  0 fulfilled · 2 stopped/recovery-required · 42 sleeping · 1 invalid/error/busy · 130 SIGINT.
+  `none` prints the detached accepted-ref checkout command; `commit` names its
+  local result ref. PR publication is not merge.

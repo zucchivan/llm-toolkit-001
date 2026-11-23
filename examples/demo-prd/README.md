@@ -16,7 +16,10 @@ description only) and by the UI's demo mode:
   control, so the executed assertion is not task-writable. The UI demo bake and
   the test builders perform that copy; a manual `cp -r` of this fixture needs
   the one extra line: `cp smoke-gate.cjs evals/`.
-- The completed result satisfies `node bin/render.js '/a/-b'` → exit 0, stdout
-  exactly `a b`. Requires Node ≥ 23.6: the product's `src/*.ts` modules run
-  through Node's default TypeScript type-stripping.
+- After the run, inspect the accepted result separately; the operator checkout
+  is unchanged. Use `git worktree add --detach /tmp/demo-result
+  refs/kit/<planRevision>/accepted`, then run
+  `node bin/render.js '/a/-b'` from `/tmp/demo-result` → exit 0, stdout exactly
+  `a b`. Requires Node ≥ 23.6: the product's `src/*.ts` modules run through
+  Node's default TypeScript type-stripping.
 - `smoke-slow.replay` keeps its 6s delay for attach/stop tests.

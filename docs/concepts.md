@@ -8,7 +8,7 @@ durable harness.
 | role | conversation | tools | model source | purpose |
 | --- | --- | --- | --- | --- |
 | planner | ONE per plan (`kit-plan-v1` request id) | `[read]` only | `roles.planner` | PRD → RouterDoc tasks (id/spec/dependsOn/acceptance/targetPaths) |
-| implementer | ONE per task (`task-<id>`, resumed across waves) | read, write, edit, bash | `roles.implementer` | one wave = one task; PROMPT.md discipline attached |
+| implementer | fresh ownerless conversation per new wave; same conversation/request reused only to reconcile that wave | read, write, edit, bash | `roles.implementer` | one private workspace lease per wave; PROMPT.md comes from the committed start tree |
 | verifier | fresh per pass; adversarial pass follows a conclusive, evidence-backed primary approval by default | `[read]` only (+ beforeTool guard) | `roles.verifier` | strict-JSON verdict `approve`/`reject`/`needs_human`; approval requires per-criterion evidence on the checked tree (M0-P11) |
 
 The implementer's final `STATUS: COMPLETE` / `STATUS: BLOCKED` line is only a
@@ -20,8 +20,7 @@ not itself change the task status.
 - **Task** — a planned unit of work with its reviewed definition and dependencies.
 - **Wave** — one numbered implementation attempt at a task; a retry is another
   wave, not a new task.
-- **Gate** — a deterministic check run against the current baseline working-tree
-  candidate (immutable candidate trees are proposed later, not current behavior).
+- **Gate** — a deterministic check run against one frozen candidate tree. Scope is the integration-parent→candidate delta; wave progress is the start-of-this-wave→candidate delta.
 - **Verdict** — a read-only review judgment about specified criteria. A verdict
   is distinct from both an implementer's status report and a gate result.
 
@@ -89,33 +88,38 @@ safe to run.
   its branch) captured at planning. Uncommitted operator edits (staged,
   unstaged, untracked) are EXCLUDED from that base — they are operator
   working files, never plan input, and before the first commit the base is
-  recorded as absent rather than guessed.
+  recorded as absent rather than guessed. P14 execution requires a non-null
+  committed base; create the intended seed/base commit and replan first.
 - **wave** — the driver picks the next GRANTED `todo` task whose `dependsOn`
   are all `done` (dependency lookup sees every plan task; candidates come
-  only from the grant; topological, priority then id), captures the git
-  working tree as `baselineTreeSha` (temp-index snapshot in `.orch/`, never
-  touching the user's index), and submits one wave input
-  (`requestId: "<task>-w<N>"`, idempotent). The driver re-reads latest
+  only from the grant; topological, priority then id). It opens a private
+  workspace from the accepted integration commit, or the prior failed candidate
+  on retry, then fences and freezes one candidate. The operator checkout is
+  never captured or restored. Scope is parent→candidate; progress is this
+  wave's start tree→candidate. A stable revision/task/wave/stage request key
+  and checkpoint let resume reconcile the same submission instead of starting
+  a second wave. The driver re-reads latest
   durable state before each selection and after completion. A satisfied
   subset reports selection-complete while the plan keeps its remaining work;
   only whole-plan fulfillment flips the router phase to complete (recorded
-  once). A quarantined granted task stops the selection immediately as a
-  policy stop (CLI exit 2 with ids), never a drained-queue success.
+  once). A quarantined granted task stops the selection immediately; an
+  uncertain receipt/effect returns `recovery-required` (CLI exit 2), leaves the
+  task non-done, and stops before any dependent wave.
 - **gate** — deterministic checks run as plain code phases (simpler diagnostics
-  than an `afterRun` hook; both are viable, see api-map): scope check first
-  (diff-vs-baseline file set minus engine-owned paths), then effective recipes
-  from `evals/recipes.auto.toml` + human-overriding `evals/recipes.toml`
-  (one command form per recipe — legacy whitespace-split `cmd` with shell
-  syntax refused, or literal `argv` tokens; ALL stdout `match` regexes must
-  match, empty list vacuously true; `on` path fast-skip; project-relative
-  real-path-contained workspace `cwd`). stdout past the 256 KiB capture cap
-  with `match` present fails `output_capped` instead of matching on a tail;
+  than an `afterRun` hook; both are viable, see api-map): scope check first on
+  the immutable integration-parent→candidate delta, then effective recipes
+  captured from the committed wave-start tree (`evals/recipes.auto.toml` plus
+  human-overriding `evals/recipes.toml`). Recipes run in a private read view of
+  that exact candidate (one command form per recipe — legacy whitespace-split
+  `cmd` with shell syntax refused, or literal `argv` tokens; ALL stdout
+  `match` regexes must match, empty list vacuously true; `on` path fast-skip;
+  project-relative real-path-contained cwd). stdout past the 256 KiB capture
+  cap with `match` present fails `output_capped` instead of matching on a tail;
   match evaluation runs in a bounded worker under the recipe's remaining
-  deadline. Failures become compact feedback text and a
-  `lastGateHash` for the breaker. These checks run directly on the host working
-  tree and provide no sandbox or containment boundary.
+  deadline. Failures become compact feedback text and a `lastGateHash` for the
+  breaker. Host execution is not an OS sandbox or containment boundary.
 - **verify** — a fresh read-only verifier conversation is fed spec + criteria +
-  per-file diff summary vs the task baseline + the checked tree, the gate
+  per-file diff summary for this wave's start tree→candidate delta + the checked tree, the gate
   receipt id and the non-skipped gate outcomes. When that primary pass approves
   with valid criterion evidence, a SECOND fresh read-only conversation uses the
   same `roles.verifier` model but a dedicated adversarial brief: refute approval
@@ -156,11 +160,14 @@ safe to run.
   not stored. Uncertain, conflicting, stale, missing-key, malformed, and network
   outcomes remain `unknown` and cannot change feedback, retries, quarantine,
   task/adoption state, delivery, human approvals, or any command execution.
-- **deliver** — off by default (`delivery.mode = "none"`): approved waves stay
-  in the operator's working tree, with diffs measured from each task's baseline.
-  `commit` mode attempts one commit per approved task on the checked-out branch. `pr` mode
-  optionally branches, commits, pushes, and calls `gh pr create --fill` when the
-  run also has `--deliver`; it never merges the pull request.
+- **deliver** — acceptance, integration, workspace recovery, and publication
+  are separate receipted effects. `none` records `not_requested` and leaves the
+  accepted lineage at `refs/kit/<revision>/accepted`; inspect it in a separate
+  detached worktree. `commit` publishes the named local branch
+  `refs/heads/kit/<revision>/result` without checking it out. `pr` requires
+  `--deliver` and the operator's allowlisted GitHub origin before implementation
+  starts; stacked PRs use verified create-only refs and are never auto-merged.
+  The operator's HEAD, index, and working files remain unchanged in every mode.
 
 ## The governor (budgets + breakers)
 
@@ -174,35 +181,39 @@ All decisions append to `.orch/wave-log.jsonl` with a `reason`.
   the ceiling.
 - **Wave warn** (`budgets.waveUsdWarn`): warn row when one wave's estimated
   spend crosses the threshold.
-- **Zero-progress breaker**: a wave that produces no file changes outside
-  engine-owned paths (`router.md`, `.orch/**`, `PROMPT.md`) is quarantined
-  immediately — no `retryLimit` burn.
+- **Zero-progress breaker**: a wave that produces no changes from its own
+  start tree to its frozen candidate is quarantined immediately — no
+  `retryLimit` burn, even if the task has cumulative changes from prior waves.
 - **Duplicate-failure breaker**: identical failing-gate hash two waves running
   (`lastGateHash`) → immediate quarantine.
-- **Consecutive-error breaker** (`budgets.maxConsecutiveErrors`): that many
-  back-to-back unanswered runs quarantine with an alert.
+- **Consecutive-error breaker** (`budgets.maxConsecutiveErrors`): unanswered
+  run failures increment the persisted counter; reaching the cap quarantines
+  with an alert. M0-P14 does not reset it on an answered wave, so it is not a
+  strict back-to-back failure window.
 - **Rate-limit sleep**: rate-limit-shaped errors parse a reset delay (or fall
   back to 30 min) and arm a DURABLE sleep task (`kit.sleep` via
   `runtime.sleepUntil`) — the driver exits 42; the next `run` waits out the
   sleep (real clock or the injected fake one) and resumes without cron code.
   `budgets.maxSleepCycles` caps the round-trips per task.
 
-## Quarantine + rollback
+## Quarantine + workspace recovery
 
-When a task is quarantined, the engine attempts to save the wave's diff against
-`baselineTreeSha` to `.orch/artifacts/quarantined-<task>-w<N>.patch`, then
-attempts `git read-tree` + `checkout-index` + `git clean -fd -e .orch` to restore
-the working tree toward the baseline while preserving `.orch/`. Capture and
-restore failures are currently best-effort and can be swallowed. Consequently,
-a `quarantined` status, wave-log row, or patch does not prove complete rollback,
-and subsequent tasks must not be described as guaranteed to see a clean tree.
+A failed/rejected frozen candidate is retained under its private Git pin and
+receipted for review. The driver discards only the owned private workspace
+lease, then records `discarded` after confirming the lease is absent and the
+integration ref is unchanged. It does not reset, clean, stage, or restore the
+operator checkout. A failed/unknown disposal is blocking: the task cannot be
+done and dependents cannot start. Revision-qualified flat candidate artifacts
+are display evidence only; checkpoint/rollback receipts are the recovery facts.
 
 ## Visibility
 
 Every view of the kit renders the same snapshot. `readout()` (`src/engine/inspector.ts`)
-assembles ONE `KitReadout` — identity, phase, tasks, wave-log rows, usage splits
-(session / per-model / per-task + spend rate), wave timeline, artifacts,
-conversation summaries, health checks — and every surface consumes it:
+assembles ONE `KitReadout` — identity, latest `planRevision`, receipt-state
+projection, latest frozen `{wave,baseTree,candidateTree,asOf}` checkpoint,
+phase, tasks, wave-log rows, usage splits (session / per-model / per-task + spend
+rate), wave timeline, artifacts, conversation summaries, health checks — and
+every surface consumes it:
 
 | surface | command | mode |
 | --- | --- | --- |
@@ -241,8 +252,9 @@ pi-durable's SQLite is local-only and single-owner (§ one-process rule), so
 `status --follow` in another process reads the ATOMIC `.orch/status.json`
 side-car, and the local paper trail is `router.md` + `.orch/wave-log.jsonl`
 (+ gate artifacts). Storage stays the durable truth; side-cars are best-effort
-mirrors re-rendered after state commits, not guaranteed committed evidence or
-proof of an external effect such as rollback or delivery.
+mirrors re-rendered after state commits, not guaranteed committed evidence.
+The receipt journal—not a status color or display patch—records confirmed
+workspace disposal, integration, and publication effects.
 
 ## Repository hygiene — three ownership classes
 

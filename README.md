@@ -2,10 +2,10 @@
 
 A maintained TypeScript **agent implementation loop template**: point it at a PRD,
 review one plan, and let a budget-governed `pi-durable` agent harness produce
-working-tree changes, optional local commits, or optional pull requests —
-implementer waves → deterministic gates → read-only verifier + default-on
-adversarial second pass → done/quarantine, with local evidence along the way.
-Pull-request creation never merges code.
+frozen candidate trees and receipted outcomes — implementer waves → deterministic
+gates → read-only verifier + default-on adversarial second pass → accepted
+lineage → optional local result branch or pull request. The operator checkout is
+not the result location; pull-request creation never merges code.
 
 - Runtime: [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable) **1.5.0** (pinned exact) on Node ≥ 22.19 (Node 24 LTS preferred).
 - One provider/model per ROLE (planner / implementer / verifier) from project config — subscription-budgeted, sequential v1, no parallel agent fan-out.
@@ -17,8 +17,9 @@ Pull-request creation never merges code.
   reviewable kit controls (`.orch/config.toml`, `.orch/gate-decisions.json`,
   `.orch/gate-remediations.json`) stay committable but are never auto-staged.
   These mirrors/artifacts are local evidence, not guaranteed committed
-  evidence; Git writes occur only through the configured delivery path or
-  explicit operator action.
+  evidence. The driver writes private candidate objects/refs under `refs/kit/`
+  and never changes the operator checkout or index; public/local result refs
+  are written only by the configured and receipted delivery path.
 - Gates (recipes), a read-only verifier with a default-on adversarial second
   pass, and a budget governor (estimated session USD ceiling,
   zero-progress/duplicate-failure breakers, rate-limit durable sleep with exit
@@ -36,7 +37,8 @@ npx llm-toolkit-001 init . --with-demo     # in the repo root of your project
 #    approvals get a second adversarial verify call by default; opt out with
 #    [gates] skepticSecondPass = false
 
-# 3. write the PRD at docs/prd.md, then run one planning conversation
+# 3. write the PRD at docs/prd.md and commit the intended base with your normal Git workflow.
+#    plan records HEAD; `run` requires that reviewed base commit. Dirty operator changes are excluded.
 llm-toolkit-001 plan --prd docs/prd.md     # writes RouterDoc + router.md, stops
 
 # 4. REVIEW router.md, the generated mirror. To change the graph, revise the
@@ -54,7 +56,7 @@ llm-toolkit-001 inspect --health            # full snapshot: tasks, usage, timel
 
 # extras
 llm-toolkit-001 handoff "context for the next wave"
-llm-toolkit-001 verify --task some-task-id  # one-off read-only verification
+llm-toolkit-001 verify --task some-task-id  # one-off read-only verification of the latest retained candidate
 ```
 
 ### Scripted smoke, no API keys (fixture replay)
@@ -80,20 +82,25 @@ llm-toolkit-001 init . --with-demo
 #   gate-cli to evals/smoke-gate.cjs — no hand-editing. The extra cp above is
 #   the demo setup: the reviewed gate bytes go to evals/ for execution.
 
-git init -q && git add -A && git commit -qm base   # the loop needs a repo
+git init -q && git add -- . && git commit -qm base   # commit this disposable fixture before planning
 KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 plan
 KIT_FAUX=1 KIT_FAUX_SCRIPT=smoke.replay llm-toolkit-001 run --approve --revision <uuid>   # → STATUS: COMPLETE
 # <uuid> is the `plan revision` the plan command printed (or read from router.md).
 
-node bin/render.js '/a/-b'      # the completed program prints exactly `a b`
+# `none` keeps the operator checkout unchanged; inspect the accepted result separately.
+git worktree add --detach /tmp/demo-result refs/kit/<revision>/accepted
+cd /tmp/demo-result
+node bin/render.js '/a/-b'      # prints exactly `a b`
 ```
 
 The replay demonstrates loop transitions WITH an outcome test: after the run,
-the independent `node bin/render.js '/a/-b'` invocation must exit 0 and print
-exactly `a b` — a missing `renderList` export, a case-sensitive query, or the
-old parser defect (dropping `-b` instead of stripping its dash) all fail the
-gates. The demo requires Node ≥ 23.6: the product's `src/*.ts` modules run
-through Node's default TypeScript type-stripping.
+the independent `node bin/render.js '/a/-b'` invocation in a detached view of
+`refs/kit/<revision>/accepted` must exit 0 and print exactly `a b` — a missing
+`renderList` export, a case-sensitive query, or the old parser defect (dropping
+`-b` instead of stripping its dash) all fail the gates. The operator HEAD,
+index, staged/unstaged files, and ignored files are not changed by the run.
+The demo requires Node ≥ 23.6: the product's `src/*.ts` modules run through
+Node's default TypeScript type-stripping.
 
 Replay format: `[planner]` / `[implementer]` / `[verifier]` sections with
 `---` separated chunks; a chunk is one model request's answer — plain text
@@ -115,12 +122,12 @@ primary approval followed by adversarial approval.
 | `run [--tasks id…]` | resume the stored grant bare (no re-approval); an explicitly supplied set must equal the grant exactly |
 | `status [--follow]` | task graph + budgets from `.orch/status.json` (when a run is locked) or storage |
 | `inspect [--json] [--health] [section…]` | full visibility snapshot: tasks, usage splits, wave timeline, conversations, artifacts, health; degrades to side-cars while a run holds the lock |
-| `verify --task id` | one-off read-only verification incl. your manual edits |
+| `verify --task id` | one-off read-only verification of the latest retained candidate; no operator-checkout fallback |
 | `export` | per-project JSON+HTML report from storage into `.orch/artifacts/` |
 | `handoff "note"` | queue a note the driver ingests at the start of the next wave |
 | `ui [--port n] [--no-open]` | the local web UI (separate sub-product under `ui/`) — see [`ui/README.md`](ui/README.md) |
 
-Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) or `selection complete` (the granted subset is done; the plan's remaining work is named, the router phase stays open) · `2` policy stop — quarantined/blocked members or the budget ceiling, always with the task ids (rerun to resume) · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` invalid input, refused grant, lock busy or error · `130` SIGINT.
+Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) or `selection complete` (the granted subset is done; the plan's remaining work is named, the router phase stays open) · `2` policy stop — quarantine, blocked members, budget, or `recovery-required` for an uncertain effect · `42` sleeping (rate-limit durable sleep armed — rerun `run`) · `1` invalid input, refused grant, lock busy or error · `130` SIGINT.
 
 ### Current behavior and limits
 
@@ -138,9 +145,13 @@ Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) o
   and it is recorded once. Quarantined/blocked selected tasks stop the run
   with exit 2 and the ids — never 0/complete. `router.md` is a rewritten
   review mirror, not editable plan input; revise the PRD and rerun `plan`.
-- `delivery.mode = "none"` leaves accepted changes in the operator's working
-  tree. `commit` attempts a commit on the checked-out branch. `pr` additionally requires
-  `--deliver` and may create a branch and pull request; it never merges one.
+- Delivery modes use separate result locations. `none` records the accepted
+  lineage at `refs/kit/<revision>/accepted`; inspect it in a detached worktree.
+  `commit` compare-and-swaps the named local branch
+  `refs/heads/kit/<revision>/result` without checking it out. `pr` requires
+  `--deliver`, the operator host-profile `deliveryOrigin`, and reviewed base
+  branch preflight before implementation starts; it publishes verified stacked
+  PR heads and never merges them.
 - Implementer tools, gates, probes, and delivery run on the host. Write/edit
   guards, target-path checks, and `shell: false`-style process spawning are not
   OS containment; use trusted projects and fixtures only. Gate and probe
@@ -149,9 +160,11 @@ Exit codes: `0` fulfilled — `STATUS: COMPLETE` (every task in the plan done) o
 - Budget stops use recorded provider/catalog costs or configured rate estimates.
   They are not a hard provider-bill cap and cannot prevent an already admitted
   in-flight request from exceeding the ceiling.
-- Quarantine attempts to save display evidence and restore the working-tree
-  baseline. Artifact capture and restoration can fail; a quarantine row or patch
-  is not proof that rollback succeeded.
+- Quarantine retains the frozen candidate for review and discards only the
+  owned private workspace. A rollback receipt is `discarded` only after the
+  workspace is observed absent and the accepted integration ref unchanged;
+  failed/unknown disposal blocks the task and its dependents. Candidate patches
+  are display evidence, never rollback inputs.
 - Read-only views (`status`, `inspect`, `export`, and the web UI's reads) open
   durable storage with the harness's `readOnly` option while still holding
   `.orch/lock`: zero model/tool calls, no scheduling, no task progress, and
@@ -493,13 +506,15 @@ Verification runs locally (this repo carries no hosted CI): the engine suite
 and the ui sub-product's suites — including the faux e2e against the real
 CLI — before any push.
 
-The seam now (A.2/A.3) also attempts a display-oriented per-task patch + stats
-side-car for done/quarantined tasks (`.orch/artifacts/task-<id>.patch` +
-`task-<id>.json`; engine paths excluded, 5 MiB cap, cumulative since baseline,
-never a rollback input — see the 0.2.2 changelog). Capture can fail or truncate,
-so these are not guaranteed evidence. The seam also carries each task's
-`baselineTreeSha` in `status.json` so the UI's live in-flight diff works while
-the run owns the lock.
+The M0-P14 serial driver freezes candidates from committed Git objects, never
+from the operator checkout. It writes best-effort, revision-qualified
+per-wave artifacts (`candidate-<revision>-<task>-w<N>.patch` plus `.json`),
+and status/readout rows add the latest `planRevision`, receipt states, and
+`{wave,baseTree,candidateTree,asOf}` when a candidate is frozen. Artifacts are
+display evidence only; acceptance, integration, workspace disposal, and
+publication are separate durable receipts. The UI's live diff endpoint is not
+yet checkpoint-only (M0-P15); it must not attribute operator-checkout edits to
+a task.
 
 ## The cycle
 
@@ -508,24 +523,32 @@ PRD →[plan, one conversation, read-only]→ RouterDoc + router.md (planned)
       │ human grant (--approve --revision / {planRevision, selected, humanApprovedAt})   ← review point
       ▼ [run — exactly the granted revision + task list]
   per granted task (topological, priority, id tie-break; deps seen across ALL tasks):
-    baseline tree capture → implementer wave (conversation per task)
-      → gates (scope check + recipes) → primary verifier (read-only, strict JSON)
-      → evidence-backed approval ⇒ fresh adversarial verifier (default on; read-only)
-      → both approve with per-criterion evidence ⇒ done, or feedback ⇒ next wave
-        (context reset between waves)
-      → exhausted/blocked ⇒ quarantine: patch capture + baseline restore attempted
-      → first quarantine in the selection ⇒ run stops (exit 2, ids named)
+    accepted parent → private task lease (wave 1 starts at its tree;
+      retry starts at the prior failed candidate) → stable submission checkpoint
+      → fence + freeze candidate → scope check + reviewed recipes on candidate
+      → primary verifier (read-only, strict JSON) → evidence-backed approval
+      → fresh adversarial verifier (default on; read-only)
+      → accept candidate → one-parent integration commit → publication receipt
+      → done only after publication state is confirmed
+    failed/rejected candidate → retain pinned tree, discard only owned lease,
+      record rollback receipt → retry or quarantine once
+    uncertain gate/publication/disposal effect → recovery-required (exit 2);
+      task stays non-done and no dependent wave starts
   fulfillment: whole plan done ⇒ phase complete (recorded once); granted subset
   done with plan work remaining ⇒ selection-complete, phase stays open.
-  budgets/breakers: session USD ceiling (exit 2), wave warn, zero-change quarantine,
-  duplicate gate-failure hash, consecutive-error cap, rate-limit durable sleep (exit 42).
-  malformed/inconclusive/unproven verdicts ⇒ needs_human (never approval)
-delivery: none (working tree; default) | commit (current branch) | pr (optional; needs --deliver; never merges)
+  budgets/breakers: session USD ceiling (exit 2), wave warn, zero-progress from
+  start-of-wave tree→candidate, duplicate gate-failure hash, consecutive-error
+  cap, rate-limit durable sleep (exit 42). Malformed/inconclusive/unproven
+  verdicts ⇒ needs_human (never approval)
+delivery: none (accepted ref; default) | commit (named local result branch) |
+  pr (stacked create-only refs; requires preflight + --deliver; never merges)
 ```
 
 The implementer's final `STATUS: COMPLETE` / `STATUS: BLOCKED` line is a
 nonbinding report. It neither satisfies acceptance criteria nor changes task
 status; gates and verifier passes determine the loop's outcome.
+
+For `none`, inspect the result with `git worktree add --detach /path/to/result refs/kit/<revision>/accepted`; the operator checkout is not the result directory. `commit` publishes `refs/heads/kit/<revision>/result` without checkout. PR mode preflights the host allowlist, reviewed base, and explicit `--deliver` before implementation.
 
 `[gates] skepticSecondPass` defaults to `true` when omitted. Set it to `false`
 for the explicit single-verifier opt-out. Each pass appends its own verdict,

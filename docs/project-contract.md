@@ -8,7 +8,7 @@ What `<kit> init` writes in a target project, and how versions move.
 | --- | --- | --- |
 | `PROMPT.md` | per-wave discipline appended into each implementer wave input | template (user-editable) |
 | `evals/checklist.md` | human-editable acceptance-criteria template aligned with the RouterDoc schema | template (user-editable) |
-| `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes; one command form per recipe (`cmd` legacy simple, or literal `argv` tokens) | template (user-editable; hot-read every gate run) |
+| `evals/recipes.toml` | human gate recipes — COMMENTED defaults; empty = scope-check-only; same names override generated recipes; one command form per recipe (`cmd` legacy simple, or literal `argv` tokens) | template (user-editable; snapshotted into the reviewed plan and read from each wave-start tree) |
 | `evals/recipes.auto.toml` | approved discovered gate recipes; supports project-relative `cwd` for workspaces | generated only by approved `gates refresh`; absent initially |
 | `router.md` | human-readable MIRROR of RouterDoc; engine rewrites it on router commits; review it, but revise the PRD and replan instead of editing it as input | engine |
 | `.orch/config.toml` | annotated project config (roles, budgets, gates, delivery, paths) | config |
@@ -57,7 +57,7 @@ effect receipts.
   present fails `output_capped`. Invalid input fails before any command
   starts; failures become compact feedback text and a `lastGateHash` for the
   breaker. Recipe cwd cannot be absolute or escape the root.
-- `[gates]` — `timeoutSec` (per recipe; also the `gates probe` deadline), `enforceTargetPaths` (working-tree scope check + write/edit guard; neither is OS containment and bash/recipes still execute on the host),
+- `[gates]` — `timeoutSec` (per recipe; also the `gates probe` deadline), `enforceTargetPaths` (parent→candidate scope check + write/edit guard; neither is OS containment and bash/recipes still execute on the host),
   `skepticSecondPass` (default `true`, including when omitted): after a conclusive,
   evidence-backed primary approval, a fresh read-only adversarial verifier must
   also approve. Explicit `false` is the single-pass opt-out. The adversarial pass
@@ -88,7 +88,7 @@ effect receipts.
   effects remain in code; uncertain, conflicting, stale, missing-key, malformed,
   and network-error outcomes remain unknown and cannot alter feedback routing,
   retry limits, quarantine, task/adoption state, delivery, or approvals.
-- `[delivery]` — `mode`: `none` (default) | `commit` | `pr`. Until M0-P14, the production serial driver still uses the legacy behavior described in the older release notes; these labels do not claim the prepared journal guarantees below are active. P13's prepared `pr` operation requires operator host-policy approval of one GitHub origin and explicit `run --deliver` consent; it does not merge.
+- `[delivery]` — `mode`: `none` (default) | `commit` | `pr`. M0-P14 activates journaled publication: `none` leaves the accepted lineage at `refs/kit/<revision>/accepted`; `commit` publishes `refs/heads/kit/<revision>/result` without checking it out; `pr` requires the operator host-policy GitHub origin and explicit `run --deliver` preflight before grant/work dispatch. PRs are stacked, create-only, validated, and never merged.
 - `[paths]` — `prd` (default `docs/prd.md`), `specs`
 
 NO SECRETS live in config.toml: providers read credentials from the
@@ -145,7 +145,10 @@ over the approved controls (gate-gap remediations, `PROMPT.md`,
 `evals/checklist.md`, human and approved generated recipes). `controlsSha256`
 is ABSENT when no control input exists at all — distinct from a digest over
 empty controls, and absent remediations hash differently from an approved
-empty list.
+empty list. M0-P14 execution requires a non-null `baseCommit`; if planning
+records no committed HEAD, make the intended local seed/base commit and replan
+before granting a run. Staged/unstaged/untracked operator data is never used to
+fill a missing base.
 
 The `planRevision` is a REVIEW identity, not a schema version: the durable
 document payload versions (`loop.router`/`loop.run` at version 2) describe
@@ -182,13 +185,52 @@ broadens a refused grant:
 `run` exit codes: `0` only for whole-plan fulfillment (`STATUS: COMPLETE`;
 the ONLY outcome that flips the router phase to complete, recorded once) or
 selection-complete (the granted subset is fulfilled; the remaining plan
-work is named and the phase stays open) · `2` policy stop — a quarantined
-granted task stops the selection on its first quarantine, an unsatisfiable
-selection stops with ids, or the budget ceiling hit · `42` sleeping · `1`
-invalid input/lock/hard error · `130` SIGINT.
+work is named and the phase stays open) · `2` policy stop — quarantine,
+unsatisfiable selection, budget stop, or unresolved/uncertain effect reported
+as `recovery-required` · `42` sleeping · `1` invalid input/lock/hard error ·
+`130` SIGINT.
 
 Failed plan parsing or identity-input failures (git, paths, controls) leave
 the previous plan, run status, and mirrors byte-identical.
+
+## M0-P14 serial candidate and result contract
+
+A new wave opens a private workspace from the current `refs/kit/<revision>/accepted`
+commit; a retry starts from the previous failed candidate while retaining the
+same integration parent. The driver records a stage checkpoint and stable
+conversation/request identity before each model submission, fences the writer,
+and freezes one candidate tree. Gates and verifier passes read that exact
+candidate. Scope is checked from integration parent→candidate; zero-progress
+uses only the start-of-this-wave tree→candidate. Pinned candidates and
+revision-qualified flat `candidate-<revision>-<task>-w<N>.{patch,json}` artifacts
+are retained for review. Artifacts are display evidence, not rollback inputs.
+
+Acceptance, integration, workspace disposal, and publication are separate
+receipted effects. `done` requires valid acceptance and integration receipts
+plus a confirmed publication result (`not_requested` for `none`). Uncertain
+publication or workspace disposal is blocking `recovery-required`: the task is
+not done and no dependent task starts. Recovery reuses the recorded candidate,
+commit, and submission identity; it does not pay for implementation or review
+again. Quarantine discards only the kit-owned private workspace after observed
+fencing and an unchanged integration ref; it never restores the operator tree.
+A checkpointless legacy `in_progress` task is ambiguous and refuses replay.
+
+`run` never uses staged, unstaged, untracked, or ignored operator checkout
+content as task input. HEAD, the index, working files, and ignored files remain
+unchanged in `none`, `commit`, and `pr` modes. Result locations:
+
+- `none`: create a separate view with
+  `git worktree add --detach /path/to/result refs/kit/<revision>/accepted`.
+  The accepted result is not written into `.`.
+- `commit`: inspect `refs/heads/kit/<revision>/result`; the driver does not
+  check it out or advance the operator branch.
+- `pr`: inspect the receipted stacked PR branch/URL. `--deliver`, the exact
+  operator-approved GitHub origin, and the reviewed base-branch preflight are
+  required before implementation starts; PR creation never merges the result.
+
+`verify --task <id>` is diagnostic only: it reads the newest retained candidate
+for the current plan revision and refuses if no candidate exists. It does not
+read current operator-checkout edits or change task disposition.
 
 ## Read-only observation
 
@@ -235,19 +277,21 @@ mechanically enforced per `docs/api-map.md` (M0-P02).
   default-on skeptic pass adds `verify:skeptic:<verdict>` rows without changing
   the wave-log schema version; existing `verify:<verdict>` rows remain primary
   verdicts, and summing verdict-row usage now accounts for both conversations.
-- Delivery modes matter for upgrade drills: before P14, the legacy driver
-  behavior remains active; a kit update is not a transparent activation of the
-  prepared P12/P13 journal operations.
+- M0-P14 is a deliberate driver/output-location cutover. Existing in-progress
+  work without a P14 checkpoint must be reconciled manually or replanned; it is
+  never replayed from the operator checkout. `none` no longer leaves files in
+  `.`, and `commit` no longer advances the checked-out branch. Follow the
+  result-location instructions above and rehearse against a fixture before
+  upgrading a real project.
 
-## Prepared PR publication (M0-P13; not active in `run` until P14)
+## PR publication (M0-P13; activated by M0-P14)
 
-The P13 helper publishes only an already accepted and integrated candidate.
-It is not an auto-merge feature or a claim that a PR is CI-approved code. The
-production serial driver is still on the legacy delivery path until P14 wires
-the prepared operations; do not infer current `run` behavior from this
-contract.
+The serial driver publishes only an already accepted and integrated candidate.
+This is not an auto-merge feature or a claim that a PR is CI-approved code.
+`run` uses the verified publication contract below; no legacy branch/checkout
+path remains active.
 
-For prepared publication, the operator must put exactly one project entry in
+Before a PR-mode run, the operator must put exactly one project entry in
 the private host policy (`~/.config/llm-toolkit-001/host-v1.json`, or the
 platform-equivalent) with an approved canonical HTTPS GitHub `deliveryOrigin`
 for the exact canonical project root. The operation reads that allowlisted
@@ -283,9 +327,9 @@ or an uncertain create without an observable matching PR remains blocking
 create, updates an existing remote ref, force-pushes, checks out a delivery
 branch, auto-merges, or repairs a diverged branch.
 
-`test/pr-publication.test.ts` runs the prepared path against a local bare Git
-remote and an injected fake PR host. It does not contact GitHub or read GitHub
-credentials. Until P14, this is a seam/test guarantee, not active CLI delivery.
+`test/pr-publication.test.ts` and `test/serial-lineage.test.ts` exercise the
+publication path against a local bare Git remote and injected fake PR hosts.
+They do not contact GitHub or read GitHub credentials.
 
 ## Repository hygiene — three ownership classes (ADR 04)
 
@@ -338,7 +382,7 @@ warned about.
 ├── status.json          # atomic status payload (private; status --follow reads this)
 ├── wave-log.jsonl       # JSONL mirror of WaveLogDoc (paper trail; ignored by default)
 ├── pending-handoff.json # queued handoff note (private; handoff command)
-└── artifacts/           # gate logs, quarantine patches, exports (private)
+└── artifacts/           # gate logs, revision-qualified candidate patches, exports (private)
 
 router.md                # RouterDoc mirror (paper trail; not plan input; ignored by default)
 PROMPT.md, evals/, docs/prd.md   # reviewable project bytes
@@ -348,5 +392,6 @@ PROMPT.md, evals/, docs/prd.md   # reviewable project bytes
 > after state commits. It is an optional local paper-trail file: the init
 > hygiene block ignores it by default, and operators choose whether to retain
 > or commit it (explicitly, with `git add -f`). Neither this file nor
-> `router.md` is guaranteed committed evidence, and mirror content alone does
-> not certify rollback, delivery, or another external effect.
+> `router.md` is guaranteed committed evidence. Durable receipts in
+> `.orch/durable.sqlite` record accepted integration, confirmed workspace
+> disposal, and publication effects; mirror content and display patches do not.

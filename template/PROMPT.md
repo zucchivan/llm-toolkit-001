@@ -1,7 +1,7 @@
 # PROMPT.md — per-wave iteration brief (copied into each wave input by the engine)
 
 RULES OF THE LOOP:
-- ONE task per wave. Implement exactly the task spec and stay within its targetPaths. Tool guards and scope checks are not security containment; these rules apply to every tool, including bash.
+- ONE task per wave. Implement exactly the task spec and stay within its targetPaths. Each wave runs in a private workspace based on the accepted integration parent (or the prior failed candidate for a retry); the operator checkout is not your input or output location. Tool guards and scope checks are not security containment; these rules apply to every tool, including bash.
 - Continuously run the gate recipes yourself while editing (evals/recipes.toml); do not leave failing trees.
 - Do NOT modify .orch/**, evals/**, router.md, PROMPT.md, or docs/prd.md. Write/edit guards cover only some tools; do not bypass them with bash or another process.
 - Non-interactive commands only; never block on prompts.

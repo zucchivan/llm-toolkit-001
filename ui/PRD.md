@@ -26,11 +26,14 @@ activity:
   `.orch/wave-log.jsonl`, gate logs, verifier verdicts, `.orch/status.json`,
   and git state. `status --follow` gives a coarse panel; `inspect` is a
   snapshot.
-- After a wave, knowing *what the agent changed* means reconstructing a diff
-  from the task baseline or reading gate output.
-- A quarantined task attempts a baseline restore; the display evidence is a
-  patch file and a wave-log row. At baseline, capture/restore errors can be
-  swallowed, so neither artifact proves that rollback completed.
+- The M0-P14 serial driver now freezes one candidate tree per wave and records
+  gate/pass/acceptance/integration/workspace-disposal/publication receipts. The
+  UI readout exposes additive revision, receipt-state, and latest-checkpoint
+  facts, but P15 still owns rendering those facts as badges or switching every
+  diff route to checkpoint-only data.
+- A quarantined wave retains its pinned candidate for review and discards only
+  its private workspace after an observed disposal receipt. A quarantine row or
+  display patch alone is not rollback proof; the receipt journal is authoritative.
 - Watching a run means babysitting a terminal, and switching context to check
   cost or the current task.
 
@@ -96,10 +99,11 @@ Jobs, in priority order:
    pretending.
 4. **Density over decoration.** This is an operator console. Tables,
    monospace, status glyphs + labels, restrained color.
-5. **Diffs are display evidence.** Completed or quarantined tasks can have a
-   viewable diff, but capture is best-effort and artifacts may be absent or
-   truncated. A display patch is not an acceptance certificate or rollback
-   receipt; the in-flight wave has a clearly-marked working-copy preview.
+5. **Diffs are display evidence.** Revision-qualified candidate artifacts are
+   best-effort and may be absent or truncated. A display patch is not an
+   acceptance certificate or rollback receipt. Until P15 switches the live-diff
+   route to a requested checkpoint, an in-flight operator-checkout preview is
+   not attributable to the task and must not be presented as its candidate.
 6. **Nothing surprising.** No auto-approve, no auto-run, no hidden writes, no
    destructive action without a confirmation.
 
@@ -158,12 +162,15 @@ The UI exposes exactly these mutations. Every one maps to a CLI invocation
 | Run selected | `run --approve --revision <uuid> --tasks <id>…` (checked ids only) | plan reviewed; selection non-empty; revision visible | subset of `todo` tasks; the same tuple rule — empty selection never becomes run-all |
 | Stop | SIGINT to the active job | a running UI job, or a terminal-started run whose §7.2.1 identity verification passes | graceful; state stays resumable (exit 130); exactly one re-verified signal |
 | Handoff | `handoff "<note>"` | always (atomic side-car, safe during a run) | queued for the next wave |
-| Verify | `verify --task <id>` | no run active; task has a baseline | one-off read-only check |
+| Verify | `verify --task <id>` | no run active; task has a retained candidate checkpoint | one-off read-only check of that candidate |
 | Export | `export` | no run active | writes `.orch/artifacts/report.{json,html}` |
 
 Guardrails:
 
-- No config, router, PRD, or delivery editing.
+- No config, router, PRD, or delivery editing. The UI has no `--deliver`
+  control; in `delivery.mode = "pr"` core preflight therefore refuses before
+  grant/model work and directs the operator to the CLI, where `--deliver`, the
+  allowlisted origin, and reviewed base branch are confirmed.
 - `run` always passes `--approve` from the Approve & run / Run selected
   buttons; there is no silent run.
 - **Revision-bound confirmation (M0-P06, A.8):** opening a run dialog
@@ -235,41 +242,42 @@ authoritative gate.
 - **Sleep:** exit code 42 is surfaced as a distinct `sleeping` state with
   `sleepUntil` countdown when available, and a "Resume" action (= bare `run`:
   it resumes the stored grant exactly; no new approval is ever sent).
-- **Exit codes (M0-P06, A.8):** 0 is TWO outcomes told apart by durable
+- **Exit codes (M0-P06/P14, A.8):** 0 is TWO outcomes told apart by durable
   state — whole-plan completion (the durable complete phase) vs "selection
   complete" (the granted subset fulfilled; todo tasks remain); 2 is a policy
-  stop (quarantine/budget — stopped short, never success); 42 sleeping; 1
-  error; 130 interrupted. The UI never infers completion from exit 0 alone
+  stop (quarantine/budget) or `recovery-required` uncertain effect — stopped
+  short, never success; 42 sleeping; 1 error; 130 interrupted. The UI never infers completion from exit 0 alone
   and never presents a subset completion or an exit 2 as whole-plan success.
 
 ### 7.4 Diffs
 
-- **Per task (display artifact):** when a task reaches `done` or `quarantined`,
-  the engine attempts to persist a patch of the working tree vs the task's
-  `baselineTreeSha` plus a stats side-car (Appendix A.2). Capture failure or
-  truncation is possible; the artifact is not a durable effect receipt.
-- **Quarantine:** the existing `quarantined-<task>-w<N>.patch` is shown in the
-  same viewer with a "rolled back" badge. **Current limitation:** that badge
-  follows the quarantine projection, not a verified restore; the baseline
-  engine can swallow restore failures. A.8 reserves receipt-based replacement
-  for M0-P15 rather than claiming the badge is authoritative today.
-- **Live (in-flight):** while a wave is running, the UI can request a diff of
-  the current tree vs the task baseline. It is marked "live preview — may be
-  incomplete" and is never persisted.
+- **Candidate artifacts (M0-P14):** the core attempts a revision-qualified
+  flat `candidate-<revision>-<task>-w<N>.patch` plus stats side-car for every
+  frozen wave candidate. The patch is the start-of-this-wave tree→candidate
+  delta, not cumulative task history. Capture may fail or truncate; the
+  artifact is display evidence, not an acceptance, rollback, or publication
+  receipt.
+- **Quarantine:** the pinned candidate is retained for review and the private
+  workspace is discarded only after an observed rollback receipt. The UI has
+  not yet switched its badge to that receipt (M0-P15); it must not infer
+  "rolled back" from the quarantined task status or a patch.
+- **Live (in-flight):** M0-P14 moves worker edits out of the operator checkout.
+  The current live-diff route has not yet been cut over from its working-copy
+  read; until M0-P15 it is not authoritative and must not attribute operator
+  checkout edits to a live task.
 - **Content:** file list with status (added/modified/deleted) and insertions /
   deletions; unified hunks with syntax-neutral line coloring; binary and
   oversized entries show stats + a notice, not content.
 - **Exclusions:** engine-owned paths (`.orch/**`, `router.md`, `PROMPT.md`)
-  are excluded from display and stats.
-- **Semantics:** because retries do not reset the tree, the per-task patch is
-  cumulative since the task baseline (all attempts), not "only the last wave".
-  The UI labels it "task diff" and shows the wave count.
-- **Wave scope (A.7, shipped 0.8.0):** when a wave's rows carry recorded
-  trees, the drawer offers that wave's own delta — the difference between
-  the wave's start and end trees — labeled "wave N — isolated to this
-  wave". Computed on demand, never persisted; not isolatable (older rows,
-  failed capture, still-running wave) answers a plain-words refusal; the
-  cumulative view stays the default.
+  are excluded from candidate artifacts and stats.
+- **Semantics:** each artifact is wave-local (start tree→candidate). Retries
+  start from the previous failed candidate; the accepted task lineage remains
+  parent→candidate. M0-P15 owns the UI's revision/task/wave checkpoint-diff
+  selector and separate review/checks/recovery/publication labels.
+- **Wave scope (A.7, shipped 0.8.0; core source updated by M0-P14):** rows
+  carry the wave start tree and frozen candidate tree. The tree-to-tree wave
+  view can use those immutable OIDs; later operator-checkout edits are not
+  wave changes. The UI's working-copy live route remains deferred to P15.
 
 ### 7.5 Conversation visibility
 
@@ -349,9 +357,9 @@ authoritative gate.
 ### 8.4 Quarantine
 
 - Task turns red with a "quarantined" badge; the drawer explains the cause and
-  shows any captured patch and baseline sha. The current "rollback fact" is an
-  unverified engine claim, not proof of restoration (A.8/M0-P15 reserves the
-  receipt-based replacement).
+  shows any available revision-qualified candidate artifact and checkpoint.
+  The badge remains a status projection until M0-P15 renders the workspace
+  disposal receipt; task status or patch alone is not proof of rollback.
 - Dependent tasks blocked by it are marked as blocked-by-dependency.
 - Available next actions: Handoff, Verify, Export; there is no "retry
   quarantined" in the loop, and the UI must not invent one.
@@ -417,6 +425,15 @@ New readout fields (all optional, backward compatible):
 ```ts
 interface KitReadout {
   seam?: 1;                       // present when the UI seam is available
+  planRevision?: string;          // M0-P14 latest reviewed plan
+  receiptStates?: {                // additive projection; loop.receipts is authoritative
+    planRevision: string; taskId: string; wave: number;
+    gate?: "pass" | "fail"; primary?: string; skeptic?: string;
+    acceptance?: "accepted"; integration?: string; rollback?: string; delivery?: string;
+  };
+  checkpoint?: {                   // newest frozen candidate, if one exists
+    wave: number; baseTree: string; candidateTree: string; asOf: number;
+  };
   live?: {
     task: string;
     wave: number;
@@ -433,7 +450,7 @@ interface KitReadout {
 
 interface DiffArtifactRef {
   task: string;
-  patch: string;                  // artifact file name, not content
+  patch: string;                  // revision-qualified candidate artifact name, not content
   stats?: string;                 // artifact file name for the JSON stats
   bytes: number;
   truncated: boolean;
@@ -661,7 +678,7 @@ llm-toolkit-001 init . --with-demo
 # [roles.*] -> provider "faux", modelId kit-planner|kit-implementer|kit-verifier
 # evals/recipes.toml (shipped with the fixture) -> gate-list/gate-query/gate-cli
 #   → node evals/smoke-gate.cjs list|query|cli (behavioral: executes the product)
-git init -q && git add -A && git commit -qm base
+git init -q && git add -- . && git commit -qm base
 
 npm --prefix <kit repo>/ui install
 npm --prefix <kit repo>/ui run build
@@ -677,9 +694,10 @@ Pass criteria:
    ships is rejected by the executed `gate-query` (behavior, not a grep-able
    token); feedback and the failed gate log are visible; wave 2 starts and
    repairs it from the gate feedback; the run completes.
-4. The completed task's diff drawer shows the expected files and hunks; a
-   quarantine (if exercised in a variant) shows its available patch and the
-   current rollback claim, which is not an independently verified restore.
+4. The completed task's diff drawer shows its available candidate artifact.
+   A quarantined variant may show the retained candidate and quarantine cause;
+   it must not claim rollback until the workspace-disposal receipt is rendered
+   (M0-P15).
 5. Budget spent, waves, and health match `inspect --json`.
 6. Closing the browser does not kill the run; reopening the UI reattaches and
    shows the correct final state.
@@ -690,10 +708,12 @@ Pass criteria:
    resumable). A terminal `run --approve` WITHOUT `--revision` is refused by
    the CLI (exit 1) — the same fail-closed contract the UI's server guards.
 8. Export produces the same `.orch/artifacts/report.{json,html}` as the CLI.
-9. The demo is falsifiable: on the completed result the independent invocation
-   `node bin/render.js '/a/-b'` exits 0 and prints exactly `a b` (a missing
-   `renderList` export, a case-sensitive query or a wrong stdout fails the
-   corresponding executed gate — M0-P08; needs Node ≥ 23.6 for type-stripping).
+9. The demo is falsifiable: create a detached view with
+   `git worktree add --detach /path/to/result refs/kit/<revision>/accepted`, then
+   run `node bin/render.js '/a/-b'` there. It exits 0 and prints exactly `a b`
+   (a missing `renderList` export, a case-sensitive query or wrong stdout fails
+   an executed gate — M0-P08; Node ≥ 23.6 for type-stripping). The operator
+   checkout is unchanged.
 
 ### 15.3 Manual checks
 
@@ -752,7 +772,7 @@ together with the milestone that consumes it.
 
 | risk | mitigation |
 | --- | --- |
-| Core seam changes loop behavior | additive fields only; tests assert unchanged wave/gate/verifier/quarantine behavior; UI absence changes nothing |
+| Core seam changes loop behavior | M0-P14 intentionally switches the serial driver to frozen candidates/receipts; core tests own that contract, and UI absence must not change it |
 | Lock contention with CLI runs | acquire/release per read, retry then degrade to side-cars; never hold the lock |
 | Detached jobs orphaned | job record + PID liveness + stale state; stop for UI jobs; clear log path; no auto-kill |
 | Side-car drift / stale view | `at` timestamp, "last updated", degraded badge, health checks |
@@ -761,7 +781,7 @@ together with the milestone that consumes it.
 | A LAN bind widens the surface | opt-in `--host` only (the default stays loopback); the per-session token + cookie + same-origin triple is unchanged — only the hostname gate widens, to this machine's names; raw LAN is plaintext and says so, Tailscale is the encrypted path (C.1) |
 | Svelte 5 ecosystem churn | core Svelte + Vite only; no UI kit/router/state libs |
 | Scope creep into a chat client | the transcript drawer is read-only and bounded (A.5: newest ≤ 2,000 entries, per-entry caps, no pagination, no writing); live token streaming and conversation search stay deferred; the list stays summaries |
-| Diff semantics misunderstood | label "task diff (cumulative since baseline, N waves)"; per-wave isolated diffs deferred |
+| Diff semantics misunderstood | core candidate artifacts are revision-qualified and wave-local; label them as display evidence, not acceptance/rollback. Until M0-P15, the working-copy live route is non-authoritative and may not be attributed to a task |
 
 ## 18. Deferred (explicitly not v1)
 
@@ -840,34 +860,35 @@ semantics, config, docs, or CLI output for users who never open the UI.
 - `buildTimeline` uses the start/end rows so spans have real start times; rows
   remain append-only and mirrors stay byte-compatible.
 
-### A.2 Diff artifacts
+### A.2 Diff artifacts (M0-P14 core cutover)
 
-- Reuse `savePatch` semantics (throwaway index, untracked files included,
-  binary allowed) with a display-oriented wrapper:
-  - exclude engine-owned paths: `.orch/**`, `router.md`, `PROMPT.md`;
-  - cap the stored patch at 5 MiB, write `truncated: true` in stats, and never
-    use a truncated patch for rollback (rollback uses `restoreTree`);
-  - stats via `git diff --numstat` / `--name-status` against the baseline:
-    `{ task, wave, baselineTreeSha, generatedAt, files: [{ path, status,
-    insertions, deletions, binary }], totalInsertions, totalDeletions, bytes,
-    truncated }`.
-- On `done`: write `.orch/artifacts/task-<id>.patch` and
-  `.orch/artifacts/task-<id>.json` before delivery (the task's final tree).
-- On quarantine: keep the existing `quarantined-<task>-w<N>.patch`; write the
-  stats side-car for it. The rollback behavior is unchanged: baseline restore
-  is attempted through `restoreTree`, but capture/restore failures are
-  best-effort and a patch/quarantine row is not proof of successful rollback.
-- Live diff endpoint: compute vs the task baseline on demand with the same
-  exclusions/caps; do not persist; return `409` when the task is not the
-  current in-flight task.
-- Do not store diffs in durable docs or the wave log (no DB migration).
+- Each frozen wave candidate gets a revision-qualified flat display artifact:
+  `.orch/artifacts/candidate-<revision>-<task>-w<N>.patch` plus `.json` stats.
+  The OIDs come from immutable Git trees; no operator-worktree capture or
+  temporary index is used by the serial driver.
+- The patch is the wave's start tree→candidate delta (create/modify/delete,
+  binary and executable mode included), capped at 5 MiB with `truncated: true`
+  in stats. Exclude `.orch/**`, `router.md`, and `PROMPT.md`. The artifact is
+  never an acceptance, rollback, or publication input.
+- Stats are `{task, planRevision, wave, baselineTreeSha, candidateTreeSha,
+  generatedAt, files: [{path,status,insertions,deletions,binary}],
+  totalInsertions,totalDeletions,bytes,truncated}`. Capture failure remains
+  best-effort; receipts and pinned checkpoint trees are authoritative.
+- M0-P15 switches all task/live diff reads to the requested revision/task/wave
+  checkpoint. Until then, a live endpoint that reads the operator checkout is
+  non-authoritative; it must not label those bytes as a task change.
+- No patch bytes are stored in durable docs or receipts (no DB migration).
 
 ### A.3 Readout
 
 - Add `seam: 1`.
 - Add `live` from the status side-car (merged in both modes; in storage mode
   the side-car is still the freshest source for elapsed time).
-- Add `tasks[].diff` refs and the `"diff"` artifact kind.
+- M0-P14 adds `planRevision`, latest `receiptStates`, and the frozen
+  checkpoint `{wave,baseTree,candidateTree,asOf}` to the readout/status side-car.
+  The UI may expose these fields later; the journal remains authoritative.
+- Add `tasks[].diff` refs to the latest current-revision candidate artifact and
+  the `"diff"` artifact kind.
 - In storage mode, read `.orch/status.json` for live fields and health parity;
   do not change the single-owner rule.
 - Health: add a `seam` check (present/absent) and a `live` check (startedAt is
@@ -891,75 +912,67 @@ semantics, config, docs, or CLI output for users who never open the UI.
 ### A.6 Delivery truth (additive, read-only)
 - `KitReadout` gains an additive `delivery` section: `mode` — the configured `delivery.mode` (§4.6: `none | commit | pr`) — and `rows` — the wave log's kind `"delivery"` rows echoed as plain JSON-able shapes (`ts`, `task`, `verb`, `wave?`, `detail?`). Both modes serve it: storage reads the mode from the open config; side-car mode best-effort re-reads `.orch/config.toml` (a static file, not the owned storage) and omits `mode` when the config itself is unreadable, while the outcome rows still come from the wave log.
 - Read-only, and deliberately WITHOUT a UI mutation: per §5 delivery stays a config + CLI decision. The CLI's only delivery paths are the config's `delivery.mode` and the `--deliver` run qualifier the `pr` mode requires (a per-run override of what a human typed, not a safe toggle) — exposing either as an action would be the §5 non-goal and a §7.2 action-table change. No config write, no new CLI flag/command, no behavior change when the UI is absent. Delivery/config editing stays deferred to M5 (§18). Seam version stays `readout.seam = 1` (A.6 is additive surface, not a new seam version).
-- Current rows describe the engine's reported delivery operation; they are not
-  independently verified publication receipts. PR creation is optional and
-  never merges the PR. A.8 reserves receipt-based badges for M0-P15.
+- M0-P14's core delivery rows are emitted after a confirmed `not_requested` or
+  `published` receipt; the readout/status also carry the latest receipt-state
+  projection. The UI still echoes rows and does not yet render separate receipt
+  badges (M0-P15). PR creation is optional and never merges the PR.
 
-### A.7 — Per-wave isolated diffs (additive; shipped — kit 0.2.3 + ui 0.8.0)
+### A.7 — Per-wave isolated diffs (UI shipped 0.8.0; core source updated by M0-P14)
 
 Drafted during the 0.7.1 wrap-up; implemented at the owner's explicit
 go-ahead in the same wrap-up (the kit 0.2.3 seam + this UI's 0.8.0 route and
 drawer).
 
-- **The gap:** the engine already snapshots a git tree per task baseline
-  (throwaway index; the project's real index is never touched —
-  `captureBaselineTree` in `util/git.ts`). What one wave added to a task is
-  derivable but never recorded, so the UI cannot name a wave's own change.
-- **Engine change (additive):** at every wave START and wave END, capture the
-  tree with the SAME `captureBaselineTree` call, made inside the wave's
-  existing `commitState` windows (no new lock discipline, no extra window),
-  and record it as an optional additive `treeSha` on the `wave` start/end
-  rows (`WaveRow` gains `treeSha?: string`). Old readers ignore the field;
-  no CLI output, config, or docs change. Cost: two throwaway-index git
-  snapshots per wave; the objects live in `.git` — no new artifact dir, no
-  retention policy beyond git's own. A quarantine captures the wave's
-  produced tree BEFORE its rollback, so the isolated diff names the wave's
-  evidence, not the empty post-restore tree. Shipped-out fix: the throwaway
-  index is now uniquely named and removed after each capture (a pid-named,
-  never-removed one leaked staged state between captures, so files deleted
-  between captures wrongly survived every later tree).
-- **Display wrapper (additive):** `util/git.ts` gains a tree-to-tree diff +
-  stats wrapper with the A.2 exclusions and caps (`.orch/**`, `router.md`,
-  `PROMPT.md` excluded; 5 MiB cap, `truncated: true`), endpoints being
-  immutable shas — pure `git diff --binary <tree> <tree>` (including
-  untracked-relevant states already captured in the trees). Existing
-  `savePatch` semantics are unchanged; rollback still uses `restoreTree`.
+- **Core cutover (M0-P14):** each serial wave now pins its start and frozen
+  candidate trees under private refs and records both in the stage checkpoint.
+  The operator index/worktree is neither sampled nor restored. Scope is
+  integration parent→candidate; wave diff/progress is start tree→candidate.
+- **Engine facts:** wave start/end rows carry the start tree and frozen
+  candidate tree as optional `treeSha` plus revision/checkpoint/receipt-state
+  fields. The exact candidate OID is also in `loop.receipts`; a failed freeze
+  or uncertain effect stops the driver rather than fabricating an empty tree.
+  Quarantine retains the pinned candidate and records confirmed disposal of
+  only the owned private lease.
+- **Display wrapper:** candidate artifacts use immutable tree-to-tree diffs
+  with A.2 exclusions/caps (`.orch/**`, `router.md`, `PROMPT.md`; 5 MiB,
+  `truncated: true`). Filenames are flat and revision-qualified. They are
+  best-effort display evidence; rollback/recovery uses receipts and private
+  refs, never a patch or an operator-working-tree restore.
 - **Read path:** wave-log rows and the readout's wave timeline spans pass
   `treeSha` through as plain JSON-able shapes (`startTreeSha`/`endTreeSha`; the
   A.6 echo style). `seam` stays 1: additive surface only.
-- **UI (§7.4 gains a wave scope):** `GET /api/tasks/:id/diff?wave=N` serves
-  wave N's isolated patch + stats — the wave's end tree vs its start tree
-  (both recorded by that same wave's rows) — computed on demand, stored
-  nowhere new, labeled "wave N — isolated to this wave". Task views offer
-  the wave numbers they already carry from the wave log. The default "task
-  diff" view KEEPS its cumulative label. Quarantine rollback, gate and
-  delivery behavior are untouched; display patches are never used for
-  rollback.
-- **Failure posture:** a failed wave-tree capture never fails the wave — the
-  row is written WITHOUT `treeSha` and the UI labels that wave "not isolated
-  (no wave tree recorded)". (Deliberately softer than the baseline path,
-  which throws: a missing baseline is fatal, a missing wave tree is only a
-  missing view.) Git is a precondition the loop already has.
+- **UI (§7.4):** wave rows/readout expose immutable OIDs and the current
+  candidate artifact. The existing wave selector can compare recorded start
+  and candidate trees.
+  M0-P15 switches the live endpoint to a requested revision/task/wave
+  checkpoint and adds receipt-derived labels; until then, a working-copy
+  preview is non-authoritative. No UI mutation or rollback-from-patch path is
+  added here.
+- **Failure posture:** a missing/invalid frozen candidate is not represented
+  as an empty diff. The driver leaves the task non-done and returns a stated
+  recovery requirement; the last confirmed candidate remains pinned when one
+  exists. No UI view may attribute later operator-checkout edits to that task.
 - **Non-goals:** no per-wave rollback or wave-level approve/regate, no
-  wave-log format version bump, no delivery change (D3/D5 hold), no CLI
-  output change, no new UI deps.
+  wave-log schema version bump, no UI receipt-badge/live-diff implementation
+  (M0-P15 owns that), and no new UI dependencies.
 
-### A.8 — Revision-bound control and observed outcomes (approved design scope; revision echo and exit 2 shipped by M0-P06, the rest not shipped)
+### A.8 — Revision-bound control and observed outcomes (approved design scope; revision echo/exit 2 shipped by M0-P06, core checkpoints/receipts by M0-P14)
 
 This amendment reserves design scope. **The revision echo/exact confirmation
-and the policy-stop exit 2 mapping are SHIPPED (M0-P06, ui 0.11.0)**; the
-remaining fields, CLI flags, exit codes, receipts, views, metrics, and
-launcher rules are not implemented. Until the named activation packets land,
-current behavior remains as documented above for them: badges/diffs use
-projections and the working copy, cache metrics are absent, and the launcher
-uses its existing resolution chain.
+and policy-stop exit 2 mapping are SHIPPED (M0-P06, ui 0.11.0).** M0-P14 now
+ships the core driver cutover, stage checkpoints, receipt outcomes, frozen
+candidates, and output-location/PR-preflight changes. The UI has not activated
+receipt-based badges or checkpoint-only live diffs yet; those remain M0-P15.
+Until then, a working-copy live preview is not task-attributable and must not be
+read as the candidate. Cache metrics remain absent and the launcher keeps its
+existing resolution chain.
 
 | Reserved design item | Required behavior and activation |
 | --- | --- |
 | Revision echo and exact confirmation | **SHIPPED (M0-P06, ui 0.11.0):** the UI snapshots the displayed `{planRevision, selected}` tuple when the dialog opens and confirms exactly that tuple (`run --approve --revision <uuid>` plus repeated `--tasks` per id). Empty selection or absent identity rejects/disables rather than becoming run-all; bare `run` is the explicit resume only; a replan behind an open dialog leaves the stale revision for the CLI to refuse under the lock. |
 | Policy-stop exit 2 | **SHIPPED (M0-P06, ui 0.11.0):** the UI maps CLI exit 2 to a "stopped short" policy-stop state (toast + job chip + report badge), distinguishes whole-plan completion (durable phase) from selection completion, and never presents exit 0 alone as whole-plan success. |
-| Receipt-based badges | M0-P11–M0-P14 establish the review/integration/recovery/publication evidence, and M0-P15 activates separate review, checks, workspace-recovery, and publication labels. Quarantined must not imply discarded/rolled back; review approval must not imply delivered. |
-| Checkpoint diff, not working-copy diff | M0-P14 freezes and addresses candidate checkpoints; M0-P15 switches the live view to the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists. Later operator-checkout edits are not task changes. |
+| Receipt-based badges | M0-P11–M0-P14 establish review/integration/recovery/publication evidence; M0-P15 activates separate review, checks, workspace-recovery, and publication labels. Quarantined must not imply discarded/rolled back; review approval must not imply delivered. |
+| Checkpoint diff, not working-copy diff | M0-P14 freezes and addresses candidate checkpoints. M0-P15 switches the UI's live view to the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists. Until then, operator-checkout edits are not task changes and any live preview is non-authoritative. |
 | Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
 | Trusted launcher resolution | M4-P04 resolves the trusted installed CLI through package metadata rather than a target project's `.bin` or sibling source checkout. This reservation does not itself authorize package exports or a new launcher. |
 
