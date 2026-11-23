@@ -4,6 +4,27 @@ Manual semver discipline: keep `package.json` version and the newest section in 
 
 ## Unreleased
 
+- **M0 release gate**: `test/m0-release.test.ts` proves the prerequisite
+  with a black-box run of the BUILT CLI (`node dist/cli.js`) over the
+  shipped demo fixture — temp repos, faux replay re-read from disk by
+  separate plan/run processes, independent full-run and subset projects
+  (faux queues are process-local), ignored coverage plus sentinel
+  staged/unstaged operator bytes asserted unchanged, and the product
+  outcome asserted by executing `node bin/render.js '/a/-b'` inside the
+  detached accepted result (stdout/stderr/status captured, not grepped
+  from a mirror). A subset grant records no second task wave and no
+  whole-plan completion; grant and outcome are never reconstructed from
+  an edited `router.md` mirror across a locked/unlocked inspection
+  window. Any red prerequisite suite blocks the release; there is no
+  red-test suppression.
+- `docs/project-contract.md` gains the M0 release & migration checklist:
+  the exact verification commands, explicitly recorded compatibility
+  breaks (v1→v2 payload migration and grant protocol, the M0-P14
+  output-location cutover, receipt-backed `done`, budget admission), the
+  exact no-key offline smoke command, and the admitted
+  trusted-project-only security posture before M1 containment.
+  `README.md` links the gate; no performance claim, no live PR creation.
+
 - **opt-in shadow Jev failure triage**: `[gates] jevFailureTriageShadow`
   (default `false`) assesses existing deterministic gate failures and verifier
   rejection/needs-human feedback after their authoritative commits. Independent

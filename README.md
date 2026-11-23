@@ -739,3 +739,26 @@ e2e smoke, the demo-behavior tests and the UI demo mode bake share; the
 `--with-demo` scaffold writes a placeholder PRD describing it, never a baked
 project, and the generic scaffolds install no active demo gates. Do **not**
 publish (`private: true`).
+
+## Release gate (M0)
+
+M0 is a hard release gate before M1–M4; the full checklist — verification
+commands, explicitly recorded compatibility breaks (v1→v2 payload migration
+and grant protocol, the M0-P14 output-location cutover, receipt-backed `done`,
+budget admission), the exact no-key offline smoke command, and the admitted
+trusted-project-only security posture before M1 containment — lives in
+[`docs/project-contract.md`](docs/project-contract.md). Its executable core is
+`test/m0-release.test.ts`: a black-box run of the **built** CLI
+(`node dist/cli.js`) over the demo fixture that asserts the actual product
+invocation (`node bin/render.js '/a/-b'` → exactly `a b`, stdout/stderr/status
+captured), subset-grant isolation, and that an edited `router.md` mirror never
+reconstructs grant or outcome across a locked/unlocked inspection window.
+
+```bash
+npm run typecheck && npm run build && npm test
+npm --prefix ui run typecheck && npm --prefix ui run check && npm --prefix ui test && npm --prefix ui run test:e2e
+git diff --check
+```
+
+Any red prerequisite suite blocks the release — no red-test suppression, no
+skipped gate.

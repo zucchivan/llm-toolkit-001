@@ -383,6 +383,102 @@ mechanically enforced per `docs/api-map.md` (M0-P02).
   result-location instructions above and rehearse against a fixture before
   upgrading a real project.
 
+## M0 release & migration checklist (M0-P19)
+
+M0 is a hard release gate before M1–M4. A release is blocked unless ALL of the
+following pass at the release commit, from a clean checkout:
+
+1. `npm run typecheck && npm run build && npm test`
+2. `npm --prefix ui run typecheck && npm --prefix ui run check && npm --prefix ui test && npm --prefix ui run test:e2e`
+3. `git diff --check`
+4. The offline smoke below reproduces the demo contract end to end through
+   the BUILT CLI (`node dist/cli.js`). `test/m0-release.test.ts` is the
+   executable form of this checklist: black-box temp projects, separate
+   plan/run processes, the faux replay re-read from disk, the actual product
+   invocation asserted (stdout/stderr/status) — never router status alone.
+   Any red prerequisite suite blocks the release; there is no red-test
+   suppression and no skipped gate.
+
+Compatibility breaks this checklist records explicitly (deliberate, shipped
+by the M0 packets — never transparent bug fixes):
+
+- Durable document payloads moved v1 → v2 (`loop.router`/`loop.run`, pure
+  migrations). A mutating `run` on an unmigrated non-empty plan refuses;
+  pre-P14 in-progress work is never replayed; downgrading requires restoring
+  the pre-upgrade backup, not running an older writer.
+- Plan approval is the ADR 01 triple under a fresh per-plan `planRevision`;
+  legacy stamp/timestamp approvals authorize nothing. `router.md` is a
+  rewritten mirror — never plan input: an edited or missing mirror refuses
+  new grants, and inspection flags edited mirror bytes as drift instead of
+  reconstructing grant or outcome from them.
+- Output location cutover (M0-P14): `none` leaves the accepted lineage at
+  `refs/kit/<revision>/accepted` (the operator checkout is unchanged; inspect
+  via a detached worktree), `commit` publishes `refs/heads/kit/<revision>/result`
+  without checkout, `pr` publishes stacked create-only refs behind explicit
+  `--deliver` and never merges. No mode writes result files into `.`.
+- `done` is receipt-backed (acceptance + integration + confirmed publication),
+  not a scheduler projection; a quarantined task unblocks only through the
+  human `resolve` path.
+- Budget admission (M0-P16) guards every paid submission at `>=` of
+  `budgets.sessionUsd` — a zero ceiling refuses all paid work — and unpriced
+  observed spend pauses with a distinct reason. Recorded spend is an estimate,
+  not a provider-bill cap.
+- Security posture until M1: implementer tools, gates, probes and delivery
+  execute on the HOST with no OS containment. Use trusted projects and
+  fixtures only; there is no `unsafeHost` switch — unsupported containment
+  means no execution, not a banner followed by host execution.
+
+Offline smoke (no API keys; disposable directory; Node ≥ 23.6 for the demo
+product's type-stripping):
+
+```bash
+KIT=/path/to/this/repo
+cp -r "$KIT/examples/demo-prd" /tmp/m0-demo && cp "$KIT/examples/demo-prd/smoke-gate.cjs" /tmp/m0-demo/evals/
+cd /tmp/m0-demo
+node "$KIT/dist/cli.js" init .
+cat > .orch/config.toml <<'TOML'
+[engine]
+piDurable = "1.5.0"
+maxTurns = 12
+retryLimit = 2
+
+[roles.planner]
+provider = "faux"
+modelId = "kit-planner"
+
+[roles.implementer]
+provider = "faux"
+modelId = "kit-impl"
+
+[roles.verifier]
+provider = "faux"
+modelId = "kit-verifier"
+
+[budgets]
+sessionUsd = 25.0
+waveUsdWarn = 6.0
+maxConsecutiveErrors = 3
+maxSleepCycles = 3
+
+[gates]
+timeoutSec = 30
+enforceTargetPaths = true
+
+[delivery]
+mode = "none"
+
+[paths]
+prd = "docs/prd.md"
+specs = "specs/"
+TOML
+git init -q && git add -A && git commit -qm base
+export KIT_FAUX=1 KIT_FAUX_SCRIPT="$KIT/examples/demo-prd/smoke.replay"
+node "$KIT/dist/cli.js" plan   # prints the plan revision <uuid>
+node "$KIT/dist/cli.js" run --approve --revision <uuid>   # exit 0, STATUS: COMPLETE
+git worktree add --detach /tmp/m0-demo-result "refs/kit/<uuid>/accepted"
+cd /tmp/m0-demo-result && node bin/render.js '/a/-b'   # prints exactly `a b`, exit 0
+```
+
 ## PR publication (M0-P13; activated by M0-P14)
 
 The serial driver publishes only an already accepted and integrated candidate.
