@@ -32,9 +32,8 @@
  * given retroactive ones.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
-import { readJson } from "../util/fsx.ts";
 import { headBranch, headCommit, shasum } from "../util/git.ts";
 import type { RouterTask } from "./infos.ts";
 import type { Remediation } from "../adoption/types.ts";
@@ -136,6 +135,9 @@ export function planDefinitionSha256(tasks: readonly RouterTask[]): Digest {
  * identity.
  */
 export function normalizeRelPath(root: string, path: string): string {
+	if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..") || /^[A-Za-z]:/.test(path)) {
+		throw new Error(`path ${JSON.stringify(path)} is not a safe project-relative path`);
+	}
 	const resolved = resolve(root, path);
 	const rel = relative(root, resolved);
 	if (!rel || rel.startsWith("..") || resolve(rel) === rel) {
@@ -162,18 +164,36 @@ export interface PlanControls {
 	recipesAutoSha256: Digest | null;
 }
 
-async function fileSha256(root: string, rel: string): Promise<Digest | null> {
-	try {
-		return shasum(await readFile(join(root, rel), "utf8"));
-	} catch {
-		return null;
+async function reviewedFile(root: string, rel: string): Promise<string | null> {
+	const file = join(root, rel);
+	let info;
+	try { info = await lstat(file); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+		throw error;
 	}
+	if (!info.isFile() || info.isSymbolicLink()) throw new Error(`review control is not a regular file: ${rel}`);
+	const actual = await realpath(file);
+	if (relative(await realpath(root), actual).startsWith("..")) throw new Error(`review control escapes project: ${rel}`);
+	return readFile(file, "utf8");
+}
+
+async function fileSha256(root: string, rel: string): Promise<Digest | null> {
+	const value = await reviewedFile(root, rel);
+	return value === null ? null : shasum(value);
 }
 
 /** Read the approved controls inputs (no writes; absent files are null, not errors). */
 export async function loadPlanControls(root: string): Promise<PlanControls> {
-	const stored = await readJson<{ version: number; remediations: Remediation[] }>(join(root, ".orch", "gate-remediations.json"));
-	const remediations = stored?.version === 1 && Array.isArray(stored.remediations) ? stored.remediations : null;
+	const raw = await reviewedFile(root, ".orch/gate-remediations.json");
+	let remediations: Remediation[] | null = null;
+	if (raw !== null) {
+		const stored: unknown = JSON.parse(raw);
+		if (!stored || typeof stored !== "object" || (stored as { version?: unknown }).version !== 1 || !Array.isArray((stored as { remediations?: unknown }).remediations)) {
+			throw new Error("invalid reviewed gate-remediations.json; repair it before planning or running");
+		}
+		remediations = (stored as { remediations: Remediation[] }).remediations;
+	}
 	return {
 		remediations,
 		promptSha256: await fileSha256(root, "PROMPT.md"),

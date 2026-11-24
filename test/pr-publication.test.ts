@@ -285,6 +285,20 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect(data.host.createCalls).toBe(1);
 	});
 
+	it("recovers a durable remote intent that crashed before any push attempt", async () => {
+		const data = await fixture();
+		const commit = await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
+		const options = { deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host };
+		await expect(publishPullRequest(data.kit, data.waves[0]!, {
+			...options,
+			faultInjector(point) { if (point === "delivery-intent:after-commit") throw new Error("crash before push"); },
+		})).rejects.toThrow("crash before push");
+		expect(data.remote.pushCalls).toBe(0);
+		const result = await publishPullRequest(data.kit, data.waves[0]!, options);
+		expect(result.receipt).toMatchObject({ state: "published", commit });
+		expect(data.remote.pushCalls).toBe(1);
+	});
+
 	it("does not recreate a remote ref removed after publication", async () => {
 		const data = await fixture();
 		const commit = await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);

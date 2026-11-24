@@ -776,14 +776,19 @@ export async function publishPullRequest(
 		if (deliveryIntent?.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-conflict", options);
 		throw new RecoveryRequiredError(`refusing conflicting existing remote head ${headRef}: ${observedHead}; expected exact commit ${commit}`);
 	}
-	if (observedHead === undefined && !firstAttempt) {
+	// A durable pre-attempt intent can retry; after an attempt, absence could
+	// mean the remote ref was deleted, so it must remain recovery-required.
+	if (observedHead === undefined && !firstAttempt && deliveryIntent?.code !== "remote-ref-pending") {
 		// A prior intent means the create may already have happened and the ref
 		// may since have been removed. Recreating it would be repair, not replay.
 		await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-missing-after-intent", options);
 		throw new RecoveryRequiredError(`remote head ${headRef} is absent after a recorded publication intent; refusing to recreate or repair it`);
 	}
 	if (observedHead === undefined) {
-		// First attempt only: an empty-expected lease creates the ref atomically.
+		// Record that a push may have been attempted before calling the transport.
+		// A subsequent absent head is uncertain, never blindly recreated.
+		deliveryIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent!, "pending", "remote-ref-create-attempt", options)).receipt;
+		// An empty-expected lease creates the ref atomically.
 		// If the response is lost, readback decides whether the exact commit appeared.
 		try {
 			await fault(options, "pr-ref-create:before-effect");

@@ -157,7 +157,11 @@ over the approved controls (gate-gap remediations, `PROMPT.md`,
 `evals/checklist.md`, human and approved generated recipes). `controlsSha256`
 is ABSENT when no control input exists at all — distinct from a digest over
 empty controls, and absent remediations hash differently from an approved
-empty list. M0-P14 execution requires a non-null `baseCommit`; if planning
+empty list. Unreadable, symlinked, or malformed review controls refuse rather
+than becoming absent inputs. Approval and new work refuse a moved HEAD or
+changed controls; already-journaled effects reconcile only against recorded
+identities. The PRD must be a regular project file before reading or model
+submission. M0-P14 execution requires a non-null `baseCommit`; if planning
 records no committed HEAD, make the intended local seed/base commit and replan
 before granting a run. Staged/unstaged/untracked operator data is never used to
 fill a missing base.
@@ -504,7 +508,9 @@ reviewed base, and replan.
 
 Publication uses a create-only remote-ref CAS for
 `refs/heads/kit/<planRevision>/<taskId>`. If absent, only an empty-expected
-lease may create it. An exact existing head is observed without pushing; a
+lease may create it. A durable pre-push intent can retry the create-only CAS;
+once a push attempt is recorded, an absent head is uncertain and cannot be
+blindly recreated. An exact existing head is observed without pushing; a
 different head blocks. An already-attempted ref that later disappears is not
 recreated. Task A's PR targets the reviewed base branch only while it still
 points at the reviewed base commit. A later task's PR targets the unique

@@ -7,15 +7,17 @@
  * the old identity is archived and any prior approval is invalidated in the
  * same commit. A failed parse leaves the old plan untouched.
  */
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock, ToolRegistration } from "./harness.ts";
 import { commitState, flushStatusSnapshot, readSessionState } from "./state.ts";
+import { BACKGROUND_CONTEXT } from "./kit.ts";
 import type { RouterTask } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
 import { readJson } from "../util/fsx.ts";
-import { buildPlanIdentity, type ArchivedPlanRef } from "./plans.ts";
+import { buildPlanIdentity, normalizeRelPath, type ArchivedPlanRef } from "./plans.ts";
+import { ReceiptsDoc } from "./receipts.ts";
 import { admitSubmission, BudgetAdmissionError } from "./model-admission.ts";
 import type { Remediation } from "../adoption/types.ts";
 
@@ -54,16 +56,36 @@ export interface PlanInputs {
 /** Load the PRD from the project paths (errors in plain words). */
 export async function loadPrd(kit: LoopAndLock, prdPathArg?: string): Promise<string> {
 	const path = prdPathArg ?? kit.loop.config.paths.prd;
-	const abs = join(kit.loop.paths.root, path);
+	let rel: string;
+	try { rel = normalizeRelPath(kit.loop.paths.root, path); }
+	catch { throw new PlanParseError(`unsafe PRD path ${JSON.stringify(path)} — use a project-relative regular file`); }
+	const abs = join(kit.loop.paths.root, rel);
 	try {
+		const info = await lstat(abs);
+		const actual = await realpath(abs);
+		const root = await realpath(kit.loop.paths.root);
+		if (!info.isFile() || info.isSymbolicLink() || relative(root, actual).startsWith("..")) throw new Error("unsafe PRD file");
 		return await readFile(abs, "utf8");
 	} catch {
-		throw new PlanParseError(`PRD not found at ${abs} — write it, or pass --prd <path> (init --with-demo adds a fixture)`);
+		throw new PlanParseError(`PRD not found or unsafe at ${abs} — use a regular project file (init --with-demo adds a fixture)`);
 	}
 }
 
 /** Run the one planning conversation and commit "planned" state. */
 export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText: string): Promise<PlanOutcome> {
+	// Replacing a plan must not strand an old lease or an unconfirmed effect.
+	const prior = await readSessionState(kitAndLock.loop.harness);
+	if (prior.router.identity && prior.router.tasks.some((task) => task.status === "in_progress")) throw new PlanParseError("cannot replan while a task is in progress — reconcile its checkpoint first");
+	const receipts = await kitAndLock.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
+	if (prior.router.identity && receipts) {
+		const latest = new Map<string, (typeof receipts.events)[number]>();
+		for (const event of receipts.events) {
+			if (event.kind === "checkpoint" && event.value.planRevision === prior.router.identity.planRevision) latest.set(`${event.value.taskId}/${event.value.wave}`, event);
+		}
+		if ([...latest.values()].some((event) => event.kind === "checkpoint" && (event.value.stage !== "terminal" || event.value.state !== "complete"))) {
+			throw new PlanParseError("cannot replan with unresolved checkpoint or effect — resume or reconcile the prior revision first");
+		}
+	}
 	// UI seam A.1: flush { phase: "planning" } BEFORE the conversation starts so an
 	// attached UI sees the live planning state (and keeps the existing planned
 	// commit after the answer). Read-only side-car snapshot, no commit.

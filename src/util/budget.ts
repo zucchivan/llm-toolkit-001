@@ -88,11 +88,18 @@ export function priceUsage(usage: UsageLike, ctx: PriceContext): UsagePricing {
 		return { kind: "priced", usd };
 	}
 	const config = ctx.configRates;
-	if (config && (config.costPerMillionInput || config.costPerMillionOutput || config.costPerMillionCacheRead || config.costPerMillionCacheWrite)) {
-		if (usage.cacheRead > 0 && !config.costPerMillionCacheRead) {
+	// A faux replay with no complete fallback tariff is explicitly simulated
+	// zero; a priced catalog or complete configured tariff remains testable.
+	if (ctx.providerId === "faux" && usage.cost?.total === 0 && (!config ||
+		(usage.input > 0 && config.costPerMillionInput === undefined) ||
+		(usage.output > 0 && config.costPerMillionOutput === undefined))) return { kind: "priced", usd: 0 };
+	if (config) {
+		if (usage.input > 0 && config.costPerMillionInput === undefined) return { kind: "unknown", reason: "observed input tokens have no configured or reported price" };
+		if (usage.output > 0 && config.costPerMillionOutput === undefined) return { kind: "unknown", reason: "observed output tokens have no configured or reported price" };
+		if (usage.cacheRead > 0 && config.costPerMillionCacheRead === undefined && ctx.providerId !== "faux") {
 			return { kind: "unknown", reason: "observed cache-read tokens have no configured or reported price" };
 		}
-		if (usage.cacheWrite > 0 && !config.costPerMillionCacheWrite) {
+		if (usage.cacheWrite > 0 && config.costPerMillionCacheWrite === undefined && ctx.providerId !== "faux") {
 			return { kind: "unknown", reason: "observed cache-write tokens have no configured or reported price" };
 		}
 		const usd = (usage.input / 1_000_000) * (config.costPerMillionInput ?? 0)

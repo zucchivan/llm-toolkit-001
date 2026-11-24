@@ -36,7 +36,8 @@ import type { HandoffClaim } from "./handoffs.ts";
 import {
 	admitSubmission, BudgetAdmissionError, isBudgetDenial, recordBudgetStop, refreshAdmissionHighWater,
 } from "./model-admission.ts";
-import { diffDisplayTrees } from "../util/git.ts";
+import { diffDisplayTrees, headCommit } from "../util/git.ts";
+import { controlsSha256 } from "./plans.ts";
 import { readCommit, readRef, resolveTree } from "../util/git-objects.ts";
 import { hostExecArgv } from "./recipe-runner.ts";
 import { createTaskControls } from "./controls.ts";
@@ -197,6 +198,14 @@ async function activeCheckpointConflict(kit: LoopAndLock, state: SessionState): 
 	return undefined;
 }
 
+async function reviewedInputsRefusal(kit: LoopAndLock, state: SessionState): Promise<string | undefined> {
+	const identity = state.router.identity;
+	if (!identity) return undefined;
+	if (await headCommit(kit.loop.paths.root) !== identity.baseCommit) return "reviewed HEAD moved — replan before granting or starting more work";
+	if (await controlsSha256(kit.loop.paths.root) !== identity.controlsSha256) return "reviewed controls changed — restore them or replan before granting or starting more work";
+	return undefined;
+}
+
 export interface ApprovalRequest {
 	/** The plan revision being approved (the CLI's --revision). */
 	planRevision: string;
@@ -220,6 +229,8 @@ export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest): 
 	if (refusal) throw new DriverStateError(refusal);
 	const checkpointConflict = await activeCheckpointConflict(kit, state);
 	if (checkpointConflict) throw new DriverStateError(checkpointConflict);
+	const inputsRefusal = await reviewedInputsRefusal(kit, state);
+	if (inputsRefusal) throw new DriverStateError(inputsRefusal);
 	// The grant binds the human to what they reviewed: the mirror must exist
 	// and match the canonical durable render (edited/missing → replan).
 	const mirrorRefusal = await approvalMirrorRefusal(kit, state);
@@ -385,6 +396,15 @@ export async function runWaves(
 		}
 
 		const task = pickNextTaskInSelection(stateNow.router.tasks, grant.selected);
+		if (task) {
+			const checkpoint = latestTaskCheckpoint(await receiptSnapshot(kit), grant.planRevision, task.id);
+			// Recorded integration/publication effects may be reconciled using their
+			// pinned identities; changed inputs cannot authorize another model wave.
+			if (!checkpoint || checkpoint.stage === "terminal" || checkpoint.stage === "implement" || checkpoint.stage === "gates" || checkpoint.stage === "primary" || checkpoint.stage === "skeptic") {
+				const inputsRefusal = await reviewedInputsRefusal(kit, stateNow);
+				if (inputsRefusal) throw new DriverStateError(inputsRefusal);
+			}
+		}
 		if (!task) {
 			// Outstanding granted tasks are blocked: their dependencies ended
 			// quarantined (this run or a previous one). Policy stop with ids.
