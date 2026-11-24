@@ -998,7 +998,9 @@ ships the core driver cutover, stage checkpoints, receipt outcomes, frozen
 candidates, and output-location/PR-preflight changes. **M0-P15 (ui 0.13.0)
 SHIPS the receipt-based badges (four separate labels: review, checks,
 workspace recovery, publication) and the checkpoint-only live diff.** Cache
-metrics remain absent and the launcher keeps its existing resolution chain.
+metrics remain absent and the launcher keeps its existing resolution chain
+until M1-P01. The amendment below authorizes trust hardening before packaging;
+it does not claim that hardening is already shipped.
 
 | Reserved design item | Required behavior and activation |
 | --- | --- |
@@ -1007,7 +1009,7 @@ metrics remain absent and the launcher keeps its existing resolution chain.
 | Receipt-based badges | **SHIPPED (M0-P15, ui 0.13.0):** review, checks, workspace-recovery, and publication render as four separate labels from the receipt projection (core-shared `receiptLabels()` derivation; the CLI views render the same words). Each label keeps not-requested/pending/unknown/no-receipt states; quarantined does not imply discarded/rolled back; review approval does not imply delivered. |
 | Checkpoint diff, not working-copy diff | **SHIPPED (M0-P15, ui 0.13.0):** the UI's live view reads the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists; the freeze timestamp labels the view. Operator-checkout edits are not task changes. |
 | Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
-| Trusted launcher resolution | M4-P04 resolves the trusted installed CLI through package metadata rather than a target project's `.bin` or sibling source checkout. This reservation does not itself authorize package exports or a new launcher. |
+| Trusted launcher resolution | **DESIGN, activates M1-P01:** validate an operator-selected trusted installation and reject target-local `.bin`, cwd/PATH and symlink escapes for CLI/host executable resolution; attached-stop uses the same resolved identity. Explicit absolute overrides belong only to the non-project host profile. No sandbox execution, package export, v2 DTO or UI state-writing authority is added by this amendment. **M4-P04** later locates that trusted CLI through installed package metadata and must preserve the M1 trust boundary. |
 
 **Reserved for a separate M4 amendment:** live-plan/sequence side-car facts,
 `seam: 2` and nullable read DTOs, the packaged read-only entry point, and
