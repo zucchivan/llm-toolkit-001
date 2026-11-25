@@ -20,10 +20,10 @@
  * The baked root is printed and LEFT IN PLACE for post-mortem (delete any
  * time; it is a temp dir).
  */
-import { copyFile, cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { exec } from "../../src/util/exec.ts";
+import { runGit, writeWorktreeTree } from "../../src/util/git-objects.ts";
 import { initProject } from "../../src/init.ts";
 
 export interface BakedDemo {
@@ -93,15 +93,34 @@ export async function bakeDemoProject(repoRoot: string): Promise<BakedDemo> {
 	// case-sensitive queryList it ships), passes on wave 2 after the repair
 	// (drives the conversation-reset path — proven by behavior).
 	// The loop needs a repo; local identity keeps the bake independent of the
-	// operator's global git config.
-	const g = async (argv: string[]): Promise<void> => {
-		const out = await exec(argv, { cwd: root, timeoutMs: 15_000 });
-		if (out.code !== 0) throw new Error(`git ${argv.join(" ")} failed: ${out.stderr}`);
+	// operator's global git config. Every call goes through the host-owned
+	// trusted resolver with the callback-free Git environment; staging uses
+	// filter-free plumbing (hash-object --no-filters + update-index), never
+	// `git add`/commit hooks or repository clean filters.
+	const git = async (args: string[], env?: Record<string, string>): Promise<string> => {
+		const out = await runGit(root, args, { timeoutMs: 15_000, ...(env ? { env } : {}) });
+		if (out.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${out.stderr || out.stdout}`);
+		return out.stdout.trim();
 	};
-	await g(["git", "init", "-q"]);
-	await g(["git", "add", "-A"]);
-	await g(["git", "-c", "user.email=kit-ui-demo@example.invalid", "-c", "user.name=kit-ui-demo", "commit", "-qm", "demo base"]);
-	await g(["git", "config", "user.email", "kit-ui-demo@example.invalid"]);
-	await g(["git", "config", "user.name", "kit-ui-demo"]);
+	await git(["init", "-q"]);
+	await git(["symbolic-ref", "HEAD", "refs/heads/main"]);
+	const indexFile = join(root, ".orch", `.demo-index-${process.pid}`);
+	let tree: string;
+	try {
+		tree = await writeWorktreeTree(root, { indexFile });
+	} finally {
+		await rm(indexFile, { force: true }).catch(() => {});
+		await rm(`${indexFile}.lock`, { force: true }).catch(() => {});
+	}
+	const identity = {
+		GIT_AUTHOR_NAME: "kit-ui-demo",
+		GIT_AUTHOR_EMAIL: "kit-ui-demo@example.invalid",
+		GIT_COMMITTER_NAME: "kit-ui-demo",
+		GIT_COMMITTER_EMAIL: "kit-ui-demo@example.invalid",
+	};
+	const commit = await git(["commit-tree", tree, "-m", "demo base"], identity);
+	await git(["update-ref", "refs/heads/main", commit]);
+	await git(["config", "user.email", "kit-ui-demo@example.invalid"]);
+	await git(["config", "user.name", "kit-ui-demo"]);
 	return { root, replay: join(root, "smoke.replay") };
 }

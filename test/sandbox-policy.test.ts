@@ -262,6 +262,20 @@ describe("trusted executable resolution", () => {
 		})).toMatchObject({ ok: false, code: "installation-unsafe-path" });
 	});
 
+	it("selects without a target and refuses containment at use, without a fallback", () => {
+		const host = profile({ installation: { git: "/srv/project/.bin/git" } });
+		// Host-descriptor selection: the operator's selected path is kept (the
+		// descriptor has no target yet), so a later use-time refusal cannot be
+		// replaced by the fixed default.
+		expect(resolveTrustedExecutable(host, "git", { trustedDefaults: { git: "/usr/bin/git" } })).toEqual({
+			ok: true,
+			value: { path: "/srv/project/.bin/git", source: "profile" },
+		});
+		// At use, the same selection refuses; it never falls through to /usr/bin/git.
+		expect(resolveTrustedExecutable(host, "git", { targetRoot: ROOT, trustedDefaults: { git: "/usr/bin/git" } }))
+			.toMatchObject({ ok: false, code: "installation-inside-target" });
+	});
+
 	it("never lets project env select a target-local CLI", () => {
 		const saved = { KIT_UI_CLI_BIN: process.env["KIT_UI_CLI_BIN"], PATH: process.env["PATH"] };
 		process.env["KIT_UI_CLI_BIN"] = "/srv/project/node_modules/.bin/llm-toolkit-001";

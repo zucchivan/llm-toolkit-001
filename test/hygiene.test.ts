@@ -22,6 +22,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { initProject } from "../src/init.ts";
 import {
+	installTrustedInstallationForTests,
+	runningInstallationFrom,
+	selectInstallation,
+} from "../src/sandbox/trusted-exec.ts";
+import {
 	HYGIENE_BLOCK_BEGIN,
 	HYGIENE_BLOCK_END,
 	HYGIENE_RULE_LINES,
@@ -225,8 +230,29 @@ describe("warn-don't-unstage for already-tracked files", () => {
 		expect(headAfter.stdout).toBe(head.stdout);
 	}, 60_000);
 
-	it("a pre-existing pattern that excludes the .orch parent is reported, not repaired", async () => {
+	it("init-time Git goes through the host resolver: a refused selection is not a repo and touches no PATH git", async () => {
 		const root = await tmpProject();
+		await mkdir(join(root, ".orch"), { recursive: true });
+		await writeFile(join(root, ".orch", "status.json"), "{}\n", "utf8");
+		installTrustedInstallationForTests(selectInstallation({
+			platform: process.platform,
+			running: runningInstallationFrom("file:///srv/kit/src/sandbox/trusted-exec.ts", process.platform),
+			execPath: process.execPath,
+			installation: { git: join(root, ".bin", "git") },
+		}));
+		try {
+			const report = await initProject(root);
+			// The selection refused (inside the target), so the tracked-file probe is
+			// "not a repository" and reports nothing; the .gitignore block is still
+			// written without any PATH Git fallback.
+			expect(report.warnings).toEqual([]);
+			expect(await readFile(join(root, ".gitignore"), "utf8")).toContain(HYGIENE_BLOCK_BEGIN);
+		} finally {
+			installTrustedInstallationForTests(undefined);
+		}
+	}, 60_000);
+
+	it("a pre-existing pattern that excludes the .orch parent is reported, not repaired", async () => {		const root = await tmpProject();
 		await mkdir(join(root, "docs"), { recursive: true });
 		await writeFile(join(root, ".gitignore"), "# operator rule\n.orch/\ndist/\n", "utf8");
 		const report = await initProject(root);

@@ -307,6 +307,28 @@ export interface ParseHostProfileOptions {
 	platform?: NodeJS.Platform;
 }
 
+/**
+ * Strict installation-override schema, shared by the full M1 profile parser and
+ * the narrow operator read used by the host-owned descriptor. Absent means no
+ * overrides (never a PATH candidate); unknown keys and non-canonical paths are
+ * errors, so an invalid selected override can never silently become a default.
+ */
+export function parseInstallationPaths(
+	value: unknown,
+	platform: NodeJS.Platform = process.platform,
+): InstallationPaths | undefined {
+	if (value === undefined) return undefined;
+	const installRecord = asRecord(value, "installation");
+	onlyKeys(installRecord, INSTALL_KEYS, "installation key");
+	const installation: InstallationPaths = {};
+	for (const tool of INSTALL_TOOLS) {
+		const path = installRecord[tool];
+		if (path === undefined) continue;
+		installation[tool] = assertCanonicalAbsolutePath(path, `installation.${tool}`, platform);
+	}
+	return installation;
+}
+
 /** Strict, pure version-1 host policy parser. Unknown keys are errors. */
 export function parseHostProfile(value: unknown, options: ParseHostProfileOptions = {}): HostProfile {
 	const platform = options.platform ?? process.platform;
@@ -318,18 +340,7 @@ export function parseHostProfile(value: unknown, options: ParseHostProfileOption
 		invalid("operator host profile must have a toolchains object");
 	}
 
-	let installation: InstallationPaths | undefined;
-	if (record["installation"] !== undefined) {
-		const installRecord = asRecord(record["installation"], "installation");
-		onlyKeys(installRecord, INSTALL_KEYS, "installation key");
-		installation = {};
-		for (const tool of INSTALL_TOOLS) {
-			const path = installRecord[tool];
-			if (path === undefined) continue;
-			installation[tool] = assertCanonicalAbsolutePath(path, `installation.${tool}`, platform);
-		}
-	}
-
+	const installation = parseInstallationPaths(record["installation"], platform);
 	const projects = record["projects"].map((entry) => parseProject(entry, platform));
 	const seenRoots = new Set<string>();
 	for (const project of projects) {
@@ -417,6 +428,32 @@ export async function readHostProfile(
 }
 
 /**
+ * Narrow operator read for the host-owned installation descriptor: only the
+ * `installation.*` overrides. An absent profile means "no overrides" (the
+ * fixed defaults still apply); an unsafe, malformed or wrongly typed profile
+ * refuses, because silently dropping a selected override would be a fallback.
+ * Project/toolchain fields are deliberately not validated here — P05 owns the
+ * strict M1 profile admission, and M0-shaped profiles must keep working.
+ */
+export async function readInstallationOverrides(
+	profilePath = defaultHostProfilePath(),
+	options: ParseHostProfileOptions = {},
+): Promise<InstallationPaths | undefined> {
+	let text: string;
+	try {
+		({ text } = await readOperatorProfileText(profilePath));
+	} catch (error) {
+		if (error instanceof HostProfileError && error.code === "not-found") return undefined;
+		throw error;
+	}
+	const parsed = parseProfileJson(text);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new HostProfileError("invalid-schema", "operator host profile must be a JSON object");
+	}
+	return parseInstallationPaths((parsed as Record<string, unknown>)["installation"], options.platform ?? process.platform);
+}
+
+/**
  * Narrow M0 delivery-only view: exact-root project entry → validated
  * deliveryOrigin. This intentionally accepts an entry without the M1 sandbox
  * fields; it grants nothing except the PR destination.
@@ -458,51 +495,118 @@ export interface ValidateInstallationOptions {
 	uid?: number;
 }
 
+export interface TrustedExecutableFileOptions extends ValidateInstallationOptions {
+	/**
+	 * Set ONLY by `src/sandbox/trusted-exec.ts` after it has proven from the
+	 * resolved running module/entry URL that this path is one of the running
+	 * installation's own entries. It waives the outside-the-target rule only;
+	 * symlink, ownership, mode and ancestor checks still apply.
+	 */
+	allowRunningInstallationEntry?: boolean;
+}
+
 /**
- * Validate every configured installation override before first use:
- * outside the target, canonical ancestry (no symlink component), regular
- * non-symlink file, not group/world writable, owned by the current user or
- * root on POSIX. Missing paths are errors, never silent fallbacks.
+ * Ancestor-directory trust for a selected installation path. Each component
+ * from the leaf's parent up to the filesystem root must be a real (non-symlink)
+ * directory owned by the operator or root that is not group/world writable.
+ * A sticky directory (for example `/tmp`) may be world-writable: other users
+ * cannot replace an operator-owned entry there, and the leaf is still checked.
+ */
+async function assertTrustedAncestors(path: string, platform: NodeJS.Platform, uid: number | undefined): Promise<void> {
+	const api = pathApi(platform);
+	let dir = api.dirname(path);
+	while (true) {
+		let info;
+		try {
+			info = await lstat(dir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				throw new HostProfileError("not-found", `trusted installation ancestor directory is missing: ${dir}`);
+			}
+			throw new HostProfileError("unsafe-file", `cannot inspect trusted installation ancestor ${dir}: ${(error as Error).message}`);
+		}
+		if (info.isSymbolicLink() || !info.isDirectory()) {
+			throw new HostProfileError("unsafe-path", `trusted installation ancestor must be a real directory, not a symlink or special file: ${dir}`);
+		}
+		if (platform !== "win32") {
+			const sticky = (info.mode & 0o1000) !== 0;
+			if ((info.mode & 0o022) !== 0 && !sticky) {
+				throw new HostProfileError("unsafe-file", `trusted installation ancestor is group/world writable: ${dir}`);
+			}
+			if (uid !== undefined && info.uid !== uid && info.uid !== 0) {
+				throw new HostProfileError("unsafe-file", `trusted installation ancestor is not owned by the operator or root: ${dir}`);
+			}
+		}
+		const parent = api.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+}
+
+/**
+ * Validate ONE selected installation executable on demand. This is the single
+ * file-trust decision shared by the per-use resolver and the explicit eager
+ * host check; production launch must call it per use, never sweep all tools.
+ */
+export async function validateTrustedExecutableFile(
+	value: string,
+	label: string,
+	options: TrustedExecutableFileOptions,
+): Promise<string> {
+	const platform = options.platform ?? process.platform;
+	let safe: string;
+	if (options.allowRunningInstallationEntry === true) {
+		safe = assertCanonicalAbsolutePath(value, `trusted ${label} executable`, platform);
+	} else {
+		safe = validateInstallationPath(value, { targetRoot: options.targetRoot, platform });
+	}
+	let info;
+	try {
+		info = await lstat(safe);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			throw new HostProfileError("not-found", `trusted ${label} executable not found at ${safe}`);
+		}
+		throw new HostProfileError("unsafe-file", `cannot inspect trusted ${label} executable ${safe}: ${(error as Error).message}`);
+	}
+	if (info.isSymbolicLink()) {
+		throw new HostProfileError("unsafe-path", `trusted ${label} executable must not be a symlink: ${safe}`);
+	}
+	if (!info.isFile()) {
+		throw new HostProfileError("unsafe-file", `trusted ${label} executable must be a regular file: ${safe}`);
+	}
+	const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+	if (platform !== "win32") {
+		if ((info.mode & 0o022) !== 0) {
+			throw new HostProfileError("unsafe-file", `trusted ${label} executable is group/world writable: ${safe}`);
+		}
+		if (uid !== undefined && info.uid !== uid && info.uid !== 0) {
+			throw new HostProfileError("unsafe-file", `trusted ${label} executable is not owned by the operator or root: ${safe}`);
+		}
+	}
+	await assertTrustedAncestors(safe, platform, uid);
+	const actual = await realpath(safe).catch((error: Error) => {
+		throw new HostProfileError("unsafe-file", `cannot canonicalize trusted ${label} executable ${safe}: ${error.message}`);
+	});
+	if (actual !== safe) {
+		throw new HostProfileError("unsafe-path", `trusted ${label} executable path must not traverse a symlink: ${safe}`);
+	}
+	return safe;
+}
+
+/**
+ * Eager host check over the configured `installation.*` overrides. This backs
+ * an explicit operator check only; production launch resolves and validates a
+ * single tool on demand through `src/sandbox/trusted-exec.ts`.
  */
 export async function validateTrustedInstallation(
 	profile: HostProfile,
 	options: ValidateInstallationOptions,
 ): Promise<void> {
-	const platform = options.platform ?? process.platform;
 	const installation = profile.installation ?? {};
 	for (const tool of INSTALL_TOOLS) {
 		const configured = installation[tool];
 		if (configured === undefined) continue;
-		const safe = validateInstallationPath(configured, { targetRoot: options.targetRoot, platform });
-		let info;
-		try {
-			info = await lstat(safe);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-				throw new HostProfileError("not-found", `trusted ${tool} executable not found at ${safe}`);
-			}
-			throw new HostProfileError("unsafe-file", `cannot inspect trusted ${tool} executable ${safe}: ${(error as Error).message}`);
-		}
-		if (info.isSymbolicLink()) {
-			throw new HostProfileError("unsafe-path", `trusted ${tool} executable must not be a symlink: ${safe}`);
-		}
-		if (!info.isFile()) {
-			throw new HostProfileError("unsafe-file", `trusted ${tool} executable must be a regular file: ${safe}`);
-		}
-		if (platform !== "win32") {
-			if ((info.mode & 0o022) !== 0) {
-				throw new HostProfileError("unsafe-file", `trusted ${tool} executable is group/world writable: ${safe}`);
-			}
-			const uid = options.uid ?? (typeof process.getuid === "function" ? process.getuid() : info.uid);
-			if (info.uid !== uid && info.uid !== 0) {
-				throw new HostProfileError("unsafe-file", `trusted ${tool} executable is not owned by the operator or root: ${safe}`);
-			}
-		}
-		const actual = await realpath(safe).catch((error: Error) => {
-			throw new HostProfileError("unsafe-file", `cannot canonicalize trusted ${tool} executable ${safe}: ${error.message}`);
-		});
-		if (actual !== safe) {
-			throw new HostProfileError("unsafe-path", `trusted ${tool} executable path must not traverse a symlink: ${safe}`);
-		}
+		await validateTrustedExecutableFile(configured, tool, options);
 	}
 }

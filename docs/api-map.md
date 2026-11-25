@@ -657,6 +657,67 @@ not an OS sandbox.
   project value after that point; a missing/relative/non-normalized root is a
   typed `HostProfileError`, never a guess.
 
+## Host-owned trusted installation (M1-P01 step (e)) — `src/sandbox/trusted-exec.ts`
+
+One host-owned descriptor names the executable for each host tool. It is built
+from the operator host-profile `installation.*` overrides plus fixed defaults;
+selection never consults PATH, target `node_modules/.bin`, cwd, project
+config/env, `KIT_*` or argv.
+
+- **Defaults.** `node` = the running `process.execPath`; `cli`/`ui` = the
+  running operator-selected installation's own entries, derived from the
+  resolved URL of `src/sandbox/trusted-exec.ts` (`src/cli.ts` from source,
+  `dist/cli.js` from a build, plus `ui/bin/llm-toolkit-ui.js`); on Linux
+  `git` = `/usr/bin/git`, `gh` = `/usr/bin/gh`. `helper`/`bwrap` have no default
+  until P03/P05. A non-Linux host has no Git/gh default and refuses only the
+  operation that needs it.
+- **No fallback.** A present `installation.*` override wins even when invalid;
+  use-time validation then refuses. A missing/invalid selected path is never
+  replaced by another candidate (including the fixed default or PATH).
+- **On demand.** `requireTrustedTool(descriptor, tool, {targetRoot})` resolves
+  AND validates one tool at its use: canonical absolute path, regular
+  non-symlink leaf, operator/root owner, no group/world write, canonical
+  non-symlink ancestors (a sticky world-writable ancestor such as `/tmp` is
+  allowed because operator-owned entries cannot be replaced there), and
+  outside-the-target. `delivery.mode=none` never resolves `gh`; static commands
+  never acquire Git/UI/helper prerequisites. The eager
+  `validateTrustedInstallation` sweep is an explicit host check only, never the
+  launch gate.
+- **Dev-in-kit.** The one in-target exception is the running installation's own
+  entries (`src/cli.ts`, `dist/cli.js`, the UI bin). Provenance is the resolved
+  module URL recorded at selection; a target that merely contains a kit copy is
+  refused. Symlink/owner/mode checks still apply to the exception.
+- **Injection.** `installTrustedInstallationForTests(descriptor)` supplies an
+  in-process descriptor; it is host authority (production builds from the
+  profile), not a bypass of per-use validation.
+- **Spawn.** `runTrustedTool(tool, literalArgv, options)` resolves/validates the
+  tool, prepends fixed hardened Git config when the tool is Git, builds the
+  host environment, and calls `execTrusted` in `src/util/exec.ts` with
+  `argv[0]` = the absolute selected path. `execTrusted` refuses a relative/bare
+  program name or an invalid env BEFORE spawning and never merges
+  `process.env`.
+- **Git/gh environment.** `buildGitEnvironment` starts from fixed host values
+  (system/global config disabled, attributes off, terminal prompt off, no
+  pager) and accepts only plumbing overrides (index file + commit identity).
+  `gitHardeningArgs` disables hooks, fsmonitor, attributes, signing, external
+  diff, protocol-ext, proxies and credential-helper inheritance. Staging uses
+  `hash-object --no-filters` + `update-index --index-info` plumbing
+  (`writeWorktreeTree` in `src/util/git-objects.ts`) — no `git add`, clean
+  filter or hook. `buildGhEnvironment` is noninteractive and pins
+  `GH_HOST=github.com`; a host-resolved `GH_TOKEN` is passed only to a PR
+  delivery subprocess, which also receives the absolute resolved gh as Git's
+  credential helper.
+- **Wired callers.** `src/util/git.ts` (all plumbing/baseline/diff helpers),
+  `src/util/git-objects.ts`, `src/engine/verifier.ts` (`diff --name-only`),
+  `src/engine/delivery.ts` (`git`/`gh` publication; `gh` only for
+  `delivery.mode=pr` + explicit `--deliver`), `src/hygiene.ts` (init-time Git)
+  and `ui/server/demo.ts` (demo bake through filter-free plumbing).
+- **Still deferred.** Step (f): CLI/UI launch + attached-stop identity
+  (`src/cli.ts` `cmdUi`/`findUiBin`, `ui/server/{actions,cli,jobs}.ts`,
+  `job-runner.mjs`, `attached-stop.ts`) and the `KIT_UI_CLI_BIN` retirement.
+  Step (g): async config reads. P05: gate/probe execution
+  (`src/engine/recipe-runner.ts`) must consume this resolver, not add another.
+
 ## Host read boundary (M1-P01 steps c–d) — `src/util/safe-read.ts` + call sites
 
 - `readSafeText` / `openSafeFile` / `listSafeDirectory` / `walkSafeFiles` read
@@ -694,15 +755,15 @@ not an OS sandbox.
   strict paths (`src/engine/inspector.ts`, `ui/server/readout.ts`,
   `src/adoption/cli.ts`). `loadRecipes`/`loadRecipeFile` likewise remain for
   `src/adoption/gaps.ts` and existing tests.
-- NOT wired (a specification amendment is required; recorded in
-  `docs/engineering-plan/evidence/M1-P01.md`): trusted CLI/UI/node/git/gh
-  resolution and launch (`ui/server/jobs.ts` + `job-runner.mjs`, the
-  `KIT_UI_CLI_BIN` test seam, `src/hygiene.ts`, `ui/server/demo.ts`,
-  `src/engine/recipe-runner.ts`, `src/util/exec.ts` — the last two are absent
-  from both P01 and P05 strict target lists), `.orch/wave-log.jsonl` tail reads,
-  `ui/server/sse.ts` `.orch`/jobs metadata fingerprints, `src/engine/handoffs.ts`,
-  `src/engine/inspector.ts`, the sync config callers, artifact listing and the
-  `ui/server/server.ts` download routes.
+- NOT wired (deferred to P01 steps f/g or P05; recorded in
+  `docs/engineering-plan/evidence/M1-P01.md`): trusted CLI/UI launch and
+  attached-stop identity (`src/cli.ts` `cmdUi`/`findUiBin`, `ui/server/actions.ts`
+  `resolveCli`/`KIT_UI_CLI_BIN`, `ui/server/jobs.ts` + `job-runner.mjs`,
+  `ui/server/attached-stop.ts`), gate/probe recipe execution
+  (`src/engine/recipe-runner.ts`, P05 — it must consume the step (e) resolver),
+  `.orch/wave-log.jsonl` tail reads, `ui/server/sse.ts` `.orch`/jobs metadata
+  fingerprints, `src/engine/handoffs.ts`, `src/engine/inspector.ts`, the sync
+  config callers, artifact listing and the `ui/server/server.ts` download routes.
 
 ## src/views/*.ts + src/cli.ts
 

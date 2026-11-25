@@ -25,7 +25,7 @@
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { exec } from "./util/exec.ts";
+import { runGit } from "./util/git-objects.ts";
 
 export type OwnershipClass = "reviewable" | "optional-trail" | "private";
 
@@ -190,9 +190,9 @@ export async function installProjectHygiene(root: string): Promise<HygieneInstal
 
 /** Project-relative private-class files the repo already tracks (sorted; empty when not a repo). */
 export async function trackedPrivateFiles(root: string): Promise<string[]> {
-	const probe = await exec(["git", "rev-parse", "--is-inside-work-tree"], { cwd: root, timeoutMs: 5_000 });
+	const probe = await runGit(root, ["rev-parse", "--is-inside-work-tree"], { timeoutMs: 5_000 });
 	if (probe.code !== 0) return [];
-	const out = await exec(["git", "ls-files", "-z", "--", ".orch"], { cwd: root, timeoutMs: 15_000 });
+	const out = await runGit(root, ["ls-files", "-z", "--", ".orch"], { timeoutMs: 15_000 });
 	if (out.code !== 0) return [];
 	const tracked: string[] = [];
 	for (const p of out.stdout.split("\0")) {

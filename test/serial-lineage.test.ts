@@ -11,6 +11,7 @@ import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { readSessionState } from "../src/engine/state.ts";
 import { readCommit, readRef, resolveTree } from "../src/util/git-objects.ts";
 import { exec } from "../src/util/exec.ts";
+import { installTrustedInstallationForTests, runningInstallationFrom, selectInstallation } from "../src/sandbox/trusted-exec.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { accomplish, bakeProject, scripted } from "./fixtures2.ts";
 import { demoConfigToml } from "./demo-project.ts";
@@ -50,6 +51,7 @@ async function closeKit(kit: LoopAndLock): Promise<void> {
 }
 
 afterEach(async () => {
+	installTrustedInstallationForTests(undefined);
 	await Promise.all(openKits.splice(0).map(closeKit));
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -155,6 +157,16 @@ describe.each(["none", "commit", "pr"] as const)("serial accepted lineage (%s mo
 		const baked = await bakeProject({ buildFauxModels, configToml: config });
 		roots.push(baked.project.root);
 		openKits.push(baked.kit);
+		// Host-owned installation injection: Git resolves to the fixed validated
+		// default, while `gh` is selected INSIDE the project (invalid). Delivery
+		// `none`/`commit` must never resolve it, and the injected PR seam never
+		// touches the real gh host either.
+		installTrustedInstallationForTests(selectInstallation({
+			platform: "linux",
+			running: runningInstallationFrom("file:///srv/kit/src/sandbox/trusted-exec.ts", "linux"),
+			execPath: process.execPath,
+			installation: { gh: join(baked.project.root, ".bin", "gh") },
+		}));
 		await addLineageGate(baked.project.root);
 
 		const { faux, models } = baked.models;

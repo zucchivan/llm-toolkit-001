@@ -404,11 +404,54 @@ no second persisted recipe bundle.
 
 The UI source payload reports a refusal as `refused:{code,message}` with no
 text (never as plain absence). The M0 delivery-only host-profile view
-(`readApprovedDeliveryOrigin`) is unchanged. Trusted CLI/UI/node/git/gh launch
+(`readApprovedDeliveryOrigin`) is unchanged. Trusted CLI/UI launch
 resolution and the `inspect`/handoff/config readers are NOT yet cut over; they
 need a strict-path amendment recorded in
 `docs/engineering-plan/evidence/M1-P01.md`. No sandbox backend, rootfs or
 launch is enabled by this step, and M1-P01 is not complete or certified.
+
+### Trusted host installation and callback-free Git (M1-P01 step (e), prepared — not certified)
+
+Host Git/gh calls (baseline/object plumbing, verifier diffs, PR publication,
+init-time `git ls-files` and the UI demo bake) now go through ONE host-owned
+installation descriptor (`src/sandbox/trusted-exec.ts`). What the operator
+sees:
+
+- Linux defaults are `/usr/bin/git`, `/usr/bin/gh` and the running
+  interpreter (`process.execPath`); the CLI/UI entries are the running
+  installation's own, proven from the resolved module URL. A host profile
+  `installation.*` override replaces a default. There is no PATH,
+  `node_modules/.bin`, cwd, project-env or `KIT_*` fallback anywhere in this
+  chain.
+- An override that is present but invalid refuses. It is never replaced by the
+  default, and a missing default never triggers a PATH search. Overrides must
+  be canonical absolute paths; a default that is a symlink is refused (name its
+  canonical target in `installation.*`).
+- Validation happens per use, so `delivery.mode=none` does not require `gh`, and
+  commands that never launch Git/gh/UI/helper are unaffected. Installation
+  files must be regular non-symlinks, operator/root-owned, not group/world
+  writable, with non-symlink trusted ancestors (a sticky world-writable
+  ancestor like `/tmp` is allowed because entries there cannot be replaced).
+- The only in-target exception is the running kit installation's own entries
+  (dev-in-kit); a checkout that merely contains a kit copy is refused, and
+  symlink/owner/mode checks still apply to the exception.
+- Git children never inherit the operator environment: fixed literal argv,
+  inherited `GIT_*`/`GH_*`/`SSH_*`/proxy/`BASH_ENV`/`NODE_OPTIONS` stripped,
+  system/global config and attribute sources disabled, hooks, fsmonitor,
+  external diff, signing, protocol-ext, proxies and credential-helper
+  inheritance disabled. Worktree staging uses `hash-object --no-filters` +
+  `update-index --index-info` instead of `git add`, so a repository clean
+  filter or hook never executes on the host. `gh` is noninteractive,
+  destination-pinned, and used only for `delivery.mode=pr` with explicit
+  `--deliver`; a host-resolved `GH_TOKEN` reaches only that subprocess.
+- Tests inject an explicit descriptor in-process
+  (`installTrustedInstallationForTests`); that is host authority, not a weaker
+  validation mode.
+
+CLI/UI process launch and attached-stop identity (step f), the async config
+reads (step g) and gate/probe execution (P05) are NOT cut over by this step;
+P05 must consume this resolver rather than add another resolution chain. No
+sandbox launch, rootfs or certification follows from it.
 
 ## Upgrade & migration notes
 

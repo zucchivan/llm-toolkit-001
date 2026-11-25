@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acceptCandidate, integrateAcceptedCandidate, publishPullRequest, RecoveryRequiredError, TrustedGitRemoteTransport } from "../src/engine/delivery.ts";
+import { acceptCandidate, integrateAcceptedCandidate, publishPullRequest, GhPullRequestHost, RecoveryRequiredError, TrustedGitRemoteTransport } from "../src/engine/delivery.ts";
 import type { LoopAndLock } from "../src/engine/harness.ts";
 import { buildFauxModels, fauxAssistantMessage } from "./fixtures.ts";
 import { bakeProject, scripted } from "./fixtures2.ts";
@@ -15,6 +15,7 @@ import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { loadPrd, runPlan } from "../src/engine/planner.ts";
 import { approveGrant } from "../src/engine/waves.ts";
 import { exec } from "../src/util/exec.ts";
+import { installTrustedInstallationForTests, runningInstallationFrom, selectInstallation } from "../src/sandbox/trusted-exec.ts";
 import { hashBlob, resolveTree, writeTreeFromChanges } from "../src/util/git-objects.ts";
 
 const roots: string[] = [];
@@ -206,6 +207,7 @@ async function remoteRef(remote: BareRemote, ref: string): Promise<string | unde
 }
 
 afterEach(async () => {
+	installTrustedInstallationForTests(undefined);
 	await Promise.all(openKits.splice(0).map(async (kit) => {
 		await kit.loop.close().catch(() => {});
 		kit.lock.release();
@@ -257,6 +259,30 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect(result.receipt).toMatchObject({ state: "published", commit });
 		expect(data.remote.pushCalls).toBe(1);
 		expect(data.host.createCalls).toBe(1);
+	});
+
+	it("refuses an invalid selected gh before any spawn and keeps consent ahead of tool resolution", async () => {
+		const data = await fixture();
+		installTrustedInstallationForTests(selectInstallation({
+			platform: "linux",
+			running: runningInstallationFrom("file:///srv/kit/src/sandbox/trusted-exec.ts", "linux"),
+			execPath: process.execPath,
+			installation: { gh: join(data.root, ".bin", "gh") },
+		}));
+		try {
+			// Consent is checked before any host tool is resolved for publication.
+			await expect(publishPullRequest(data.kit, data.waves[0]!, {
+				deliverExplicit: false, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+			})).rejects.toThrow(/explicit --deliver consent/);
+			// The explicit gh host resolves the SELECTED gh on use, which is inside
+			// the target: it refuses instead of spawning or falling back to PATH.
+			await expect(new GhPullRequestHost(data.root).findForHead({
+				repository: "acme/widget", baseRef: data.baseBranch, baseOid: data.baseCommit,
+				headRef: "kit/head", headOid: data.baseCommit,
+			})).rejects.toThrow(/trusted installation refused/);
+		} finally {
+			installTrustedInstallationForTests(undefined);
+		}
 	});
 
 	it("uses the trusted Git transport's empty-expected lease against a local bare repository", async () => {

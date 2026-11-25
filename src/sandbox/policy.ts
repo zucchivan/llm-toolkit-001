@@ -267,7 +267,14 @@ export function projectEnvironment(
 // ---------------------------------------------------------------------------
 
 export interface TrustedExecutableOptions extends PolicyOptions {
-	targetRoot: string;
+	/**
+	 * When supplied, the selected path is checked for target containment here.
+	 * The host-owned descriptor selects WITHOUT a target (per-tool containment
+	 * and file trust happen at use time in `trusted-exec.ts`), so an invalid
+	 * selection for one tool can never be silently replaced by a default and
+	 * never blocks an unrelated tool.
+	 */
+	targetRoot?: string;
 	/**
 	 * Paths supplied by the already-running trusted installation (for example
 	 * `process.execPath` for Node). The policy never derives these from PATH,
@@ -302,7 +309,9 @@ export function resolveTrustedExecutable(
 	const platform = options.platform ?? process.platform;
 	let path: string;
 	try {
-		path = validateInstallationPath(candidate, { targetRoot: options.targetRoot, platform });
+		path = options.targetRoot === undefined
+			? assertCanonicalAbsolutePath(candidate, "installation path", platform)
+			: validateInstallationPath(candidate, { targetRoot: options.targetRoot, platform });
 	} catch (error) {
 		const profileError = error as HostProfileError;
 		if (profileError.code === "installation-inside-target") {

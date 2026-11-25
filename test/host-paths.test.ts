@@ -45,6 +45,7 @@ import {
 	readHostProfile,
 	resolveCanonicalProjectRoot,
 	validateInstallationPath,
+	validateTrustedExecutableFile,
 	validateTrustedInstallation,
 } from "../src/sandbox/host-profile.ts";
 
@@ -306,6 +307,10 @@ describe("trusted installation policy", () => {
 		await mkdir(target);
 		const bin = join(root, "bin");
 		await mkdir(bin);
+		// Trusted-installation ancestry must not be group/world writable (the
+		// process umask can make a fresh directory 0775).
+		await chmod(bin, 0o755);
+		await chmod(root, 0o755);
 		const real = join(bin, "tool");
 		await writeFile(real, "#!/bin/sh\nexit 0\n");
 		await chmod(real, 0o755);
@@ -335,6 +340,41 @@ describe("trusted installation policy", () => {
 		await expect(validateTrustedInstallation({ version: 1, installation: { node: join(bin, "absent") }, projects: [], toolchains: {} }, {
 			targetRoot: target,
 		})).rejects.toMatchObject({ code: "not-found" });
+	});
+
+	it("refuses a symlinked or writable ancestor and an in-target executable", async () => {
+		const root = await tempRoot("kit-install-ancestry-");
+		await chmod(root, 0o755);
+		const target = join(root, "project");
+		await mkdir(target);
+		const bin = join(root, "bin");
+		await mkdir(bin);
+		await chmod(bin, 0o755);
+		const real = join(bin, "tool");
+		await writeFile(real, "#!/bin/sh\nexit 0\n");
+		await chmod(real, 0o755);
+
+		await expect(validateTrustedExecutableFile(real, "node", { targetRoot: target })).resolves.toBe(real);
+
+		const alias = join(root, "bin-alias");
+		await symlink(bin, alias);
+		await expect(validateTrustedExecutableFile(join(alias, "tool"), "node", { targetRoot: target }))
+			.rejects.toMatchObject({ code: "unsafe-path" });
+
+		const group = join(root, "group");
+		await mkdir(group);
+		await writeFile(join(group, "tool"), "#!/bin/sh\nexit 0\n");
+		await chmod(join(group, "tool"), 0o755);
+		await chmod(group, 0o775);
+		await expect(validateTrustedExecutableFile(join(group, "tool"), "node", { targetRoot: target }))
+			.rejects.toMatchObject({ code: "unsafe-file" });
+
+		// The only in-target allowance is the explicit running-entry flag; the
+		// plain file validator refuses an in-target path without it.
+		await expect(validateTrustedExecutableFile(real, "node", { targetRoot: root }))
+			.rejects.toMatchObject({ code: "installation-inside-target" });
+		await expect(validateTrustedExecutableFile(real, "node", { targetRoot: root, allowRunningInstallationEntry: true }))
+			.resolves.toBe(real);
 	});
 
 	it("uses the platform default host profile path, not the target cwd", () => {
