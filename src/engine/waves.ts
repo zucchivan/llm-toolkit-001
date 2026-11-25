@@ -36,8 +36,8 @@ import type { HandoffClaim } from "./handoffs.ts";
 import {
 	admitSubmission, BudgetAdmissionError, isBudgetDenial, recordBudgetStop, refreshAdmissionHighWater,
 } from "./model-admission.ts";
-import { diffDisplayTrees, headCommit } from "../util/git.ts";
-import { controlsSha256 } from "./plans.ts";
+import { diffDisplayTrees } from "../util/git.ts";
+import { reviewBindingRefusal } from "./plans.ts";
 import { readCommit, readRef, resolveTree } from "../util/git-objects.ts";
 import { hostExecArgv } from "./recipe-runner.ts";
 import { createTaskControls } from "./controls.ts";
@@ -201,9 +201,7 @@ async function activeCheckpointConflict(kit: LoopAndLock, state: SessionState): 
 async function reviewedInputsRefusal(kit: LoopAndLock, state: SessionState): Promise<string | undefined> {
 	const identity = state.router.identity;
 	if (!identity) return undefined;
-	if (await headCommit(kit.loop.paths.root) !== identity.baseCommit) return "reviewed HEAD moved — replan before granting or starting more work";
-	if (await controlsSha256(kit.loop.paths.root) !== identity.controlsSha256) return "reviewed controls changed — restore them or replan before granting or starting more work";
-	return undefined;
+	return reviewBindingRefusal(kit.loop.paths.root, identity, kit.loop.config);
 }
 
 export interface ApprovalRequest {
@@ -398,9 +396,13 @@ export async function runWaves(
 		const task = pickNextTaskInSelection(stateNow.router.tasks, grant.selected);
 		if (task) {
 			const checkpoint = latestTaskCheckpoint(await receiptSnapshot(kit), grant.planRevision, task.id);
-			// Recorded integration/publication effects may be reconciled using their
-			// pinned identities; changed inputs cannot authorize another model wave.
-			if (!checkpoint || checkpoint.stage === "terminal" || checkpoint.stage === "implement" || checkpoint.stage === "gates" || checkpoint.stage === "primary" || checkpoint.stage === "skeptic") {
+			// A RESUMED model stage is validated here, before its dispatch. Fresh
+			// waves (no checkpoint, or after a terminal one) are validated inside
+			// driveTaskWaves at their own retry boundary; integration/publication/
+			// rollback reconciliation uses its pinned receipts, not fresh control
+			// reads (recorded effects may be acknowledged after inputs change).
+			const resumedModelStage = checkpoint !== undefined && !["terminal", "integrate", "publish", "rollback"].includes(checkpoint.stage);
+			if (resumedModelStage) {
 				const inputsRefusal = await reviewedInputsRefusal(kit, stateNow);
 				if (inputsRefusal) throw new DriverStateError(inputsRefusal);
 			}
@@ -816,6 +818,18 @@ export async function driveTaskWaves(
 			throw new RecoveryRequiredError(`task ${task.id} has legacy wave history without a terminal P14 checkpoint; replan or reconcile it before replay`);
 		}
 
+		// M1-P01 step (d): a FRESH wave (first attempt or a retry boundary) is new
+		// work under the reviewed plan. HEAD, the actual PRD and every reviewed
+		// control byte / effective policy setting must still match the identity
+		// captured at plan time — checked here, before a workspace lease, handoff
+		// claim, paid submission or gate starts. A resumed stage is checked by
+		// runWaves before its dispatch; integrate/publish/rollback replay uses the
+		// pinned receipts instead.
+		if (!active) {
+			const bindingRefusal = await reviewBindingRefusal(root, identity, kit.loop.config);
+			if (bindingRefusal) throw new DriverStateError(bindingRefusal);
+		}
+
 		const wave = active?.wave ?? current.waveCount + 1;
 		const waveKey: WaveKey = { planRevision: identity.planRevision, taskId: current.id, wave };
 		const parent = active?.parent ?? (await readRef(root, acceptedRef(identity.planRevision))) ?? identity.baseCommit;
@@ -830,7 +844,7 @@ export async function driveTaskWaves(
 		}
 		startTree = await resolveTree(root, startTree);
 		const baseForTask = current.baselineTreeSha ?? await resolveTree(root, parent);
-		const controls = createTaskControls({ root, targetPaths: current.targetPaths });
+		const controls = createTaskControls({ root, targetPaths: current.targetPaths, prdPath: identity.prdPath });
 		let lease: TaskWorkspaceLease;
 		try {
 			if (active) {

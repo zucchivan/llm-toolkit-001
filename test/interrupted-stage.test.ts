@@ -12,7 +12,7 @@ import { exec } from "../src/util/exec.ts";
 import { readJson } from "../src/util/fsx.ts";
 import { conversationEntries, readout } from "../src/engine/inspector.ts";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
-import { accomplish, bakeProject, scripted } from "./fixtures2.ts";
+import { accomplish, bakeProject, reopenProject, scripted } from "./fixtures2.ts";
 import { demoConfigToml } from "./demo-project.ts";
 import { runCli } from "./plan-revision-helpers.ts";
 import { writeGateFile } from "./helpers2.ts";
@@ -86,6 +86,44 @@ describe("interrupted stage reconciliation", () => {
 		expect(afterResume?.events.filter((event) => event.kind === "pass").map((event) => event.kind === "pass" && event.value.review.pass)).toEqual(["primary", "skeptic"]);
 		expect((await baked.kit.loop.sessionUsage()).tokens - usageBefore.tokens).toBeGreaterThan(0);
 		expect(baked.models.faux.getPendingResponseCount()).toBe(0);
+	});
+
+	it("refuses a reopened resumed model stage when reviewed controls drifted (M1-P01 step d)", async () => {
+		const baked = await bakeProject({ buildFauxModels });
+		roots.push(baked.project.root);
+		openKits.push(baked.kit);
+		await scripted(baked.kit, [
+			fauxAssistantMessage(JSON.stringify(TASK), { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/accepted.ts", content: "export const accepted = true;\n" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			pass("primary reviewed the frozen candidate"),
+			pass("skeptic independently reviewed the frozen candidate"),
+		], baked.models.faux);
+		await accomplish(baked.kit);
+		await expect(runWaves(baked.kit, {
+			driverFaultInjector(point) {
+				if (point === "after-primary") throw new Error("stop after primary receipt commit");
+			},
+		})).rejects.toThrow("stop after primary receipt commit");
+		const beforeReopen = await baked.kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
+		expect(beforeReopen?.events.filter((event) => event.kind === "pass")).toHaveLength(1);
+
+		// Reopen after the crash and drift a committed control. The resumed
+		// PRIMARY checkpoint is model work: runWaves must refuse before dispatching
+		// the skeptic (or rerunning primary) and must leave receipts untouched.
+		const reopened = await reopenProject(baked);
+		const closedIndex = openKits.indexOf(baked.kit);
+		if (closedIndex >= 0) openKits.splice(closedIndex, 1);
+		openKits.push(reopened.kit);
+		await writeFile(join(reopened.project.root, "evals", "checklist.md"), "TAMPERED REVIEW CHECKS\n", "utf8");
+		await expect(runWaves(reopened.kit, { tasksFilter: [] })).rejects.toThrow(/reviewed controls changed/);
+		expect(reopened.models.faux.state.callCount).toBe(0);
+		const after = await reopened.kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
+		expect(after?.events.filter((event) => event.kind === "pass")).toHaveLength(1);
+		const state = await readSessionState(reopened.kit.loop.harness);
+		expect(state.router.tasks[0]).toMatchObject({ status: "in_progress", waveCount: 1 });
+		const latest = after?.events.filter((event) => event.kind === "checkpoint" && event.value.taskId === "resume-task").at(-1);
+		expect(latest).toMatchObject({ kind: "checkpoint", value: { stage: "primary", state: "complete" } });
 	});
 
 	it("resumes the receipted candidate after review without re-running implementation or verification", async () => {
@@ -268,6 +306,49 @@ describe("interrupted stage reconciliation", () => {
 		}
 		const finalState = await readSessionState(observer.loop.harness);
 		expect(finalState.router.tasks[0]?.status).toBe("done");
+	});
+
+	it("one-off verify refuses control/policy drift before any paid submission (M1-P01 step d)", async () => {
+		const baked = await bakeProject({ buildFauxModels });
+		roots.push(baked.project.root);
+		openKits.push(baked.kit);
+		await scripted(baked.kit, [
+			fauxAssistantMessage(JSON.stringify(TASK), { stopReason: "stop" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "src/accepted.ts", content: "export const accepted = true;\n" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			pass("primary reviewed the frozen candidate"),
+			pass("skeptic independently reviewed the frozen candidate"),
+		], baked.models.faux);
+		await accomplish(baked.kit);
+		await runWaves(baked.kit, { tasksFilter: [] });
+		const before = await readout(baked.kit.loop.paths, { loop: baked.kit });
+		const conversationsBefore = before.storage?.conversations.length ?? 0;
+		const receiptsBefore = (await baked.kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events
+			.filter((event) => event.kind === "pass").length ?? 0;
+		await closeKit(baked.kit);
+
+		// Change BOTH a reviewed eval byte and the effective verification policy.
+		// Either alone is control drift; verify must refuse before admission.
+		await writeFile(join(baked.project.root, "evals", "checklist.md"), "TAMPERED REVIEW CHECKS\n", "utf8");
+		await writeFile(join(baked.project.root, ".orch", "config.toml"), demoConfigToml().replace(
+			"[gates]\ntimeoutSec = 30",
+			"[gates]\ntimeoutSec = 30\nskepticSecondPass = true",
+		), "utf8");
+		const replay = join(baked.project.root, "verify.replay");
+		await writeFile(replay, "", "utf8");
+		const result = await runCli(baked.project.root, ["verify", "--task", "resume-task"], replay);
+		expect(result.code).toBe(1);
+		expect(result.stderr).toMatch(/reviewed controls changed/);
+		expect(result.stderr).toMatch(/replan/);
+		expect(result.stdout).not.toContain('"verdict"');
+
+		const observer = await openProjectHarness(baked.project.root, "verify-inspect", { readView: true });
+		openKits.push(observer);
+		const after = await readout(observer.loop.paths, { loop: observer });
+		expect(after.storage?.conversations.length ?? 0).toBe(conversationsBefore);
+		const receiptsAfter = (await observer.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events
+			.filter((event) => event.kind === "pass").length ?? 0;
+		expect(receiptsAfter).toBe(receiptsBefore);
 	});
 
 	it("blocks task B when local publication is unknown after the branch CAS", async () => {

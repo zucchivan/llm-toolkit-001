@@ -16,12 +16,21 @@
  *   baseBranch        — the checked-out branch at planning (null when detached);
  *   prdPath/prdSha256 — the normalized project-relative PRD path and content
  *                       digest;
- *   controlsSha256    — digest over the approved review controls (gate-gap
- *                       remediations, PROMPT.md rules, checklist, human and
- *                       approved generated recipes). ABSENT (no control input
- *                       exists at all) is distinct from a digest over empty
- *                       controls, and absent remediations are distinct from an
- *                       empty approved list inside the hashed payload.
+ *   controlsSha256    — digest over the reviewed control bundle captured ONCE
+ *                       before disclosure: every `evals/**` regular-file byte,
+ *                       PROMPT.md, approved gate remediations, the actual
+ *                       configured/`--prd` file and the effective verification/
+ *                       delivery/routing/admission settings. ABSENT (no control
+ *                       input exists at all) is distinct from a digest over
+ *                       empty controls, and absent remediations are distinct
+ *                       from an empty approved list inside the hashed payload.
+ *                       `budgets.sessionUsd` is excluded (a raised ceiling is
+ *                       not control drift).
+ *
+ * Capturing the bundle before the planner sees the PRD means the recorded
+ * identity describes the bytes and settings actually used for that review. The
+ * same identity is validated at a new grant, at resume and at each fresh wave/
+ * retry boundary; a mismatch refuses new work and never rewrites receipts.
  *
  * Replans archive the replaced plan's identity references on the RouterDoc and
  * invalidate prior approvals ATOMICALLY in the same commit (see planner.ts) —
@@ -34,8 +43,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { relative, resolve } from "node:path";
 import { headBranch, headCommit, shasum } from "../util/git.ts";
+import { readBlob, readTreeEntries, resolveTree } from "../util/git-objects.ts";
 import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
-import { SafeReadBudget, readSafeText } from "../util/safe-read.ts";
+import { SafeReadBudget, readSafeFile, readSafeText, walkSafeFiles } from "../util/safe-read.ts";
+import { controlPolicySettings } from "../config.ts";
+import type { ControlPolicySettings, KitConfig } from "../config.ts";
 import type { RouterTask } from "./infos.ts";
 import type { Remediation } from "../adoption/types.ts";
 
@@ -148,83 +160,273 @@ export function normalizeRelPath(root: string, path: string): string {
 }
 
 /**
- * Approved controls present in the project, as identity inputs. Every field is
- * null when its input is absent, so "no approved remediations file" hashes
- * differently from "an approved (empty) remediations list".
+ * Approved controls present in the project, as captured identity inputs.
+ *
+ * M1-P01 step (d) widened this from five named files to the reviewed control
+ * bundle: every regular file under `evals/**` (bytes, so executable assertion
+ * scripts count too), `PROMPT.md`, the approved gate remediations, the ACTUAL
+ * configured/`--prd` file, and the effective verification/delivery/routing/
+ * admission policy settings. `budgets.sessionUsd` is not part of the payload
+ * because raising a spend ceiling is not a new plan.
+ *
+ * ABSENT is distinct from empty: `evals: null` means the directory does not
+ * exist, `evals: []` means it exists and holds no files; `prompt: null` means
+ * no PROMPT.md; `remediations: null` means no remediations file. A `prd` key
+ * absent means this capture did not bind a PRD at all (unit capture only);
+ * `prd: null` means a PRD was requested and is now absent.
  */
-export interface PlanControls {
-	/** Approved gate-gap remediations (parsed); null when the file is absent or unreadable. */
-	remediations: Remediation[] | null;
-	/** PROMPT.md (wave discipline rules) content digest; null when absent. */
-	promptSha256: Digest | null;
-	/** evals/checklist.md (review rules) content digest; null when absent. */
-	checklistSha256: Digest | null;
-	/** evals/recipes.toml (human recipes) content digest; null when absent. */
-	recipesSha256: Digest | null;
-	/** evals/recipes.auto.toml (approved generated recipes) content digest; null when absent. */
-	recipesAutoSha256: Digest | null;
+export interface PlanControlFile {
+	/** Root-relative reviewed name. */
+	path: string;
+	/** Length of the reviewed bytes (UTF-8 bytes for text controls). */
+	bytes: number;
+	/** SHA256 over exactly those bytes. */
+	sha256: Digest;
 }
 
-/**
- * Read one reviewed control root-relative through the no-follow host reader.
- * `null` is reserved for a genuine ENOENT; a symlink, non-regular file,
- * unreadable/oversized file or unavailable primitive refuses the whole load.
- * `root` is already canonical (resolved once by `loadPlanControls`).
- */
-async function reviewedFile(root: string, rel: string, budget: SafeReadBudget): Promise<string | null> {
-	const read = await readSafeText({ root, path: rel, budget });
-	if (read.kind === "ok") return read.value;
-	if (read.kind === "absent") return null;
-	const notRegular = read.code === "symlink" || read.code === "not-regular";
-	throw new Error(
-		`${notRegular ? "review control is not a regular file" : "review control is unreadable"}: ${rel} (${read.code}: ${read.message})`,
+export interface PlanControls {
+	/** Approved gate-gap remediations (parsed); null when the file is absent. */
+	remediations: Remediation[] | null;
+	/** Every regular file under `evals/` (sorted); null when the directory is absent. */
+	evals: PlanControlFile[] | null;
+	/** PROMPT.md (wave discipline rules); null when absent. */
+	prompt: PlanControlFile | null;
+	/** The actual configured/`--prd` file; omitted only when no PRD was requested. */
+	prd?: PlanControlFile | null;
+	/** Effective policy settings; null only for a file-only unit capture. */
+	settings: ControlPolicySettings | null;
+}
+
+export interface ControlCaptureOptions {
+	/** The actual configured/`--prd` path (normalized by the capture). Omitted only by unit captures. */
+	prdPath?: string;
+	/**
+	 * The exact PRD text already loaded for disclosure (plan-time capture). When
+	 * omitted, the file is read through the boundary at `prdPath`.
+	 */
+	prdText?: string;
+	/** The effective config in force; its policy settings are bound to the digest. */
+	config?: KitConfig;
+}
+
+function controlRefusal(code: string, rel: string, message: string): Error {
+	const notRegular = code === "symlink" || code === "not-regular" || code === "hardlink";
+	return new Error(
+		`${notRegular ? "review control is not a regular file" : "review control is unreadable"}: ${rel} (${code}: ${message})`,
 	);
 }
 
-async function fileSha256(root: string, rel: string, budget: SafeReadBudget): Promise<Digest | null> {
-	const value = await reviewedFile(root, rel, budget);
-	return value === null ? null : shasum(value);
+/** Read one reviewed control as bytes (works for executable/binary eval scripts). */
+async function reviewedControlFile(root: string, rel: string, budget: SafeReadBudget): Promise<PlanControlFile | null> {
+	const read = await readSafeFile({ root, path: rel, budget });
+	if (read.kind === "ok") {
+		return { path: rel, bytes: read.value.byteLength, sha256: createHash("sha256").update(read.value).digest("hex") };
+	}
+	if (read.kind === "absent") return null;
+	throw controlRefusal(read.code, rel, read.message);
 }
 
-/** Read the approved controls inputs (no writes; absent files are null, not errors). */
-export async function loadPlanControls(rootInput: string): Promise<PlanControls> {
-	const root = await resolveCanonicalProjectRoot(rootInput);
-	const budget = new SafeReadBudget();
-	const raw = await reviewedFile(root, ".orch/gate-remediations.json", budget);
-	let remediations: Remediation[] | null = null;
-	if (raw !== null) {
-		const stored: unknown = JSON.parse(raw);
-		if (!stored || typeof stored !== "object" || (stored as { version?: unknown }).version !== 1 || !Array.isArray((stored as { remediations?: unknown }).remediations)) {
-			throw new Error("invalid reviewed gate-remediations.json; repair it before planning or running");
-		}
-		remediations = (stored as { remediations: Remediation[] }).remediations;
+/** Read one reviewed control as strict UTF-8 text. */
+async function reviewedControlText(root: string, rel: string, budget: SafeReadBudget): Promise<string | null> {
+	const read = await readSafeText({ root, path: rel, budget });
+	if (read.kind === "ok") return read.value;
+	if (read.kind === "absent") return null;
+	throw controlRefusal(read.code, rel, read.message);
+}
+
+/** Text control record whose digest matches the PRD identity (`shasum` of the text). */
+function textControl(path: string, text: string): PlanControlFile {
+	return { path, bytes: Buffer.byteLength(text, "utf8"), sha256: shasum(text) };
+}
+
+async function readRemediationControls(root: string, budget: SafeReadBudget): Promise<Remediation[] | null> {
+	const raw = await reviewedControlText(root, ".orch/gate-remediations.json", budget);
+	if (raw === null) return null;
+	const stored: unknown = JSON.parse(raw);
+	if (!stored || typeof stored !== "object" || (stored as { version?: unknown }).version !== 1 || !Array.isArray((stored as { remediations?: unknown }).remediations)) {
+		throw new Error("invalid reviewed gate-remediations.json; repair it before planning or running");
 	}
-	return {
-		remediations,
-		promptSha256: await fileSha256(root, "PROMPT.md", budget),
-		checklistSha256: await fileSha256(root, "evals/checklist.md", budget),
-		recipesSha256: await fileSha256(root, "evals/recipes.toml", budget),
-		recipesAutoSha256: await fileSha256(root, "evals/recipes.auto.toml", budget),
-	};
+	return (stored as { remediations: Remediation[] }).remediations;
+}
+
+async function readEvalControls(root: string, budget: SafeReadBudget): Promise<PlanControlFile[] | null> {
+	const walk = await walkSafeFiles({ root, path: "evals" });
+	if (walk.kind === "absent") return null;
+	if (walk.kind === "refused") throw controlRefusal(walk.code, walk.path, walk.message);
+	const files: PlanControlFile[] = [];
+	for (const rel of walk.value.files) {
+		const file = await reviewedControlFile(root, rel, budget);
+		if (file === null) throw new Error(`review control vanished while the bundle was captured: ${rel}`);
+		files.push(file);
+	}
+	return files;
 }
 
 /**
- * Digest over the approved controls payload. ABSENT (undefined) when no
- * control input exists at all — distinct from a digest over empty controls
- * (e.g. an approved-empty remediations list with a checklist present).
+ * Capture the reviewed control bundle ONCE. Call this before the PRD (or any
+ * control) is disclosed to a model, and reuse the returned payload for the
+ * plan identity — never hash working files after disclosure. One canonical
+ * root and one `SafeReadBudget` cover every read; a symlink, non-regular/hard-
+ * linked file, escape, malformed text or cap excess refuses the capture.
  */
-export async function controlsSha256(root: string): Promise<Digest | undefined> {
-	const controls = await loadPlanControls(root);
-	if (
-		controls.remediations === null &&
-		controls.promptSha256 === null &&
-		controls.checklistSha256 === null &&
-		controls.recipesSha256 === null &&
-		controls.recipesAutoSha256 === null
-	) {
-		return undefined;
+export async function loadPlanControls(rootInput: string, options: ControlCaptureOptions = {}): Promise<PlanControls> {
+	const root = await resolveCanonicalProjectRoot(rootInput);
+	const budget = new SafeReadBudget();
+	const controls: PlanControls = {
+		remediations: await readRemediationControls(root, budget),
+		evals: await readEvalControls(root, budget),
+		prompt: await reviewedControlFile(root, "PROMPT.md", budget),
+		settings: options.config ? controlPolicySettings(options.config) : null,
+	};
+	if (options.prdPath !== undefined) {
+		const rel = normalizeRelPath(root, options.prdPath);
+		const text = options.prdText ?? await reviewedControlText(root, rel, budget);
+		controls.prd = text === null ? null : textControl(rel, text);
 	}
-	return canonicalSha256(controls);
+	return controls;
+}
+
+/** Approved remediations alone, read through the same boundary (null = absent). */
+export async function readRemediations(rootInput: string): Promise<Remediation[] | null> {
+	const root = await resolveCanonicalProjectRoot(rootInput);
+	return readRemediationControls(root, new SafeReadBudget());
+}
+
+function controlsAbsent(controls: PlanControls): boolean {
+	return controls.remediations === null
+		&& controls.evals === null
+		&& controls.prompt === null
+		&& controls.settings === null
+		&& !("prd" in controls);
+}
+
+/** Digest over a captured controls payload. ABSENT only when no input exists at all. */
+export function controlsDigest(controls: PlanControls): Digest | undefined {
+	return controlsAbsent(controls) ? undefined : canonicalSha256(controls);
+}
+
+/**
+ * Digest of the PRE-step-(d) controls payload shape.
+ *
+ * This is used only to recognize a migration, never to authorize work: a plan
+ * minted before the bundle widened recorded a digest over the five named
+ * fields below. Recomputing that old shape from the CURRENT capture lets the
+ * refusal say "the reviewed inputs are unchanged; the plan predates the
+ * widened payload" instead of falsely claiming an on-disk edit.
+ */
+export function legacyControlsDigest(controls: PlanControls): Digest {
+	const evalSha = (path: string): Digest | null => controls.evals?.find((file) => file.path === path)?.sha256 ?? null;
+	return canonicalSha256({
+		remediations: controls.remediations,
+		promptSha256: controls.prompt?.sha256 ?? null,
+		checklistSha256: evalSha("evals/checklist.md"),
+		recipesSha256: evalSha("evals/recipes.toml"),
+		recipesAutoSha256: evalSha("evals/recipes.auto.toml"),
+	});
+}
+
+/**
+ * Compare the current capture with the digest recorded by a reviewed plan.
+ * `undefined` means the reviewed inputs still bind. A legacy-shaped digest is
+ * named as a migration, not as an on-disk change; every other mismatch is
+ * control drift and never authorizes fresh work.
+ */
+export function controlsBindingRefusal(identity: PlanIdentity, controls: PlanControls): string | undefined {
+	if (controlsDigest(controls) === identity.controlsSha256) return undefined;
+	if (identity.controlsSha256 !== undefined && legacyControlsDigest(controls) === identity.controlsSha256) {
+		return `plan revision ${identity.planRevision} was reviewed under the pre-M1-P01-step-(d) control digest shape; that digest never bound the widened evals/PRD/PROMPT/settings bundle (the legacy named files are unchanged on disk) — replan and re-approve before granting or starting more work`;
+	}
+	return `reviewed controls changed — the approved control inputs changed on disk since plan revision ${identity.planRevision} was reviewed; restore them or replan before granting or starting more work`;
+}
+
+/**
+ * Refuse a plan whose captured controls do not match the bytes the driver will
+ * execute from the reviewed base tree.
+ *
+ * The driver reads recipes from the immutable start tree (`recipeBundleFromTree`)
+ * and PROMPT.md from the projected start tree, never from the operator worktree.
+ * Therefore every control file the base tree can execute must exist in the
+ * capture with identical bytes. A tracked control edited or deleted after the
+ * base commit is refused here, before the PRD is disclosed to the planner, so
+ * the operator must commit the reviewed `evals/**`/PROMPT.md bytes (or restore
+ * them) before planning. A genuinely new, UNTRACKED control file is captured in
+ * the identity but cannot execute from the base tree; it is not a divergent
+ * executed byte and is recorded as reviewed-but-not-executable.
+ */
+export async function reviewedBaseTreeRefusal(rootInput: string, baseCommit: string | null, controls: PlanControls): Promise<string | undefined> {
+	if (baseCommit === null) return undefined; // no base tree exists; run refuses until a commit and replan
+	const root = await resolveCanonicalProjectRoot(rootInput);
+	let entries: Awaited<ReturnType<typeof readTreeEntries>>;
+	try {
+		entries = await readTreeEntries(root, await resolveTree(root, baseCommit));
+	} catch (error) {
+		return `the reviewed base commit ${baseCommit.slice(0, 12)} cannot be read: ${(error as Error).message} — commit the reviewed controls and replan`;
+	}
+	const captured = new Map<string, Digest>();
+	for (const file of controls.evals ?? []) captured.set(file.path, file.sha256);
+	if (controls.prompt !== null) captured.set(controls.prompt.path, controls.prompt.sha256);
+	for (const entry of entries) {
+		const reviewedControl = entry.path === "PROMPT.md" || entry.path.startsWith("evals/");
+		if (!reviewedControl || entry.type === "tree") continue;
+		if (entry.type !== "blob" || (entry.mode !== "100644" && entry.mode !== "100755")) {
+			return `reviewed base tree entry ${entry.path} is not a regular file (${entry.mode} ${entry.type}) — the driver cannot execute it as a reviewed control; remove it or replan from a clean base`;
+		}
+		const expected = captured.get(entry.path);
+		if (expected === undefined) {
+			return `reviewed control ${entry.path} exists in base commit ${baseCommit.slice(0, 12)} but is absent from the working-tree capture — restore it or commit the reviewed evals/** and PROMPT.md bytes before planning`;
+		}
+		let bytes: Buffer;
+		try {
+			bytes = await readBlob(root, entry.oid);
+		} catch (error) {
+			return `reviewed control ${entry.path} in base commit ${baseCommit.slice(0, 12)} cannot be read: ${(error as Error).message} — replan after repairing the base tree`;
+		}
+		if (createHash("sha256").update(bytes).digest("hex") !== expected) {
+			return `reviewed control ${entry.path} differs from base commit ${baseCommit.slice(0, 12)} — the driver executes the base tree, not the working tree; commit the reviewed evals/** and PROMPT.md bytes before planning`;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Digest over the current control inputs. Production callers pass the effective
+ * config and the reviewed `prdPath`; validation of an existing plan uses the
+ * pinned `identity.prdPath`.
+ */
+export async function controlsSha256(root: string, options: ControlCaptureOptions = {}): Promise<Digest | undefined> {
+	return controlsDigest(await loadPlanControls(root, options));
+}
+
+/**
+ * Validate a reviewed plan identity against the current host/project inputs at
+ * a boundary that may start or resume work. Returns a refusal string (no side
+ * effects) or undefined. The pinned identity supplies the PRD path; HEAD, the
+ * actual PRD bytes, every `evals/**` byte, PROMPT.md, approved remediations and
+ * the effective policy settings must all still match what was reviewed.
+ *
+ * Raising only `budgets.sessionUsd` is NOT drift (the ceiling is excluded from
+ * the settings projection), so a budget pause still resumes the same plan.
+ */
+export async function reviewBindingRefusal(
+	root: string,
+	identity: PlanIdentity,
+	config: KitConfig,
+): Promise<string | undefined> {
+	const canonicalRoot = await resolveCanonicalProjectRoot(root);
+	if (await headCommit(canonicalRoot) !== identity.baseCommit) return "reviewed HEAD moved — replan before granting or starting more work";
+	let controls: PlanControls;
+	try {
+		controls = await loadPlanControls(canonicalRoot, { prdPath: identity.prdPath, config });
+	} catch (error) {
+		return `reviewed control inputs cannot be read: ${(error as Error).message} — restore them or replan before granting or starting more work`;
+	}
+	if (controls.prd === undefined || controls.prd === null) {
+		return `the reviewed PRD ${identity.prdPath} is absent — restore it or replan before granting or starting more work`;
+	}
+	if (controls.prd.sha256 !== identity.prdSha256) {
+		return `the reviewed PRD ${identity.prdPath} changed — replan and re-approve before granting or starting more work`;
+	}
+	return controlsBindingRefusal(identity, controls);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,20 +434,30 @@ export async function controlsSha256(root: string): Promise<Digest | undefined> 
 // ---------------------------------------------------------------------------
 
 /**
- * Mint the identity of one plan. Pure inputs, no state mutation: every read
- * (git, files) happens BEFORE the plan commit, so a failure here leaves the
- * previous plan untouched.
+ * Mint the identity of one plan from the control bundle captured BEFORE the
+ * PRD was disclosed (see `loadPlanControls`). No files are re-read here: the
+ * recorded identity is the reviewed capture, not the working tree after the
+ * planning conversation. No state mutation either — every input is read before
+ * the plan commit, so a failure here leaves the previous plan untouched.
  */
-export async function buildPlanIdentity(root: string, prdPath: string, prdText: string, tasks: readonly RouterTask[]): Promise<PlanIdentity> {
+export async function buildPlanIdentity(
+	root: string,
+	prdPath: string,
+	prdText: string,
+	tasks: readonly RouterTask[],
+	controls: PlanControls,
+	/** Git base captured with the controls BEFORE disclosure; absent = read now. */
+	base?: { commit: string | null; branch: string | null },
+): Promise<PlanIdentity> {
 	const identity: PlanIdentity = {
 		planRevision: randomUUID(),
 		definitionSha256: planDefinitionSha256(tasks),
-		baseCommit: await headCommit(root),
-		baseBranch: await headBranch(root),
+		baseCommit: base ? base.commit : await headCommit(root),
+		baseBranch: base ? base.branch : await headBranch(root),
 		prdPath: normalizeRelPath(root, prdPath),
 		prdSha256: shasum(prdText),
 	};
-	const controls = await controlsSha256(root);
-	if (controls !== undefined) identity.controlsSha256 = controls;
+	const digest = controlsDigest(controls);
+	if (digest !== undefined) identity.controlsSha256 = digest;
 	return identity;
 }

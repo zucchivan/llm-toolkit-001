@@ -14,6 +14,14 @@ export type TaskControlsInput = {
 	deniedPaths?: readonly string[];
 	/** Additional protected read-only paths (e.g. the configured PRD). */
 	readOnlyPaths?: readonly string[];
+	/**
+	 * The ACTUAL configured/`--prd` path from the reviewed plan identity. It is
+	 * a literal project-relative file name (never a glob), reserved read-only in
+	 * projection and candidate admission even when the file is absent. An empty
+	 * targetPaths list means "all admissible project paths" and does NOT reopen
+	 * the PRD; a docs/** target does not either.
+	 */
+	prdPath?: string;
 };
 
 export type TaskControls = Readonly<{
@@ -50,15 +58,19 @@ export function validateProjectPath(path: string, { pattern = false }: { pattern
 export function createTaskControls(input: TaskControlsInput): TaskControls {
 	if (!input.root || !Array.isArray(input.targetPaths) || !input.targetPaths.every((p) => typeof p === "string") ||
 		(input.deniedPaths !== undefined && (!Array.isArray(input.deniedPaths) || !input.deniedPaths.every((p) => typeof p === "string"))) ||
-		(input.readOnlyPaths !== undefined && (!Array.isArray(input.readOnlyPaths) || !input.readOnlyPaths.every((p) => typeof p === "string")))) {
-		throw new Error("task controls require a root and string target, deny, and read-only path arrays");
+		(input.readOnlyPaths !== undefined && (!Array.isArray(input.readOnlyPaths) || !input.readOnlyPaths.every((p) => typeof p === "string"))) ||
+		(input.prdPath !== undefined && typeof input.prdPath !== "string")) {
+		throw new Error("task controls require a root and string target, deny, read-only, and PRD path values");
 	}
 	if (input.targetPaths.length > 1000 || (input.deniedPaths?.length ?? 0) > 1000 || (input.readOnlyPaths?.length ?? 0) > 1000) {
 		throw new Error("task controls contain too many path patterns; nothing was omitted");
 	}
 	const targets = input.targetPaths.map((path) => validateProjectPath(path, { pattern: true }));
 	const denied = (input.deniedPaths ?? []).map((path) => validateProjectPath(path, { pattern: true }));
-	const readOnly = [...DEFAULT_READ_ONLY_PATHS, ...(input.readOnlyPaths ?? [])].map((path) => validateProjectPath(path, { pattern: true }));
+	// The reviewed PRD is a literal file path: validate without pattern syntax so
+	// a wildcard cannot silently protect a different set of files.
+	const prd = input.prdPath === undefined ? [] : [validateProjectPath(input.prdPath)];
+	const readOnly = [...DEFAULT_READ_ONLY_PATHS, ...prd, ...(input.readOnlyPaths ?? [])].map((path) => validateProjectPath(path, { pattern: true }));
 	return Object.freeze({
 		root: resolve(input.root),
 		targetPaths: Object.freeze([...targets]),

@@ -88,6 +88,72 @@ export const DEFAULT_CONFIG: KitConfig = {
 
 export class ConfigError extends Error {}
 
+/**
+ * Effective settings bound into a reviewed plan's control identity (M1-P01
+ * step d). Verification, delivery, routing and admission policy are part of
+ * what a human reviewed; a change requires a replan and a fresh grant.
+ *
+ * `budgets.sessionUsd` is deliberately EXCLUDED: raising only the session
+ * ceiling resumes the same reviewed plan (§3 transition 1 / ADR 01). The
+ * other budget entries (warning threshold, breaker, sleep cap) are policy.
+ *
+ * There are no effective sandbox settings before M1-P05 — the current parser
+ * treats unknown top-level tables as inert. That cutover MUST add the
+ * `[sandbox]` settings it starts to enforce to this projection; the `null`
+ * marker below is the reviewed "no sandbox policy exists yet" state.
+ */
+export interface ControlPolicySettings {
+	engine: { piDurable: string; maxTurns: number; retryLimit: number };
+	routing: Record<RoleName, { provider: string; modelId: string; thinkingLevel?: RoleConfig["thinkingLevel"] }>;
+	verification: {
+		timeoutSec: number;
+		enforceTargetPaths: boolean;
+		skepticSecondPass: boolean;
+		jevVerifierShadow: boolean;
+		jevFailureTriageShadow: boolean;
+	};
+	delivery: { mode: DeliveryConfig["mode"] };
+	admission: { waveUsdWarn: number; maxConsecutiveErrors: number; maxSleepCycles: number };
+	paths: { prd: string; specs: string };
+	sandbox: null;
+}
+
+/** Canonical identity projection of the EFFECTIVE config (never raw file bytes). */
+export function controlPolicySettings(config: KitConfig): ControlPolicySettings {
+	const routing = {} as ControlPolicySettings["routing"];
+	for (const role of ROLES) {
+		const entry = config.roles[role];
+		routing[role] = {
+			provider: entry.provider,
+			modelId: entry.modelId,
+			...(entry.thinkingLevel !== undefined ? { thinkingLevel: entry.thinkingLevel } : {}),
+		};
+	}
+	return {
+		engine: {
+			piDurable: config.engine.piDurable,
+			maxTurns: config.engine.maxTurns,
+			retryLimit: config.engine.retryLimit,
+		},
+		routing,
+		verification: {
+			timeoutSec: config.gates.timeoutSec,
+			enforceTargetPaths: config.gates.enforceTargetPaths,
+			skepticSecondPass: config.gates.skepticSecondPass,
+			jevVerifierShadow: config.gates.jevVerifierShadow,
+			jevFailureTriageShadow: config.gates.jevFailureTriageShadow,
+		},
+		delivery: { mode: config.delivery.mode },
+		admission: {
+			waveUsdWarn: config.budgets.waveUsdWarn,
+			maxConsecutiveErrors: config.budgets.maxConsecutiveErrors,
+			maxSleepCycles: config.budgets.maxSleepCycles,
+		},
+		paths: { prd: config.paths.prd, specs: config.paths.specs },
+		sandbox: null,
+	};
+}
+
 function orStr(v: unknown, fallback: string, what: string): string {
 	if (v === undefined || v === null) return fallback;
 	if (typeof v !== "string" || !v.trim()) throw new ConfigError(`[engine] ${what}: must be a non-empty string`);

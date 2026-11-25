@@ -27,6 +27,7 @@ import type { ReadWorkspace } from "./engine/workspace.ts";
 import { recipeBundleFromTree } from "./engine/gates.ts";
 import { resolveTree } from "./util/git-objects.ts";
 import { loadPrd, runPlan, PlanParseError } from "./engine/planner.ts";
+import { reviewBindingRefusal } from "./engine/plans.ts";
 import { runWaves } from "./engine/waves.ts";
 import type { ProgressEvent } from "./engine/driver-events.ts";
 import { renderInspectPanel } from "./views/inspect.ts";
@@ -494,8 +495,16 @@ async function cmdVerify(argv: string[]): Promise<void> {
 		const state = await readSessionState(kit.loop.harness);
 		const task = state.router.tasks.find((t) => t.id === taskId);
 		if (!task) throw new Error(`task "${taskId}" is not in the router doc — see router.md`);
-		const revision = state.router.identity?.planRevision;
-		if (!revision) throw new Error(`task "${taskId}" has no reviewed plan revision; replan before verification`);
+		const identity = state.router.identity;
+		const revision = identity?.planRevision;
+		if (!identity || !revision) throw new Error(`task "${taskId}" has no reviewed plan revision; replan before verification`);
+		// M1-P01 step (d): a one-off verify is a paid submission under the CURRENT
+		// verifier policy. The reviewed identity must still bind HEAD, the actual
+		// PRD and every reviewed control byte/effective setting BEFORE the
+		// submission is admitted or any model call starts; otherwise a changed
+		// eval byte or verification policy would be executed under an old review.
+		const bindingRefusal = await reviewBindingRefusal(root, identity, kit.loop.config);
+		if (bindingRefusal) throw new Error(`${bindingRefusal} — verify would dispatch a paid submission`);
 		const receipts = await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
 		const checkpoint = receipts?.events.filter((event) => event.kind === "checkpoint"
 			&& event.value.planRevision === revision && event.value.taskId === taskId
@@ -505,7 +514,7 @@ async function cmdVerify(argv: string[]): Promise<void> {
 		}
 		const startTree = await resolveTree(root, checkpoint.value.startTree);
 		const candidateTree = await resolveTree(root, checkpoint.value.candidate);
-		const controls = createTaskControls({ root, targetPaths: task.targetPaths });
+		const controls = createTaskControls({ root, targetPaths: task.targetPaths, prdPath: identity.prdPath });
 		frozenView = await materializeRead({ root, oid: candidateTree }, controls);
 		const executionContext = await createTaskReadContext({
 			controlPaths: kit.loop.paths,

@@ -69,22 +69,51 @@ shape without widening the seam.)
   `baseCommit` (git HEAD at planning; `null` when the project has no commit
   yet — uncommitted operator edits are excluded from the base), `baseBranch`
   (`null` when detached), normalized project-relative `prdPath`, `prdSha256`,
-  and optional `controlsSha256` (ABSENT when no approved control input exists
-  at all — distinct from a digest over empty controls)
+  and optional `controlsSha256` (ABSENT only when no reviewed control input
+  exists at all — distinct from a digest over empty controls)
 - `canonicalJson`/`canonicalSha256` — recursive key-sorted, order-preserving
   arrays, UTF-8 JSON, SHA256; `planDefinitionSha256` hashes exactly the
   immutable planner fields (id/title/spec/dependsOn/acceptance/targetPaths/
   priority) and excludes status/counter/receipt fields by construction
-- `buildPlanIdentity(root, prdPath, prdText, tasks)` — reads all identity
-  inputs (git, files) BEFORE the plan commit, so a failure leaves the previous
-  plan untouched; `ArchivedPlanRef` is the reference stored for a replaced
-  plan (references only, never receipts; a legacy v1 plan has no identity, so
-  replacing one archives nothing)
+- `buildPlanIdentity(root, prdPath, prdText, tasks, controls, base?)` — mints
+  the identity from the control bundle captured BEFORE disclosure (no control
+  re-read after the planning conversation). `base` is the `{commit,branch}`
+  captured with that bundle, so a HEAD move during the planning conversation
+  cannot rebind the identity to a different tree. Git reads happen before the
+  plan commit, so a failure leaves the previous plan untouched;
+  `ArchivedPlanRef` is the reference stored for a replaced plan (references
+  only, never receipts; a legacy v1 plan has no identity, so replacing one
+  archives nothing)
 - `normalizeRelPath` — project-relative POSIX normalization, traversal refused
-- `loadPlanControls`/`controlsSha256` — approved gate-gap remediations
-  (`.orch/gate-remediations.json`; absent/invalid file hashes as null, an
-  approved-empty list as `[]`) plus content digests of PROMPT.md,
-  `evals/checklist.md`, `evals/recipes.toml`, and `evals/recipes.auto.toml`
+- `loadPlanControls(root, {prdPath?, prdText?, config?})` — captures the reviewed
+  bundle ONCE under one canonical root and one `SafeReadBudget`: every regular
+  file under `evals/**` (byte digests, sorted; `null` = absent directory,
+  `[]` = present and empty), `PROMPT.md`, approved gate-gap remediations
+  (`.orch/gate-remediations.json`; `null` = absent, `[]` = approved-empty),
+  the actual configured/`--prd` file (text digest matching `prdSha256`), and
+  the effective policy settings from `controlPolicySettings` (verification,
+  delivery, routing, engine/admission policy; `sandbox: null` until M1-P05
+  adds effective sandbox settings). The session ceiling is excluded.
+- `readRemediations(root)` — the same no-follow read for callers that only need
+  the approved remediation list (`null` = absent)
+- `controlsDigest(controls)`/`controlsSha256(root, options)` — canonical SHA256
+  over a captured bundle / a fresh capture; `undefined` only when no input exists
+- `legacyControlsDigest(controls)` — the pre-step-(d) five-field digest shape,
+  used only to name a migration instead of claiming a false on-disk edit
+- `controlsBindingRefusal(identity, controls)` — shared current-vs-pinned
+  comparison; distinguishes legacy-shaped digests from real control drift
+- `reviewedBaseTreeRefusal(root, baseCommit, controls)` — the reviewed-vs-
+  executed check: every `evals/**` regular file and `PROMPT.md` that exists in
+  the reviewed base tree must exist in the capture with identical bytes. The
+  driver executes recipes and PROMPT.md from that tree, so an uncommitted edit
+  or delete refuses planning before the PRD is disclosed. A genuinely new
+  untracked capture cannot execute from the base tree and is recorded as
+  reviewed-but-not-executable until committed and replanned.
+- `reviewBindingRefusal(root, identity, config)` — validates the pinned identity
+  at new-grant, resume, fresh-wave/retry and one-off verify boundaries: HEAD,
+  the actual PRD digest, and the full controls digest must still match; returns
+  a refusal string (no side effects) or `undefined`. `budgets.sessionUsd` alone
+  is not drift. Reconciliation paths keep using their pinned receipts instead.
 
 The kit-defined LoopGuardDoc is NOT an SDK export and does not live here —
 harness.ts defines it on top of `defineDoc` (see its section below). Tests
@@ -95,9 +124,9 @@ subpath types included); they never import the SDK packages directly.
 
 **M0-P14 active serial-driver path.** The existing serial selector/gate flow now uses these helpers to create and verify one immutable candidate at a time. They are host-side Git/workspace plumbing, not an execution sandbox or OS-containment boundary. No caller may inspect/copy a dirty operator checkout into a task.
 
-- `openTask({root, oid}, identity, id, {scopeBaseOid?})` resolves a full commit/tree OID and materializes a private writable projection under `.orch/work/<revision>/<task>/<lease>/`; `oid` is this wave's start tree and `scopeBaseOid` is the unchanged integration parent used for whole-candidate scope. It never uses the operator index, working tree, or a Git worktree. The workspace contains no `.git`. It pins the parent tree beneath `refs/kit/...` (not `refs/heads`) and returns an opaque owned lease plus the exact projected and deliberately excluded parent paths. `resumeTask(..., leaseId)` reattaches only a checkpointed lease and reports a previously pinned candidate; it never recaptures the operator checkout.
-- `createTaskControls({root, targetPaths, deniedPaths?, readOnlyPaths?})` validates immutable project-relative controls. `matchesPath` is the shared in-process matcher: exact literal file, trailing-`/` directory prefix, `*` within one component, `**` across components. It never invokes a shell. Empty target list means all *admissible* paths; reserved/denied paths always win. `.orch/**`, secrets, `.git/**` and paper-trail files are hidden; `evals/**`, `PROMPT.md`, Git/delivery controls and optional configured read-only paths are projected read-only and cannot be admitted as changes. `classifyProjectPath` from `src/hygiene.ts` participates in admission.
-- `materializeRead({root, oid}, controls)` resolves an immutable tree, makes only safe regular-file entries read-only in a private view, pins the tree, and reports the paths projected/excluded. It does not expose Git metadata or private `.orch` state.
+- `openTask({root, oid}, identity, id, {scopeBaseOid?})` resolves a full commit/tree OID and materializes a private writable projection under `.orch/work/<revision>/<task>/<lease>/`; `oid` is this wave's start tree and `scopeBaseOid` is the unchanged integration parent used for whole-candidate scope. It never uses the operator index, working tree, or a Git worktree. The workspace contains no `.git`. It pins the parent tree beneath `refs/kit/...` (not `refs/heads`) and returns an opaque owned lease plus the exact projected and deliberately excluded parent paths. The identity's `prdPath` is reserved read-only in this projection, and `fenceWorkspace` re-binds it into candidate admission even if a caller omits it. `resumeTask(..., leaseId)` reattaches only a checkpointed lease and reports a previously pinned candidate; it never recaptures the operator checkout, and applies the same PRD reservation.
+- `createTaskControls({root, targetPaths, deniedPaths?, readOnlyPaths?, prdPath?})` validates immutable project-relative controls. `matchesPath` is the shared in-process matcher: exact literal file, trailing-`/` directory prefix, `*` within one component, `**` across components. It never invokes a shell. Empty target list means all *admissible* paths; reserved/denied paths always win. `.orch/**`, secrets, `.git/**` and paper-trail files are hidden; `evals/**`, `PROMPT.md`, Git/delivery controls, optional configured read-only paths and the identity's literal `prdPath` are projected read-only and cannot be admitted as changes — even when the PRD file is absent, and even for an empty or `docs/**` target list. `classifyProjectPath` from `src/hygiene.ts` participates in admission.
+- `materializeRead({root, oid}, controls)` resolves an immutable tree, makes only safe regular-file entries read-only in a private view, pins the tree, and reports the paths projected/excluded. It does not expose Git metadata or private `.orch` state; the caller passes the same PRD-reserving controls, so the read-only/verify view can still read the PRD while candidate admission still refuses changes to it.
 - The host must first fence every writer, then call `fenceWorkspace(lease, controls)`. This is an explicit host assertion, not a worker/process-kill implementation. `freeze(fencedWorkspace)` starts from the wave's pinned start tree in a unique `GIT_INDEX_FILE` under `.orch/work`, hashes exact bytes with `--no-filters`, applies NUL-delimited index records, writes a tree, checks admissible paths against both the whole integration-parent→candidate scope and the start-of-wave→candidate progress delta, pins the result, and returns a checked tree OID plus exact per-wave create/modify/delete/mode changes. A malformed path, unsupported object, symlink, hard link, limit, or failed Git command throws; there is no partial/empty fallback.
 - `discard(ownedLease)` accepts only an opaque handle created by this module. It has no caller-provided root/path and removes only that lease's private directory; it never resets/cleans/restores a checkout or deletes pinned objects. Tree helpers in `src/util/git-objects.ts` use full OIDs, checked subprocess results, byte-capped reads, private throwaway indexes, and private `refs/kit/...` pins. No branch is published for `delivery=none`.
 - `diffTrees` / `diffTaskTrees` compare immutable trees, including binary object IDs and executable modes; they do not stage/display-diff a worktree.
@@ -424,9 +453,12 @@ inputs or restore targets. Successful `none` mode leaves the accepted ref at
 
 A one-off `verify --task` looks up the current revision's newest retained
 candidate and opens a read-only `TaskReadContext`. With no retained candidate it
-refuses; it never verifies the operator checkout. Checkpoint, receipt-state,
-planRevision, and candidate-artifact filenames are additive to status/readout
-rows. This remains trusted-project host execution, not an OS sandbox.
+refuses; it never verifies the operator checkout. Before the paid submission it
+runs `reviewBindingRefusal` against the current identity, so a changed eval
+byte or verification policy refuses with zero model calls and no pass receipt.
+Checkpoint, receipt-state, planRevision, and candidate-artifact filenames are
+additive to status/readout rows. This remains trusted-project host execution,
+not an OS sandbox.
 
 ### Why plain code phases instead of hooks (both documented)
 
@@ -625,23 +657,39 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   project value after that point; a missing/relative/non-normalized root is a
   typed `HostProfileError`, never a guess.
 
-## Host read boundary (M1-P01 step c) — `src/util/safe-read.ts` + call sites
+## Host read boundary (M1-P01 steps c–d) — `src/util/safe-read.ts` + call sites
 
 - `readSafeText` / `openSafeFile` / `listSafeDirectory` / `walkSafeFiles` read
   root-relative through the Linux `/proc/self/fd` directory-FD walk
   (`O_NOFOLLOW`, `O_DIRECTORY`, `O_NONBLOCK` on the leaf). Genuine ENOENT is
-  `absent`; EACCES/ELOOP/ENOTDIR, a symlink at any component, a non-regular
-  leaf, malformed text, a capped read or an unavailable primitive is `refused`.
+  `absent`; EACCES/ELOOP/ENOTDIR, a symlink at any component, a hard-linked
+  regular file (`nlink > 1`, same rule as §2 projection), a non-regular leaf,
+  malformed text, a capped read or an unavailable primitive is `refused`.
   There is no `realpath`-then-open, PATH, cwd or project-env selector.
 - Wired in step (c): `src/engine/planner.ts` (`loadPrd` — configured/`--prd`
-  path), `src/engine/plans.ts` (`loadPlanControls` / reviewed control inputs),
-  `src/engine/gates.ts` (`loadRecipesSafe` / `loadRecipeFileSafe`, used by the
-  gate-time recipe read in `runGates`), `ui/server/sources.ts`
-  (`readProjectSources` incl. the `.orch/status.json` PRD-path side-car) and
-  `ui/server/diff.ts` (patch/stats side-cars, `readArtifact`, status reads).
-  Artifact listing (`artifactList`) and the `?download=1` route still stat/read
-  through plain fs calls (metadata only / outside P01 strict paths).
+  path), `src/engine/gates.ts` (`loadRecipesSafe` / `loadRecipeFileSafe`, the
+  non-taskContext/UI/test fallback; driver wave gates use
+  `recipeBundleFromTree`/`recipesFromBundle` from the immutable start tree),
+  `ui/server/sources.ts` (`readProjectSources` incl. the
+  `.orch/status.json` PRD-path side-car) and `ui/server/diff.ts` (patch/stats
+  side-cars, `readArtifact`, status reads).
+- Wired in step (d): `src/engine/plans.ts` reads the whole reviewed bundle
+  (`evals/**` walk, `PROMPT.md`, `.orch/gate-remediations.json`, the actual PRD,
+  effective config settings) under one `SafeReadBudget`; `src/engine/planner.ts`
+  captures it and the base commit/branch before disclosure, refuses a committed
+  control byte that differs from the base tree (`reviewedBaseTreeRefusal`), and
+  uses the capture for the plan identity; the same identity is validated by
+  `reviewBindingRefusal` at new grant (`approveGrant`), resumed model stages
+  (`runWaves`), fresh waves/retries (`driveTaskWaves`), a one-off `verify --task`
+  (`cmdVerify`) and new human retry/accept decisions (`runResolution`). The
+  identity `prdPath` is reserved read-only in task projection/candidate
+  admission (`createTaskControls({prdPath})`, `openTask`, `resumeTask`).
+  Artifact listing (`artifactList`), `ui/server/server.ts:312–328,359–381`
+  (`?download=1`) and `ui/server/sse.ts:99–120,261` SSE fingerprints still
+  stat/read through plain fs calls (metadata only / outside P01 strict paths).
 - `parseConfig(raw, root)` is the pure project-config parser.
+  `controlPolicySettings(config)` is the canonical identity projection of the
+  EFFECTIVE settings (session ceiling excluded; `sandbox: null` until M1-P05).
   The synchronous `loadConfig` keeps its raw read for callers outside P01's
   strict paths (`src/engine/inspector.ts`, `ui/server/readout.ts`,
   `src/adoption/cli.ts`). `loadRecipes`/`loadRecipeFile` likewise remain for
@@ -650,8 +698,11 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   `docs/engineering-plan/evidence/M1-P01.md`): trusted CLI/UI/node/git/gh
   resolution and launch (`ui/server/jobs.ts` + `job-runner.mjs`, the
   `KIT_UI_CLI_BIN` test seam, `src/hygiene.ts`, `ui/server/demo.ts`,
-  `src/engine/recipe-runner.ts`), `.orch/wave-log.jsonl` tail reads,
-  `src/engine/handoffs.ts` and `src/engine/inspector.ts` reads.
+  `src/engine/recipe-runner.ts`, `src/util/exec.ts` — the last two are absent
+  from both P01 and P05 strict target lists), `.orch/wave-log.jsonl` tail reads,
+  `ui/server/sse.ts` `.orch`/jobs metadata fingerprints, `src/engine/handoffs.ts`,
+  `src/engine/inspector.ts`, the sync config callers, artifact listing and the
+  `ui/server/server.ts` download routes.
 
 ## src/views/*.ts + src/cli.ts
 
