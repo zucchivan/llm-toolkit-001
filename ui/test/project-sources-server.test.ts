@@ -6,7 +6,7 @@
  * not-a-mutation guarantee: there is no POST path for sources at all.
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -237,5 +237,75 @@ describe("GET /api/project/sources (M5-a read-only viewers)", () => {
 			body: JSON.stringify({ config: "overwrite" }),
 		});
 		expect(posted.status).toBe(405);
+	});
+});
+
+describe("M1-P01: project sources are read through the no-follow boundary", () => {
+	const servers: { shutdown(): Promise<void> }[] = [];
+	afterAll(async () => {
+		for (const s of servers) await s.shutdown().catch(() => {});
+	});
+
+	it("a symlinked PRD is REFUSED with no bytes, never served from the link target or reported absent-only", async () => {
+		const root = await bakeConfiguredDemo();
+		const outside = await mkdtemp(join(tmpdir(), "ui-src-outside-"));
+		await writeFile(join(outside, "prd.md"), "HOST SECRET PRD BYTES\n", "utf8");
+		await rm(join(root, "docs", "prd.md"), { force: true });
+		await symlink(join(outside, "prd.md"), join(root, "docs", "prd.md"));
+		const s = await boot(root);
+		servers.push(s);
+		const res = await fetch(`${s.base}/api/project/sources`, { headers: { cookie: s.cookie } });
+		expect(res.status).toBe(200);
+		const raw = await res.text();
+		expect(raw).not.toContain("HOST SECRET PRD BYTES");
+		const payload = JSON.parse(raw) as { prd: { exists: boolean; text?: string; refused?: { code: string } }; config: { parseError?: string } };
+		expect(payload.prd.exists).toBe(false);
+		expect(payload.prd.text).toBeUndefined();
+		expect(payload.prd.refused?.code).toBe("symlink");
+		expect(payload.config.parseError).toBeUndefined();
+		await rm(outside, { recursive: true, force: true });
+	});
+
+	it("a config PRD path that escapes the root is refused before any read", async () => {
+		const root = await bakeConfiguredDemo();
+		const outside = join(root, "..", `ui-src-escape-${process.pid}.md`);
+		await writeFile(outside, "HOST SECRET ESCAPE BYTES\n", "utf8");
+		await writeFile(join(root, ".orch", "config.toml"), readFileSync(join(root, ".orch", "config.toml"), "utf8").replace(`prd = "docs/prd.md"`, `prd = "../${outside.split("/").pop()}"`), "utf8");
+		const s = await boot(root);
+		servers.push(s);
+		const res = await fetch(`${s.base}/api/project/sources`, { headers: { cookie: s.cookie } });
+		const raw = await res.text();
+		expect(raw).not.toContain("HOST SECRET ESCAPE BYTES");
+		const payload = JSON.parse(raw) as { prd: { path: string; exists: boolean; text?: string; refused?: { code: string } } };
+		expect(payload.prd.path).toContain("..");
+		expect(payload.prd.exists).toBe(false);
+		expect(payload.prd.refused?.code).toBe("unsafe-path");
+		await rm(outside, { force: true });
+	});
+
+	it("a symlinked `.orch` ancestor refuses the config and status reads (no host bytes, no forged PRD path)", async () => {
+		const root = await mkdtemp(join(tmpdir(), "ui-src-orch-link-"));
+		const outside = await mkdtemp(join(tmpdir(), "ui-src-orch-outside-"));
+		await mkdir(join(outside, ".orch-placeholder"), { recursive: true });
+		await writeFile(join(outside, "config.toml"), `[paths]\nprd = "docs/outside.md"\n[roles.planner]\nprovider = "faux"\nmodelId = "kit-planner"\n`, "utf8");
+		await writeFile(join(outside, "status.json"), JSON.stringify({ prdPath: "docs/outside.md" }), "utf8");
+		await mkdir(join(root, ".orch"), { recursive: true });
+		await rm(join(root, ".orch"), { recursive: true, force: true });
+		await symlink(outside, join(root, ".orch"));
+		const s = await boot(root);
+		servers.push(s);
+		const payload = (await (await fetch(`${s.base}/api/project/sources`, { headers: { cookie: s.cookie } })).json()) as {
+			config: { exists: boolean; text?: string; parseError?: string; refused?: { code: string } };
+			prd: { path: string; exists: boolean };
+		};
+		expect(payload.config.exists).toBe(false);
+		expect(payload.config.text).toBeUndefined();
+		expect(payload.config.refused?.code).toBe("symlink");
+		expect(payload.config.parseError).toMatch(/refused/);
+		// status.json is unreachable too: the PRD path stays the engine default,
+		// never the value read from the link target.
+		expect(payload.prd.path).toBe("docs/prd.md");
+		expect(payload.prd.exists).toBe(false);
+		await rm(outside, { recursive: true, force: true });
 	});
 });

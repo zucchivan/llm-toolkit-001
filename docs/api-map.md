@@ -619,6 +619,39 @@ rows. This remains trusted-project host execution, not an OS sandbox.
   ported, query/fragment, malformed, and multi-path URLs and returns one
   canonical `https://github.com/owner/repository.git` origin plus the repository
   identity used to validate PR-host reports.
+- `resolveCanonicalProjectRoot(input)` (M1-P01 step c) canonicalizes the
+  operator-selected project root ONCE (`realpath` + canonical-absolute check).
+  Every later host read is root-relative, so no caller re-resolves a path from a
+  project value after that point; a missing/relative/non-normalized root is a
+  typed `HostProfileError`, never a guess.
+
+## Host read boundary (M1-P01 step c) — `src/util/safe-read.ts` + call sites
+
+- `readSafeText` / `openSafeFile` / `listSafeDirectory` / `walkSafeFiles` read
+  root-relative through the Linux `/proc/self/fd` directory-FD walk
+  (`O_NOFOLLOW`, `O_DIRECTORY`, `O_NONBLOCK` on the leaf). Genuine ENOENT is
+  `absent`; EACCES/ELOOP/ENOTDIR, a symlink at any component, a non-regular
+  leaf, malformed text, a capped read or an unavailable primitive is `refused`.
+  There is no `realpath`-then-open, PATH, cwd or project-env selector.
+- Wired in step (c): `src/engine/planner.ts` (`loadPrd` — configured/`--prd`
+  path), `src/engine/plans.ts` (`loadPlanControls` / reviewed control inputs),
+  `src/engine/gates.ts` (`loadRecipesSafe` / `loadRecipeFileSafe`, used by the
+  gate-time recipe read in `runGates`), `ui/server/sources.ts`
+  (`readProjectSources` incl. the `.orch/status.json` PRD-path side-car) and
+  `ui/server/diff.ts` (patch/stats side-cars, `readArtifact`, status reads).
+  Artifact listing (`artifactList`) and the `?download=1` route still stat/read
+  through plain fs calls (metadata only / outside P01 strict paths).
+- `parseConfig(raw, root)` is the pure project-config parser.
+  The synchronous `loadConfig` keeps its raw read for callers outside P01's
+  strict paths (`src/engine/inspector.ts`, `ui/server/readout.ts`,
+  `src/adoption/cli.ts`). `loadRecipes`/`loadRecipeFile` likewise remain for
+  `src/adoption/gaps.ts` and existing tests.
+- NOT wired (a specification amendment is required; recorded in
+  `docs/engineering-plan/evidence/M1-P01.md`): trusted CLI/UI/node/git/gh
+  resolution and launch (`ui/server/jobs.ts` + `job-runner.mjs`, the
+  `KIT_UI_CLI_BIN` test seam, `src/hygiene.ts`, `ui/server/demo.ts`,
+  `src/engine/recipe-runner.ts`), `.orch/wave-log.jsonl` tail reads,
+  `src/engine/handoffs.ts` and `src/engine/inspector.ts` reads.
 
 ## src/views/*.ts + src/cli.ts
 

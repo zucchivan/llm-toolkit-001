@@ -32,9 +32,10 @@
  * given retroactive ones.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { headBranch, headCommit, shasum } from "../util/git.ts";
+import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
+import { SafeReadBudget, readSafeText } from "../util/safe-read.ts";
 import type { RouterTask } from "./infos.ts";
 import type { Remediation } from "../adoption/types.ts";
 
@@ -164,28 +165,32 @@ export interface PlanControls {
 	recipesAutoSha256: Digest | null;
 }
 
-async function reviewedFile(root: string, rel: string): Promise<string | null> {
-	const file = join(root, rel);
-	let info;
-	try { info = await lstat(file); }
-	catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-		throw error;
-	}
-	if (!info.isFile() || info.isSymbolicLink()) throw new Error(`review control is not a regular file: ${rel}`);
-	const actual = await realpath(file);
-	if (relative(await realpath(root), actual).startsWith("..")) throw new Error(`review control escapes project: ${rel}`);
-	return readFile(file, "utf8");
+/**
+ * Read one reviewed control root-relative through the no-follow host reader.
+ * `null` is reserved for a genuine ENOENT; a symlink, non-regular file,
+ * unreadable/oversized file or unavailable primitive refuses the whole load.
+ * `root` is already canonical (resolved once by `loadPlanControls`).
+ */
+async function reviewedFile(root: string, rel: string, budget: SafeReadBudget): Promise<string | null> {
+	const read = await readSafeText({ root, path: rel, budget });
+	if (read.kind === "ok") return read.value;
+	if (read.kind === "absent") return null;
+	const notRegular = read.code === "symlink" || read.code === "not-regular";
+	throw new Error(
+		`${notRegular ? "review control is not a regular file" : "review control is unreadable"}: ${rel} (${read.code}: ${read.message})`,
+	);
 }
 
-async function fileSha256(root: string, rel: string): Promise<Digest | null> {
-	const value = await reviewedFile(root, rel);
+async function fileSha256(root: string, rel: string, budget: SafeReadBudget): Promise<Digest | null> {
+	const value = await reviewedFile(root, rel, budget);
 	return value === null ? null : shasum(value);
 }
 
 /** Read the approved controls inputs (no writes; absent files are null, not errors). */
-export async function loadPlanControls(root: string): Promise<PlanControls> {
-	const raw = await reviewedFile(root, ".orch/gate-remediations.json");
+export async function loadPlanControls(rootInput: string): Promise<PlanControls> {
+	const root = await resolveCanonicalProjectRoot(rootInput);
+	const budget = new SafeReadBudget();
+	const raw = await reviewedFile(root, ".orch/gate-remediations.json", budget);
 	let remediations: Remediation[] | null = null;
 	if (raw !== null) {
 		const stored: unknown = JSON.parse(raw);
@@ -196,10 +201,10 @@ export async function loadPlanControls(root: string): Promise<PlanControls> {
 	}
 	return {
 		remediations,
-		promptSha256: await fileSha256(root, "PROMPT.md"),
-		checklistSha256: await fileSha256(root, "evals/checklist.md"),
-		recipesSha256: await fileSha256(root, "evals/recipes.toml"),
-		recipesAutoSha256: await fileSha256(root, "evals/recipes.auto.toml"),
+		promptSha256: await fileSha256(root, "PROMPT.md", budget),
+		checklistSha256: await fileSha256(root, "evals/checklist.md", budget),
+		recipesSha256: await fileSha256(root, "evals/recipes.toml", budget),
+		recipesAutoSha256: await fileSha256(root, "evals/recipes.auto.toml", budget),
 	};
 }
 

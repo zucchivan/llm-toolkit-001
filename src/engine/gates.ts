@@ -19,6 +19,8 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { changedFilesVsTree, isScopeViolation } from "../util/git.ts";
+import { SafeReadBudget, readSafeText } from "../util/safe-read.ts";
+import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
 import { preflightRecipes, runRecipe, recipeArgv } from "./recipe-runner.ts";
 import type { ExecArgvCapability, RecipeRunOutcome } from "./recipe-runner.ts";
 import type { LoopAndLock, ProjectPaths } from "./harness.ts";
@@ -43,6 +45,37 @@ export function loadRecipes(paths: ProjectPaths): GateFile {
 		for (const recipe of loadRecipeFile(paths.root, file)) byName.set(recipe.name, recipe);
 	}
 	return { recipes: [...byName.values()] };
+}
+
+/**
+ * M1-P01 step (c): the gate-time recipe read. Both files are read root-relative
+ * through the no-follow, capped host reader under one shared budget. A recipe
+ * file that is a symlink, outside the root, unreadable or past the §2 cap
+ * refuses the whole load (the gate reports an invalid recipes check) instead of
+ * executing recipes parsed from a redirected file.
+ */
+export async function loadRecipesSafe(paths: ProjectPaths, canonicalRoot?: string): Promise<GateFile> {
+	const root = canonicalRoot ?? await resolveCanonicalProjectRoot(paths.root);
+	const budget = new SafeReadBudget();
+	const byName = new Map<string, Recipe>();
+	for (const file of ["recipes.auto.toml", "recipes.toml"]) {
+		for (const recipe of await loadRecipeFileSafe(root, file, budget)) byName.set(recipe.name, recipe);
+	}
+	return { recipes: [...byName.values()] };
+}
+
+/** No-follow variant of `loadRecipeFile`; `absent` stays a defined empty gate set. */
+export async function loadRecipeFileSafe(root: string, file: string, budget?: SafeReadBudget): Promise<Recipe[]> {
+	const read = await readSafeText({ root, path: `evals/${file}`, budget });
+	if (read.kind === "absent") return []; // empty gates = scope check only
+	if (read.kind === "refused") {
+		throw new Error(`evals/${file} is unreadable/invalid: ${read.message} (${read.code})`);
+	}
+	try {
+		return parseRecipeText(read.value, file);
+	} catch (err) {
+		throw new Error(`evals/${file} is unreadable/invalid: ${(err as Error).message}`);
+	}
 }
 
 export function loadRecipeFile(root: string, file: string): Recipe[] {
@@ -256,7 +289,7 @@ export async function runGates(
 	let recipes: Recipe[] = [];
 	let loadError: string | undefined;
 	try {
-		recipes = taskContext ? recipesFromBundle(taskContext.recipeBundle) : loadRecipes(paths).recipes;
+		recipes = taskContext ? recipesFromBundle(taskContext.recipeBundle) : (await loadRecipesSafe(paths)).recipes;
 	} catch (err) {
 		loadError = (err as Error).message;
 	}

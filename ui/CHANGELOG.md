@@ -4,6 +4,27 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## Unreleased — M1-P01 step (c): no-follow source and artifact reads
+
+Security-boundary change in the server read paths; no UI component, package or
+lockfile change, so no version bump in this packet (the bump lands with the next
+UI milestone release).
+
+- **Source viewers stop following links** — `/api/project/sources` now resolves
+  the project root once and reads `.orch/config.toml`, the PRD path, PROMPT.md,
+  `evals/recipes.toml` and the `.orch/status.json` PRD-path side-car through the
+  kit's no-follow, capped host reader. A symlinked leaf or ancestor (including a
+  symlinked `.orch`), an escaping/absolute configured PRD path, a non-regular
+  file or a file past the 32 MiB §2 cap is reported as
+  `refused:{code,message}` with no `text`; genuine absence stays
+  `exists:false` with no `refused`. The recipes verdict still comes from the
+  engine's own parser, now over the same no-follow read.
+- **Artifact reads stop following links** — the task diff patch/stats side-cars
+  and `GET /api/artifacts/:name` are read root-relative through the same
+  boundary; a symlinked artifact is `404` and never serves the link target's
+  bytes. The `?download=1` stream and the artifact listing still use plain fs
+  reads (metadata only / outside the packet's strict paths).
+
 ## 0.13.0 — M0-P15: render observed receipts; stop diffing the operator checkout
 
 The UI now renders what the M0-P14 core OBSERVED instead of deriving outcomes

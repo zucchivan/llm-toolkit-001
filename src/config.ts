@@ -107,20 +107,33 @@ function orBool(v: unknown, fallback: boolean, what: string): boolean {
 	return v;
 }
 
+/** The one "no config" message; the safe-read boundary and this loader share it. */
+export function missingConfigMessage(file: string): string {
+	return `no config at ${file} — run "llm-toolkit-001 init ." in the project first (or point at the repo root)`;
+}
+
 /**
  * Parse and validate the project config at `<root>/.orch/config.toml`.
  * Missing file: throw (every project `init` scaffolds one). Unknown tables are
  * ignored (additive config), unknown fields inside known tables error.
+ *
+ * This synchronous entry point remains for host readers that are outside the
+ * M1-P01 strict target paths (`src/engine/inspector.ts`,
+ * `src/adoption/cli.ts`); `ui/server/sources.ts` and the M1 host-read boundary
+ * parse the same text through `parseConfig` after a no-follow read.
  */
 export function loadConfig(root: string, file = join(root, ".orch", "config.toml")): KitConfig {
 	let raw: string;
 	try {
 		raw = readFileSync(file, "utf8");
 	} catch {
-		throw new ConfigError(
-			`no config at ${file} — run "llm-toolkit-001 init ." in the project first (or point at the repo root)`,
-		);
+		throw new ConfigError(missingConfigMessage(file));
 	}
+	return parseConfig(raw, root);
+}
+
+/** Pure config parse: no filesystem read, so a trusted caller can reuse it. */
+export function parseConfig(raw: string, root: string): KitConfig {
 	let parsed: Record<string, unknown>;
 	try {
 		parsed = toml.parse(raw) as unknown as Record<string, unknown>;

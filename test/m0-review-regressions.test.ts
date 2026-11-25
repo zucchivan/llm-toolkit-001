@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { priceUsage } from "../src/util/budget.ts";
@@ -30,6 +30,31 @@ describe("reviewed input and valuation boundaries", () => {
     expect(() => normalizeRelPath(dir, "../outside")).toThrow(/safe project-relative/);
   });
 
+  it("refuses a symlinked ancestor, a non-regular leaf and a capped PRD without disclosing bytes", async () => {
+    const dir = await root();
+    const outside = await root();
+    await writeFile(join(outside, "prd.md"), "HOST SECRET BYTES", "utf8");
+    await symlink(outside, join(dir, "docs")); // directory alias: the ancestor walk must not follow it
+    const kit = { loop: { paths: { root: dir }, config: { paths: { prd: "docs/prd.md" } } } } as LoopAndLock;
+    const ancestor = await loadPrd(kit).catch((error: Error) => error);
+    expect(ancestor).toBeInstanceOf(Error);
+    expect((ancestor as Error).message).toMatch(/unsafe/);
+    expect((ancestor as Error).message).not.toContain("HOST SECRET BYTES");
+
+    const plain = await root();
+    await mkdir(join(plain, "docs"));
+    await mkdir(join(plain, "docs", "prd.md")); // a directory is not a PRD
+    const plainKit = { loop: { paths: { root: plain }, config: { paths: { prd: "docs/prd.md" } } } } as LoopAndLock;
+    await expect(loadPrd(plainKit)).rejects.toThrow(/unsafe/);
+
+    const big = await root();
+    await mkdir(join(big, "docs"));
+    await writeFile(join(big, "docs", "prd.md"), "", "utf8");
+    await truncate(join(big, "docs", "prd.md"), 32 * 1024 * 1024 + 1); // §2 per-file cap
+    const bigKit = { loop: { paths: { root: big }, config: { paths: { prd: "docs/prd.md" } } } } as LoopAndLock;
+    await expect(loadPrd(bigKit)).rejects.toThrow(/unsafe/);
+  });
+
   it("distinguishes absent from invalid, symlinked, and unreadable review controls", async () => {
     const dir = await root();
     await mkdir(join(dir, ".orch"));
@@ -39,6 +64,14 @@ describe("reviewed input and valuation boundaries", () => {
     await expect(controlsSha256(dir)).rejects.toThrow();
     await rm(file);
     await symlink("/etc/hosts", file);
+    await expect(controlsSha256(dir)).rejects.toThrow(/regular file/);
+  });
+
+  it("refuses review controls reached through a symlinked ancestor directory", async () => {
+    const dir = await root();
+    const outside = await root();
+    await writeFile(join(outside, "recipes.toml"), "[gate-x]\nargv = [\"true\"]\n", "utf8");
+    await symlink(outside, join(dir, "evals"));
     await expect(controlsSha256(dir)).rejects.toThrow(/regular file/);
   });
 });

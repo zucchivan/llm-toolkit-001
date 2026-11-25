@@ -45,7 +45,14 @@ what the next wave's gate step would throw; an absent file is the runner's
 defined "empty gates = scope check only" state, shown green). Same
 read-only promise, same static-file/no-lock discipline (a live run reads —
 never rewrites — either file), same 5 MiB cap and binary labeling, no new
-deps, no core seam change. Scope of **M5-slice-3** (0.7.0, this release):
+deps, no core seam change. **M1-P01 read boundary:** all four source views
+(and the `.orch/status.json` PRD path) are now read through the kit's
+canonical-root/root-relative no-follow reader: a symlinked file or ancestor
+(including a symlinked `.orch`), an escaping configured PRD path, a
+non-regular file or one past the kit's §2 cap is reported as
+`refused:{code,message}` with no text (never as plain absence), and the same
+boundary serves the diff patch/stats and artifact-preview reads.
+Scope of **M5-slice-3** (0.7.0, this release):
 safe stop for TERMINAL-started runs — the attached Stop affordance ships,
 gated behind a full process-identity verification (PRD §7.2.1): live pid,
 real working directory, and a command line that names this project's
