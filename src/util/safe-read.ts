@@ -50,6 +50,7 @@ export type SafeReadRefusalCode =
 	| "unsafe-path"
 	| "unsupported-platform"
 	| "symlink"
+	| "hardlink"
 	| "not-directory"
 	| "not-regular"
 	| "unreadable"
@@ -546,6 +547,19 @@ class PinnedDirectory implements SafeDirectory {
 					display,
 					`${display} is ${info.size} bytes; the per-file cap is ${SAFE_READ_LIMITS.maxFileBytes}`,
 					0,
+				);
+			}
+			// §2 rejects hard-linked regular files for projection/import; M1-P01
+			// step (d) applies the same rule to host control reads: an alias could
+			// otherwise name a same-owner host file outside the reviewed bundle.
+			// The check is on the opened inode; a later link does not redirect the
+			// pinned FD and cannot change which bytes this read returns.
+			if (info.nlink > 1) {
+				await handle.close().catch(() => undefined);
+				return refuse(
+					"hardlink",
+					display,
+					`${display} has ${info.nlink} hard links; host reads refuse hard-linked files`,
 				);
 			}
 			return { kind: "ok", value: new PinnedFile(handle, display, info.size) };

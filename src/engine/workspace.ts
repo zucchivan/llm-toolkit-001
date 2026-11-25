@@ -17,7 +17,7 @@ import {
 } from "../util/git-objects.ts";
 
 export type GitTreeSource = Readonly<{ root: string; oid: GitOid }>;
-type WorkspaceData = { root: string; parentTree: GitOid; scopeBaseTree: GitOid; privateRoot: string; projected: Map<string, { mode: "100644" | "100755"; oid: GitOid }>; excluded: string[]; refBase: string; disposed: boolean; frozen: boolean };
+type WorkspaceData = { root: string; parentTree: GitOid; scopeBaseTree: GitOid; privateRoot: string; projected: Map<string, { mode: "100644" | "100755"; oid: GitOid }>; excluded: string[]; refBase: string; prdPath: string; disposed: boolean; frozen: boolean };
 type ReadViewData = { root: string; privateRoot: string; projected: string[]; excluded: string[]; tree: GitOid; disposed: boolean };
 
 /** Opaque, host-created handle; its filesystem path is intentionally not an input to discard. */
@@ -309,9 +309,9 @@ export async function openTask(
 	const privateRoot = join(taskDir, leaseId);
 	await ensurePrivateDir(privateRoot);
 	assertInside(state, privateRoot);
-	const defaultControls = createTaskControls({ root, targetPaths: [] });
+	const defaultControls = createTaskControls({ root, targetPaths: [], prdPath: identity.prdPath });
 	const captured = await materializeTree(root, parentTree, defaultControls, privateRoot, false);
-	const data: WorkspaceData = { root, parentTree, scopeBaseTree, privateRoot, projected: captured.projected, excluded: captured.excluded, refBase, disposed: false, frozen: false };
+	const data: WorkspaceData = { root, parentTree, scopeBaseTree, privateRoot, projected: captured.projected, excluded: captured.excluded, refBase, prdPath: identity.prdPath, disposed: false, frozen: false };
 	const lease = Object.freeze({
 		id: leaseId,
 		kind: "task" as const,
@@ -356,7 +356,7 @@ export async function resumeTask(
 	if (pinnedParent !== parentTree) throw new Error(`checkpointed workspace parent pin is ${pinnedParent ?? "absent"}, not ${parentTree}`);
 	const candidate = await readRef(root, `${refBase}/candidate`);
 	if (!privateInfo && !candidate) throw new Error("checkpointed workspace and frozen candidate are both absent; recovery is required");
-	const defaultControls = createTaskControls({ root, targetPaths: [] });
+	const defaultControls = createTaskControls({ root, targetPaths: [], prdPath: identity.prdPath });
 	const entries = await readTreeEntries(root, parentTree);
 	const projected = new Map<string, { mode: "100644" | "100755"; oid: GitOid }>();
 	const excluded: string[] = [];
@@ -380,7 +380,7 @@ export async function resumeTask(
 		excludedParentPaths: Object.freeze(excluded.sort()),
 	});
 	const data: WorkspaceData = {
-		root, parentTree, scopeBaseTree, privateRoot, projected, excluded, refBase,
+		root, parentTree, scopeBaseTree, privateRoot, projected, excluded, refBase, prdPath: identity.prdPath,
 		disposed: false, frozen: candidate !== undefined,
 	};
 	owned.set(lease, data);
@@ -395,8 +395,10 @@ export function fenceWorkspace(lease: TaskWorkspaceLease, controls: TaskControls
 	const data = owned.get(lease);
 	if (!data || !("parentTree" in data) || data.disposed) throw new Error("cannot fence an unowned or disposed task workspace");
 	if (resolve(controls.root) !== data.root) throw new Error("task controls root does not match the workspace root");
-	// Validate targets/denies now, before any candidate filesystem scan.
-	const normalized = createTaskControls(controls);
+	// Validate targets/denies now, before any candidate filesystem scan. The
+	// identity PRD reservation is re-bound here even if a caller constructed a
+	// control bundle without it, so candidate admission can never reopen it.
+	const normalized = createTaskControls({ ...controls, prdPath: data.prdPath });
 	const token = Object.freeze({ lease, controls: normalized });
 	fenced.set(token, { data, controls: normalized });
 	return token;
@@ -609,6 +611,6 @@ export async function diffTaskTrees(source: GitTreeSource, before: string, after
 }
 
 /** Convenience constructor for controls bound to the Git source's canonical root. */
-export async function controlsForTree(source: GitTreeSource, targetPaths: readonly string[], deniedPaths: readonly string[] = []): Promise<TaskControls> {
-	return createTaskControls({ root: await canonicalRoot(source.root), targetPaths, deniedPaths });
+export async function controlsForTree(source: GitTreeSource, targetPaths: readonly string[], deniedPaths: readonly string[] = [], prdPath?: string): Promise<TaskControls> {
+	return createTaskControls({ root: await canonicalRoot(source.root), targetPaths, deniedPaths, ...(prdPath !== undefined ? { prdPath } : {}) });
 }

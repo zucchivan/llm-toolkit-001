@@ -9,6 +9,7 @@
  */
 import { join } from "node:path";
 import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
+import { headBranch, headCommit } from "../util/git.ts";
 import { readSafeText } from "../util/safe-read.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock, ToolRegistration } from "./harness.ts";
@@ -16,8 +17,7 @@ import { commitState, flushStatusSnapshot, readSessionState } from "./state.ts";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import type { RouterTask } from "./infos.ts";
 import { KIT_VERSION } from "../config.ts";
-import { readJson } from "../util/fsx.ts";
-import { buildPlanIdentity, normalizeRelPath, type ArchivedPlanRef } from "./plans.ts";
+import { buildPlanIdentity, loadPlanControls, normalizeRelPath, readRemediations, reviewedBaseTreeRefusal, type ArchivedPlanRef } from "./plans.ts";
 import { ReceiptsDoc } from "./receipts.ts";
 import { admitSubmission, BudgetAdmissionError } from "./model-admission.ts";
 import type { Remediation } from "../adoption/types.ts";
@@ -97,6 +97,24 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 	// UI seam A.1: flush { phase: "planning" } BEFORE the conversation starts so an
 	// attached UI sees the live planning state (and keeps the existing planned
 	// commit after the answer). Read-only side-car snapshot, no commit.
+	// M1-P01 step (d): capture the reviewed control bundle ONCE, BEFORE the PRD
+	// is disclosed. The identity recorded below is this capture — not whatever
+	// the working tree holds after the planning conversation — and the approved
+	// remediations used in the brief come from the same capture.
+	const root = kitAndLock.loop.paths.root;
+	const controls = await loadPlanControls(root, {
+		prdPath,
+		prdText,
+		config: kitAndLock.loop.config,
+	});
+	// The driver executes recipes and PROMPT.md from the reviewed BASE TREE, not
+	// from this working tree. Refuse BEFORE disclosure when a committed control
+	// was edited/deleted without a commit: otherwise the plan reviews one set of
+	// bytes and the wave executes another. The base is captured here too, so a
+	// HEAD move during the planning conversation cannot silently rebind it.
+	const base = { commit: await headCommit(root), branch: await headBranch(root) };
+	const baseControlsRefusal = await reviewedBaseTreeRefusal(root, base.commit, controls);
+	if (baseControlsRefusal) throw new PlanParseError(baseControlsRefusal);
 	await flushStatusSnapshot(kitAndLock, { phase: "planning" });
 	const kit = new ConversationKit(kitAndLock, kitAndLock.loop.toolBox);
 	const role = kitAndLock.loop.config.roles.planner;
@@ -108,7 +126,7 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 		maxTurns: kitAndLock.loop.config.engine.maxTurns,
 	});
 
-	const remediations = await loadApprovedRemediations(kitAndLock.loop.paths.root);
+	const remediations = controls.remediations ?? [];
 	const remediationBrief = formatRemediationBrief(remediations);
 	// M0-P16: the planning conversation is a paid submission like any other —
 	// admitted before the first call. A refusal records the stop and surfaces
@@ -127,11 +145,10 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 	}
 
 	const tasks = normalizeTasks(parsePlannerJson(outcome.answer));
-	// Identity inputs are read BEFORE the commit: a failure here (git, paths,
-	// controls) leaves the previous plan untouched. planRevision is a fresh
+	// Identity inputs were captured BEFORE disclosure; a failure in the remaining
+	// git reads leaves the previous plan untouched. planRevision is a fresh
 	// UUIDv4 per plan — even for an identical replan.
-	const root = kitAndLock.loop.paths.root;
-	const identity = await buildPlanIdentity(root, prdPath, prdText, tasks);
+	const identity = await buildPlanIdentity(root, prdPath, prdText, tasks, controls, base);
 	// What this plan REPLACES is read before the commit (the same lock makes
 	// this consistent): the replaced identity drives archiving and the provenance
 	// row, and a prior approval — v1 legacy stamps included — is invalidated.
@@ -203,8 +220,7 @@ export interface PlanOutcome {
 }
 
 export async function loadApprovedRemediations(root: string): Promise<Remediation[]> {
-	const stored = await readJson<{ version: number; remediations: Remediation[] }>(join(root, ".orch", "gate-remediations.json"));
-	return stored?.version === 1 && Array.isArray(stored.remediations) ? stored.remediations : [];
+	return (await readRemediations(root)) ?? [];
 }
 
 /** Approved gaps become planning input, never PRD mutations or model commands. */

@@ -19,12 +19,16 @@ import { readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buildFauxModels, fauxAssistantMessage } from "./fixtures.ts";
+import { bakeProject } from "./fixtures2.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { initProject } from "../src/init.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
 import { commitState, readSessionState, planRunRefusal, type SessionState } from "../src/engine/state.ts";
+import { approveGrant, runWaves } from "../src/engine/waves.ts";
 import { loadPrd, runPlan, PlanParseError, normalizeTasks } from "../src/engine/planner.ts";
-import { canonicalSha256, type PlanIdentity } from "../src/engine/plans.ts";
+import { canonicalSha256, loadPlanControls, type PlanIdentity } from "../src/engine/plans.ts";
+import { ReceiptsDoc } from "../src/engine/receipts.ts";
+import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { renderRouterMd } from "../src/engine/infos.ts";
 import { shasum } from "../src/util/git.ts";
 import { KIT_VERSION } from "../src/config.ts";
@@ -143,6 +147,121 @@ describe("plan identity (M0-P04)", () => {
 		expect(second.state.runStatus.humanApprovedAt).toBeUndefined();
 		// The run authorization gate agrees: bare run is refused on the fresh plan.
 		expect(planRunRefusal(second.state, { approve: false })).toMatch(/not human-approved for its current plan revision/);
+	}, 90_000);
+
+	it("captures the control bundle before disclosure: a control edited during planning is drift (M1-P01 step d)", async () => {
+		const root = await prepareProject();
+		const { models, faux } = buildFauxModels([]);
+		faux.appendResponses([async () => {
+			// Mutate a reviewed control WHILE the planner is answering. The identity
+			// must describe the bytes captured before disclosure, not this edit.
+			await writeFile(join(root, "evals", "checklist.md"), "EDITED DURING PLANNING\n", "utf8");
+			return fauxAssistantMessage(JSON.stringify(PLAN_ONE), { stopReason: "stop" });
+		}]);
+		const kit = await openProjectHarness(root, "plan", { modelsOverride: models });
+		const outcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+		await kit.loop.close();
+		kit.lock.release();
+
+		const runKit = await openProjectHarness(root, "run", { modelsOverride: buildFauxModels([]).models });
+		try {
+			await expect(approveGrant(runKit, { planRevision: outcome.planRevision })).rejects.toThrow(/reviewed controls changed/);
+			expect((await readSessionState(runKit.loop.harness)).runStatus.approvedPlanRevision).toBeUndefined();
+		} finally {
+			await runKit.loop.close().catch(() => {});
+			runKit.lock.release();
+		}
+	}, 90_000);
+
+	it("refuses a plan when a committed recipe byte is edited without a commit (M1-P01 step d)", async () => {
+		const baked = await bakeProject({ buildFauxModels });
+		const root = baked.project.root;
+		try {
+			// bakeProject commits the template controls; editing one after that
+			// makes the plan review bytes the driver would NOT execute (it reads the
+			// immutable base tree). The refusal happens before the planner runs.
+			const recipesPath = join(root, "evals", "recipes.toml");
+			const committedRecipes = await readFile(recipesPath, "utf8");
+			await writeFile(recipesPath, "[uncommitted-gate]\nargv = [\"node\", \"-e\", \"require('node:fs').writeFileSync('uncommitted-gate-ran','yes')\"]\n", "utf8");
+			const error = await runPlan(baked.kit, "docs/prd.md", await loadPrd(baked.kit)).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+			expect(error).toBeInstanceOf(PlanParseError);
+			expect((error as Error).message).toMatch(/evals\/recipes\.toml differs from base commit[\s\S]*commit the reviewed evals\/\*\* and PROMPT\.md bytes/);
+			expect(baked.models.faux.state.callCount).toBe(0);
+			// The uncommitted recipe command never ran: no effect marker, no plan.
+			expect(await readFile(join(root, "uncommitted-gate-ran"), "utf8").catch(() => "<absent>")).toBe("<absent>");
+
+			// The same rule covers PROMPT.md, which the wave driver reads from the
+			// projected start tree.
+			await writeFile(recipesPath, committedRecipes, "utf8");
+			await writeFile(join(root, "PROMPT.md"), "UNCOMMITTED WAVE RULES\n", "utf8");
+			const promptError = await runPlan(baked.kit, "docs/prd.md", await loadPrd(baked.kit)).then(
+				() => undefined,
+				(err: unknown) => err,
+			);
+			expect(promptError).toBeInstanceOf(PlanParseError);
+			expect((promptError as Error).message).toMatch(/PROMPT\.md differs from base commit/);
+			expect(baked.models.faux.state.callCount).toBe(0);
+			const state = await readSessionState(baked.kit.loop.harness);
+			expect(state.router.identity).toBeUndefined();
+			expect(state.router.tasks).toEqual([]);
+		} finally {
+			await baked.kit.loop.close().catch(() => {});
+			baked.kit.lock.release();
+		}
+	}, 90_000);
+
+	it("a pre-step-(d) control digest refuses resume as a migration, not an on-disk edit, and rewrites no receipts", async () => {
+		const root = await prepareProject();
+		const planned = await planOnce(root, PLAN_ONE, fauxAssistantMessage(JSON.stringify(PLAN_ONE), { stopReason: "stop" }));
+		const { models, faux } = buildFauxModels([]);
+		const kit = await openProjectHarness(root, "run", { modelsOverride: models });
+		try {
+			await approveGrant(kit, { planRevision: planned.planRevision });
+			// Seed the OLD five-field digest shape a pre-step-(d) plan recorded.
+			const controls = await loadPlanControls(root, { prdPath: "docs/prd.md" });
+			const oldDigest = canonicalSha256({
+				remediations: controls.remediations,
+				promptSha256: controls.prompt?.sha256 ?? null,
+				checklistSha256: controls.evals?.find((file) => file.path === "evals/checklist.md")?.sha256 ?? null,
+				recipesSha256: controls.evals?.find((file) => file.path === "evals/recipes.toml")?.sha256 ?? null,
+				recipesAutoSha256: controls.evals?.find((file) => file.path === "evals/recipes.auto.toml")?.sha256 ?? null,
+			});
+			await commitState(kit, { router: (draft) => { draft.identity!.controlsSha256 = oldDigest; } });
+			const receiptsBefore = (await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events.length ?? 0;
+			const callsBefore = faux.state.callCount;
+
+			await expect(runWaves(kit, { tasksFilter: [] })).rejects.toThrow(/pre-M1-P01-step-\(d\) control digest shape[\s\S]*replan and re-approve/);
+
+			const receiptsAfter = (await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events.length ?? 0;
+			expect(receiptsAfter).toBe(receiptsBefore);
+			expect(faux.state.callCount).toBe(callsBefore);
+			const state = await readSessionState(kit.loop.harness);
+			expect(state.router.tasks[0]).toMatchObject({ status: "todo", waveCount: 0 });
+		} finally {
+			await kit.loop.close().catch(() => {});
+			kit.lock.release();
+		}
+	}, 90_000);
+
+	it("a changed non-recipe eval byte refuses a NEW grant before approval is minted (M1-P01 step d)", async () => {
+		const root = await prepareProject();
+		const planned = await planOnce(root, PLAN_ONE, fauxAssistantMessage(JSON.stringify(PLAN_ONE), { stopReason: "stop" }));
+		await writeFile(join(root, "evals", "checklist.md"), "TAMPERED REVIEW RULES\n", "utf8");
+		const kit = await openProjectHarness(root, "run", { modelsOverride: buildFauxModels([]).models });
+		try {
+			await expect(approveGrant(kit, { planRevision: planned.planRevision })).rejects.toThrow(/reviewed controls changed/);
+			const state = await readSessionState(kit.loop.harness);
+			expect(state.runStatus.approvedPlanRevision).toBeUndefined();
+			expect(state.runStatus.approvedSelected).toBeUndefined();
+			expect(state.runStatus.humanApprovedAt).toBeUndefined();
+			expect(state.router.phase).toBe("planned");
+		} finally {
+			await kit.loop.close().catch(() => {});
+			kit.lock.release();
+		}
 	}, 90_000);
 
 	it("canonical hashing: key order is irrelevant, array order is significant; replans from reordered planner JSON share the definition digest", async () => {

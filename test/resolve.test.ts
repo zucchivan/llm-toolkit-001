@@ -17,7 +17,7 @@
  * remedy when blocked. `verify` never mutates task disposition.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
@@ -33,6 +33,8 @@ import {
 } from "../src/engine/resolution.ts";
 import { ReceiptsDoc } from "../src/engine/receipts.ts";
 import type { ReceiptsDocValue } from "../src/engine/receipts.ts";
+import { HandoffDoc } from "../src/engine/infos.ts";
+import { publishHandoffNote } from "../src/engine/handoffs.ts";
 import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { readCommit, readRef } from "../src/util/git-objects.ts";
 import { runCli } from "./plan-revision-helpers.ts";
@@ -266,6 +268,47 @@ describe("resolve --retry: one fresh retry cycle from the accepted head", () => 
 
 		await kit.loop.close();
 		kit.lock.release();
+	});
+
+	it("a changed eval byte refuses a fresh retry decision and a resume before wave 2 work (M1-P01 step d)", async () => {
+		const { kit, root, revision, models } = await quarantinedByGate();
+		const checklist = join(root, "evals", "checklist.md");
+		const original = await readFile(checklist, "utf8");
+
+		// A NEW retry decision is fresh work: drift refuses it and writes nothing.
+		const receiptsBefore = receiptsOf(await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT));
+		await writeFile(checklist, "TAMPERED REVIEW CHECKS\n", "utf8");
+		await expect(runResolution(kit, {
+			planRevision: revision, taskId: "t1", action: "retry", reason: "reviewed the gate failure; retry",
+		})).rejects.toThrow(/reviewed controls changed[\s\S]*remedy:/);
+		let state = await readSessionState(kit.loop.harness);
+		expect(state.router.tasks[0]!.status).toBe("quarantined");
+		const receiptsAfterRefusal = receiptsOf(await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT));
+		expect(receiptsAfterRefusal.events.filter((event) => event.kind === "resolution")).toHaveLength(0);
+		expect(receiptsAfterRefusal.events).toHaveLength(receiptsBefore.events.length);
+
+		// Restored controls: the same human retry is accepted, then a fresh wave
+		// boundary stops before dispatch when the controls drift again.
+		await writeFile(checklist, original, "utf8");
+		const retry = await runResolution(kit, {
+			planRevision: revision, taskId: "t1", action: "retry", reason: "reviewed the gate failure; retry",
+		});
+		expect(retry.idempotent).toBe(false);
+		const callsBefore = models.faux.state.callCount;
+		// A queued note must stay unclaimed and no new workspace lease may appear.
+		const noteId = await publishHandoffNote(kit.loop.paths, "drift must not claim this note");
+		const bindingsBefore = (await kit.loop.harness.snapshot(HandoffDoc, BACKGROUND_CONTEXT))?.bindings.length ?? 0;
+		const workDir = join(root, ".orch", "work", revision);
+		const workBefore = await readdir(workDir).catch(() => [] as string[]);
+		await writeFile(checklist, "TAMPERED REVIEW CHECKS AGAIN\n", "utf8");
+		await expect(runWaves(kit, { tasksFilter: [] })).rejects.toThrow(/reviewed controls changed/);
+		expect(models.faux.state.callCount).toBe(callsBefore);
+		expect(await readdir(workDir).catch(() => [] as string[])).toEqual(workBefore);
+		const bindingsAfter = (await kit.loop.harness.snapshot(HandoffDoc, BACKGROUND_CONTEXT))?.bindings.length ?? 0;
+		expect(bindingsAfter).toBe(bindingsBefore);
+		expect(await readdir(kit.loop.paths.handoffInbox)).toContain(`${noteId}.json`);
+		state = await readSessionState(kit.loop.harness);
+		expect(state.router.tasks[0]).toMatchObject({ status: "todo", waveCount: 1 });
 	});
 
 	it("refuses a stale revision, a missing grant, a non-quarantined task and evidence on a retry (with remedies)", async () => {

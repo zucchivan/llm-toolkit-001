@@ -64,7 +64,7 @@ import {
 	openTask,
 } from "./workspace.ts";
 import type { TaskExecutionContext, ReadWorkspace } from "./workspace.ts";
-import { canonicalSha256, controlsSha256 } from "./plans.ts";
+import { canonicalSha256, controlsBindingRefusal, loadPlanControls, reviewBindingRefusal } from "./plans.ts";
 import type { PlanIdentity } from "./plans.ts";
 import { integrateAcceptedCandidate } from "./delivery.ts";
 import type { RouterTask, WaveRow } from "./infos.ts";
@@ -337,6 +337,15 @@ export async function runResolution(kit: LoopAndLock, request: ResolutionRequest
 			nextSteps: [`llm-toolkit-001 run   # resumes the stored grant; ${task.id} starts a fresh wave`],
 		};
 	}
+	// M1-P01 step (d): a NEW human decision may start fresh work (rerun gates on
+	// the candidate, a fresh retry cycle), so the reviewed identity must still
+	// hold: HEAD, the actual PRD, every evals/** byte, PROMPT.md, approved
+	// remediations and the effective policy settings. A recorded decision that
+	// is being REPLAYED reconciles its pinned effects instead (no fresh work).
+	if (!prior) {
+		const bindingRefusal = await reviewBindingRefusal(root, identity, kit.loop.config);
+		if (bindingRefusal) throw new ResolutionRefusal(`${bindingRefusal}; ${remedyRun()}`);
+	}
 
 	// --- Preconditions shared by both forms: the wave is sealed and recovered.
 	if (!prior && task.status !== "quarantined") {
@@ -566,16 +575,14 @@ async function recordAcceptTree(
 		}
 		// The reviewed bytes themselves must still be the ones the plan recorded:
 		// an edited PROMPT.md / checklist / recipe file / remediation list is a new
-		// review, not something a human acceptance may silently absorb.
-		const currentControls = await controlsSha256(root);
-		if (currentControls !== identity.controlsSha256) {
-			throw new ResolutionRefusal(
-				`the approved control inputs changed on disk since plan revision ${identity.planRevision} was reviewed (${identity.controlsSha256 ?? "absent"} → ${currentControls ?? "absent"}) — restore them or replan; ${remedyRun()}`,
-			);
-		}
+		// review, not something a human acceptance may silently absorb. A legacy
+		// pre-step-(d) digest is named as a migration, not a false on-disk edit.
+		const currentControls = await loadPlanControls(root, { prdPath: identity.prdPath, config: kit.loop.config });
+		const controlsRefusal = controlsBindingRefusal(identity, currentControls);
+		if (controlsRefusal) throw new ResolutionRefusal(`${controlsRefusal}; ${remedyRun()}`);
 
 		const startTree = await resolveTree(root, checkpoint.startTree);
-		const controls = createTaskControls({ root, targetPaths: task.targetPaths });
+		const controls = createTaskControls({ root, targetPaths: task.targetPaths, prdPath: identity.prdPath });
 		let lease: Awaited<ReturnType<typeof openTask>> | undefined;
 		let readView: ReadWorkspace | undefined;
 		let context: TaskExecutionContext | undefined;

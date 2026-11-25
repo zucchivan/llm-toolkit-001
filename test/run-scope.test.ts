@@ -22,7 +22,11 @@ import { demoBudgetToml2 } from "./fixtures2.ts";
 import { initProject } from "../src/init.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
 import { readSessionState, grantRefusal, readGrant, type SessionState } from "../src/engine/state.ts";
+import { ReceiptsDoc } from "../src/engine/receipts.ts";
+import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { runWaves, approveGrant, pickNextTaskInSelection } from "../src/engine/waves.ts";
+import { assertAdmissiblePath, createTaskControls } from "../src/engine/controls.ts";
+import { discard as discardWorkspace, materializeRead } from "../src/engine/workspace.ts";
 import type { RouterTask } from "../src/engine/infos.ts";
 import { KIT_VERSION } from "../src/config.ts";
 import { runCli } from "./plan-revision-helpers.ts";
@@ -551,4 +555,60 @@ describe("run-scope: resolve never broadens the stored grant (M0-P18)", () => {
 		await kit.loop.close();
 		kit.lock.release();
 	}, 120_000);
+});
+
+describe("reviewed PRD is reserved read-only (M1-P01 binding requirement)", () => {
+	it("empty and docs* targets cannot change the PRD; the read view still reads it and absence is still reserved", async () => {
+		for (const targetPaths of [[], ["docs/"]]) {
+			const root = await prepareProject();
+			const { models, faux } = buildFauxModels([]);
+			faux.setResponses([
+				fauxAssistantMessage(JSON.stringify({ tasks: [{
+					id: "t1", title: "doc tamper", spec: "Try to rewrite the reviewed PRD.", dependsOn: [],
+					acceptance: ["When the wave ends, docs/prd.md shall be unchanged."], targetPaths, priority: 1,
+				}] }), { stopReason: "stop" }),
+				// The worker deliberately bypasses the projected 0400 mode. Candidate
+				// admission, not the filesystem mode, is the boundary under test.
+				fauxAssistantMessage([fauxToolCall("bash", { command: "chmod u+w docs/prd.md && printf 'TAMPERED PRD\\n' > docs/prd.md" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage("STATUS: COMPLETE", { stopReason: "stop" }),
+			]);
+			const kit = await openProjectHarness(root, "test", { modelsOverride: models });
+			try {
+				const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
+				const planned = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
+				const identity = (await readSessionState(kit.loop.harness)).router.identity!;
+				const prdBefore = await readFile(join(root, "docs", "prd.md"), "utf8");
+
+				// The read-only/verify projection still exposes the PRD bytes.
+				const controls = createTaskControls({ root, targetPaths, prdPath: identity.prdPath });
+				const view = await materializeRead({ root, oid: identity.baseCommit! }, controls);
+				try {
+					expect(await readFile(join(view.viewPath, "docs", "prd.md"), "utf8")).toBe(prdBefore);
+				} finally {
+					await discardWorkspace(view);
+				}
+
+				// Reservation is bound to the PATH, not to the file being present.
+				const absent = createTaskControls({ root, targetPaths: ["docs/"], prdPath: "docs/missing-prd.md" });
+				expect(() => assertAdmissiblePath("docs/missing-prd.md", absent)).toThrow(/read-only task-tree path/);
+
+				await approveGrant(kit, { planRevision: planned.planRevision });
+				const summary = await runWaves(kit, { tasksFilter: [] });
+				expect(summary.exit).toBe("recovery-required");
+				expect(await readFile(join(root, "docs", "prd.md"), "utf8")).toBe(prdBefore);
+				// The worker bypassed the 0400 projection mode; the freeze/candidate
+				// admission is what refused the PRD delta (not the filesystem mode).
+				const freezeFailure = (await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events.find(
+					(event) => event.kind === "checkpoint" && event.value.taskId === "t1" && event.value.code === "candidate-freeze-failed",
+				);
+				expect(freezeFailure).toBeDefined();
+				const state = await readSessionState(kit.loop.harness);
+				expect(state.router.tasks[0]!.status).not.toBe("done");
+				expect(state.router.tasks[0]!.waveCount).toBe(0);
+			} finally {
+				await kit.loop.close().catch(() => {});
+				kit.lock.release();
+			}
+		}
+	}, 180_000);
 });

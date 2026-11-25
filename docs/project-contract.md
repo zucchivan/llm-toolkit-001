@@ -153,18 +153,26 @@ counters, and receipts are not part of it), `baseCommit`/`baseBranch` (git
 HEAD and its branch at planning; `baseCommit` is `null` before the first
 commit, and uncommitted operator edits are excluded from the reviewed base),
 normalized project-relative `prdPath` + `prdSha256`, and `controlsSha256`
-over the approved controls (gate-gap remediations, `PROMPT.md`,
-`evals/checklist.md`, human and approved generated recipes). `controlsSha256`
-is ABSENT when no control input exists at all — distinct from a digest over
-empty controls, and absent remediations hash differently from an approved
-empty list. Unreadable, symlinked, or malformed review controls refuse rather
-than becoming absent inputs. Approval and new work refuse a moved HEAD or
-changed controls; already-journaled effects reconcile only against recorded
-identities. The PRD must be a regular project file before reading or model
-submission. M0-P14 execution requires a non-null `baseCommit`; if planning
-records no committed HEAD, make the intended local seed/base commit and replan
-before granting a run. Staged/unstaged/untracked operator data is never used to
-fill a missing base.
+over the reviewed control bundle captured ONCE before the PRD is disclosed:
+every regular-file byte under `evals/**` (executable assertion scripts and
+binary fixtures included), `PROMPT.md`, the approved gate remediations, the
+actual configured/`--prd` file, and the effective verification, delivery,
+routing and admission policy settings. `budgets.sessionUsd` is deliberately
+not part of it — raising only the session ceiling resumes the same reviewed
+plan. `controlsSha256` is ABSENT only when no control input exists at all —
+distinct from a digest over empty controls, and absent remediations hash
+differently from an approved empty list. Unreadable, symlinked, hard-linked,
+non-regular or malformed review controls refuse rather than becoming absent
+inputs. Approval, resume and every fresh wave/retry boundary refuse a moved
+HEAD, a changed actual PRD or changed reviewed bytes/settings; already-journaled
+effects reconcile only against their recorded identities and never rewrite a
+receipt. A plan created before this widened coverage must be replanned (the
+recorded old digest is compared as recorded, never silently recomputed). The
+PRD must be a regular project file before reading or model submission. M0-P14
+execution requires a non-null `baseCommit`; if planning records no committed
+HEAD, make the intended local seed/base commit and replan before granting a
+run. Staged/unstaged/untracked operator data is never used to fill a missing
+base.
 
 The `planRevision` is a REVIEW identity, not a schema version: the durable
 document payload versions (`loop.router`/`loop.run` at version 2) describe
@@ -249,7 +257,9 @@ unchanged in `none`, `commit`, and `pr` modes. Result locations:
   required before implementation starts; PR creation never merges the result.
 
 `verify --task <id>` is diagnostic only: it reads the newest retained candidate
-for the current plan revision and refuses if no candidate exists. It does not
+for the current plan revision and refuses if no candidate exists. Before its
+paid submission it validates the reviewed identity, so a changed eval byte or
+verification policy refuses with no model call and no pass receipt. It does not
 read current operator-checkout edits or change task disposition — approving a
 one-off verification never marks a task done, never unblocks a dependent and
 never advances the integration ref.
@@ -348,17 +358,19 @@ empty panel). While another process owns the lock, the same commands degrade
 to side-car-only reads. The pinned SDK seam itself is documented and
 mechanically enforced per `docs/api-map.md` (M0-P02).
 
-### Host path refusal (M1-P01 step (c), prepared — not certified)
+### Host path refusal and reviewed-control identity (M1-P01 steps (c)–(d), prepared — not certified)
 
-When the host reads a PRD (`[paths] prd` or `--prd`), the reviewed control inputs
-(`PROMPT.md`, `evals/checklist.md`, `evals/recipes*.toml`,
-`.orch/gate-remediations.json`), the gate recipes at execution time, or the UI's
+When the host reads a PRD (`[paths] prd` or `--prd`), captures the reviewed
+control bundle (all `evals/**` regular files, `PROMPT.md`,
+`.orch/gate-remediations.json`, the actual PRD and the effective policy
+settings), reads the gate recipes at execution time, or serves the UI's
 config/PRD/source/artifact views, it:
 
 - canonicalizes the project root once and reads only root-relative names
   through a no-follow component walk (`src/util/safe-read.ts`);
 - refuses a symlink at any component (including the `.orch` or `evals`
-  ancestor), an absolute/`..`/drive/UNC escape, a non-regular leaf, malformed
+  ancestor), a hard-linked regular file (an alias could name a same-owner host
+  file), an absolute/`..`/drive/UNC escape, a non-regular leaf, malformed
   UTF-8/NUL text, and a file past the §2 cap (32 MiB/file, 512 MiB per shared
   read budget, 100k entries per walk);
 - keeps a genuine ENOENT as the defined "absent" input (an absent recipe file
@@ -366,11 +378,35 @@ config/PRD/source/artifact views, it:
 - never falls back to `realpath`-then-open, PATH, cwd or a project env selector
   when the race-safe primitive is unavailable — it refuses instead.
 
+The reviewed identity is captured ONCE before the PRD is disclosed and is
+validated at a new grant, on resume, at each fresh wave/retry boundary and
+before a one-off `verify --task` paid submission. A changed actual PRD,
+non-recipe eval script, recipe, remediation approval or effective verification/
+delivery/routing/admission setting refuses NEW work with a replan remedy;
+raising only `budgets.sessionUsd` is not drift. A plan planned before the
+widened identity coverage must be replanned: its recorded digest is compared as
+recorded, is named as a pre-step-(d) migration rather than a false on-disk edit,
+and is never rewritten. Reconciliation of already recorded effects uses the
+pinned receipts/identity and does not fall through into a fresh wave.
+
+The identity's normalized `prdPath` is ALSO the read-only reservation. Projection
+and candidate admission reserve that literal path (including while the file is
+absent), so a task with an empty `targetPaths` list or a `docs/**` target still
+cannot modify or recreate the PRD; a read-only/verify projection can read it.
+The driver executes recipes and `PROMPT.md` from the immutable reviewed base
+tree, never from the operator worktree. Planning therefore refuses, before the
+PRD is disclosed, when a committed `evals/**` file or `PROMPT.md` was edited or
+deleted without a commit: the operator must commit the reviewed control bytes
+and replan. A new UNTRACKED control file is captured in the identity but cannot
+execute from the base tree; it is reviewed-but-not-executable until committed
+and replanned. This is the chosen smallest fix: one base-tree/execution reader,
+no second persisted recipe bundle.
+
 The UI source payload reports a refusal as `refused:{code,message}` with no
 text (never as plain absence). The M0 delivery-only host-profile view
 (`readApprovedDeliveryOrigin`) is unchanged. Trusted CLI/UI/node/git/gh launch
-resolution and the `inspect`/handoff readers are NOT yet cut over; they need a
-strict-path amendment recorded in
+resolution and the `inspect`/handoff/config readers are NOT yet cut over; they
+need a strict-path amendment recorded in
 `docs/engineering-plan/evidence/M1-P01.md`. No sandbox backend, rootfs or
 launch is enabled by this step, and M1-P01 is not complete or certified.
 

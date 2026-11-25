@@ -12,6 +12,7 @@ import { createServer } from "node:net";
 import {
 	appendFile,
 	chmod,
+	link,
 	mkdir,
 	mkdtemp,
 	open as openFileHandle,
@@ -475,6 +476,24 @@ describe.skipIf(process.platform !== "linux")("capped no-follow host reads", () 
 		const viaRootLink = await readSafeFile({ root: linkRoot, path: "real/inside.txt" });
 		expect(refusal(viaRootLink).code).toBe("symlink");
 		expect(JSON.stringify(viaRootLink)).not.toContain("HOST-SECRET-BYTES");
+	});
+
+	it("refuses hard-linked regular files instead of reading an alias (M1-P01 step d)", async () => {
+		const outside = await tempRoot("kit-safe-outside-");
+		const secret = join(outside, "host-secret.txt");
+		await writeFile(secret, "HOST-SECRET-BYTES");
+		const root = await tempRoot("kit-safe-read-");
+		// A same-owner hard link inside the project path aliases the host file; a
+		// symlink would be refused already, so the alias is the only way to reach
+		// it without closing the leaf.
+		await link(secret, join(root, "aliased.txt"));
+		const result = await readSafeFile({ root, path: "aliased.txt" });
+		expect(refusal(result).code).toBe("hardlink");
+		expect(JSON.stringify(result)).not.toContain("HOST-SECRET-BYTES");
+
+		// An ordinary single-link file is still read normally.
+		await writeAt(root, "plain.txt", "plain-bytes");
+		expect(okValue(await readSafeText({ root, path: "plain.txt" }))).toBe("plain-bytes");
 	});
 
 	it("keeps reading the pinned directory after an ancestor is swapped for a symlink", async () => {
