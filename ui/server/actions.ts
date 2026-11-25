@@ -11,19 +11,27 @@
  * nothing).
  */
 import { existsSync, readFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
 import { loadConfig, type RoleName } from "../../src/config.ts";
 import {
+	currentTrustedInstallation,
+	requireLaunchPrefix,
+	TrustedInstallationError,
+	type TrustedLaunchPrefix,
+} from "../../src/sandbox/trusted-exec.ts";
+import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
+import {
 	activeJobs,
+	jobLaunchIdentity,
 	jobPid,
 	jobsList,
 	pidAlive,
 	readJobRecord,
 	spawnJob,
 	type JobKind,
+	type JobLaunchIdentity,
 	type JobRecord,
 } from "./jobs.ts";
 
@@ -200,59 +208,35 @@ function FLOW_FIELDS(kind: ActionKind): string {
 }
 
 // ---------------------------------------------------------------------------
-// CLI resolution — same binary a human would run, same flags (§7.2)
+// CLI resolution — the trusted installation's ONE recorded launch identity
+// (M1-P01 step (f)). There is no `KIT_UI_CLI_BIN`, project `node_modules/.bin`,
+// kit-root, cwd-relative or PATH candidate: the host-owned descriptor selects
+// the entry, and an invalid selected entry refuses instead of trying another.
 // ---------------------------------------------------------------------------
 
 export interface CliResolution {
-	/** Exact full argv prefix used to run the CLI (interpreter included when needed). */
+	/** Exact full argv prefix used to run the CLI (interpreter included). */
 	argv: string[];
+	/** Where the identity came from (display only — never an authority). */
 	via: string;
+	/** The canonical identity recorded in private job state. */
+	identity: JobLaunchIdentity;
 }
 
 /**
- * Where is `llm-toolkit-001`? First hit wins, in this order:
- *   1. KIT_UI_CLI_BIN env override (tests + unusual installs);
- *   2. the project's own `node_modules/.bin/llm-toolkit-001` (the
- *      `npm i <kit repo>` demo/consumer layout — the human-like route);
- *   3. the kit repo's built `dist/cli.js` via node;
- *   4. `llm-toolkit-001` on PATH;
- *   5. the kit repo's TypeScript CLI through the ui package's tsx (dev checkout).
- * A *.js/*.mjs bin is always exec'd through node (never a shell).
+ * Resolve AND validate the selected CLI entry per use from the host descriptor.
+ * `installation` is the descriptor the UI entry built at startup; a direct
+ * caller (tests) may omit it and get the process descriptor. Either way it is
+ * host authority — never project config, argv, env or a job record.
  */
-export function resolveCli(projectRoot: string): CliResolution {
-	const uiRoot = fileURLToPath(new URL("..", import.meta.url)); // ui/
-	const kitRoot = join(uiRoot, "..");
-
-	const nodeitized = (path: string, via: string): CliResolution =>
-		(/\.m?js$/.test(path) ? { argv: [process.execPath, path], via } : { argv: [path], via });
-
-	const override = process.env["KIT_UI_CLI_BIN"];
-	if (override) {
-		if (!existsSync(override)) throw new Error(`KIT_UI_CLI_BIN points nowhere: ${override}`);
-		return nodeitized(override, "KIT_UI_CLI_BIN");
-	}
-
-	const projectBin = join(projectRoot, "node_modules", ".bin", "llm-toolkit-001");
-	if (existsSync(projectBin)) return { argv: [projectBin], via: "project node_modules/.bin" };
-
-	const distCli = join(kitRoot, "dist", "cli.js");
-	if (existsSync(distCli)) return { argv: [process.execPath, distCli], via: "kit dist/cli.js" };
-
-	for (const dir of (process.env["PATH"] ?? "").split(delimiter)) {
-		if (!dir) continue;
-		const bin = join(dir, "llm-toolkit-001");
-		if (existsSync(bin)) return { argv: [bin], via: "PATH" };
-	}
-
-	const tsxCli = join(uiRoot, "node_modules", "tsx", "dist", "cli.mjs");
-	const kitSrcLt = join(kitRoot, "src", "cli.ts");
-	if (existsSync(tsxCli) && existsSync(kitSrcLt)) {
-		return { argv: [process.execPath, tsxCli, kitSrcLt], via: "kit src/cli.ts via tsx" };
-	}
-
-	throw new Error(
-		`no llm-toolkit-001 CLI found — build the kit (npm run build) or install it in the project, or set KIT_UI_CLI_BIN to the CLI entry`,
-	);
+export async function resolveCli(
+	projectRoot: string,
+	installation?: TrustedInstallationDescriptor,
+): Promise<CliResolution> {
+	const descriptor = installation ?? (await currentTrustedInstallation());
+	const prefix: TrustedLaunchPrefix = await requireLaunchPrefix(descriptor, "cli", { targetRoot: projectRoot });
+	const via = `trusted installation (${prefix.source}, ${prefix.form} entry)`;
+	return { argv: [...prefix.argv], via, identity: jobLaunchIdentity(prefix, descriptor) };
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +244,7 @@ export function resolveCli(projectRoot: string): CliResolution {
 // ---------------------------------------------------------------------------
 
 /** Build the CLI argv for a validated action. `stop` never spawns (→ []). */
-export function buildArgv(resolved: CliResolution, body: ActionBody): string[] {
+export function buildArgv(resolved: { argv: readonly string[] }, body: ActionBody): string[] {
 	const base = resolved.argv;
 	switch (body.kind) {
 		case "plan":
@@ -451,10 +435,11 @@ function serializeAction<T>(fn: () => Promise<T>): Promise<T> {
 	return run;
 }
 
-/** Start one validated action as a detached job → { job } (via = CLI resolution). */
+/** Start one validated action as a detached job → { job } (via = launch identity). */
 export function startAction(
 	projectRoot: string,
 	body: ActionBody,
+	installation?: TrustedInstallationDescriptor,
 ): Promise<{ ok: true; job: JobRecord; via: string } | { ok: false; fail: StartError }> {
 	return serializeAction(async () => {
 		try {
@@ -463,16 +448,19 @@ export function startAction(
 			const conflict = await conflictFor(projectRoot, body);
 			if (conflict) return { ok: false as const, fail: conflict };
 
-			const resolved = resolveCli(projectRoot);
+			const resolved = await resolveCli(projectRoot, installation);
 			const argv = buildArgv(resolved, body);
 			if (argv.length === 0) return { ok: false as const, fail: { status: 400, error: "stop does not spawn a job" } };
 			// argv nonempty ⇒ body.kind is not "stop" (buildArgv returns [] only for stop).
 			const spawnKind = body.kind as Exclude<typeof body.kind, "stop">;
 
-			const job = await spawnJob(projectRoot, { kind: spawnKind, spawnedArgv: argv, cwd: projectRoot });
+			const job = await spawnJob(projectRoot, { kind: spawnKind, spawnedArgv: argv, identity: resolved.identity, cwd: projectRoot });
 			return { ok: true as const, job, via: resolved.via };
 		} catch (err) {
-			return { ok: false as const, fail: { status: 500, error: (err as Error).message } };
+			const message = err instanceof TrustedInstallationError
+				? `the trusted CLI entry is refused (${err.code}): ${err.message}`
+				: (err as Error).message;
+			return { ok: false as const, fail: { status: 500, error: message } };
 		}
 	});
 }

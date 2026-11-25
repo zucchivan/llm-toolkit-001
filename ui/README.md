@@ -311,9 +311,11 @@ llm-toolkit-001 ui            # forwarder; spawns llm-toolkit-ui with your args
 npm --prefix ui exec -- llm-toolkit-ui --no-open --port 4517 --project /path/to/project
 ```
 
-`llm-toolkit-001 ui` resolves the `llm-toolkit-ui` bin (kit-repo `ui/node_modules/.bin`,
-then the cwd, then `PATH`) and spawns it with inherited stdio/env — a process
-boundary, no import cycle. Without the UI package: it prints
+`llm-toolkit-001 ui` builds the host-owned installation descriptor and starts
+the UI entry as one fixed literal argv (`node ui/bin/llm-toolkit-ui.js`) with
+inherited stdio/env — a process boundary, no import cycle. There is no
+`ui/node_modules/.bin`, cwd or PATH lookup: an invalid selected entry refuses
+instead of trying another. Without the UI package: it prints
 `npm --prefix ui install` and exits 1.
 
 The server:

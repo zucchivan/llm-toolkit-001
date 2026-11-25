@@ -6,14 +6,15 @@
  * X-Kit-Token echo, jobs/log routes, and the server-restart sweep.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname } from "node:path";
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { buildArgv, resolveCli, startAction, stopAction, validateAction, configPreflight, ACTION_ROLE_NEEDS } from "../server/actions.ts";
-import { markStaleRecords, pruneJobs, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
-import { bake, postAction, actionHeaders, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
+import { jobEnvironment, markStaleRecords, pruneJobs, spawnJob, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
+import { selectInstallation } from "../../src/sandbox/trusted-exec.ts";
+import { bake, cleanup, postAction, actionHeaders, trustedNodeFixture, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
 
 describe("model preflight (422 before a doomed job spawns)", () => {
 	async function rootWithConfig(config: string): Promise<string> {
@@ -73,8 +74,6 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 
 	it("over HTTP: 422 replaces the doomed 202 — no job record appears — and fixing the config restores the 202", async () => {
 		const baked = await bake({ skipJobSweep: false });
-		const savedEnv = process.env["KIT_UI_CLI_BIN"];
-		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
 		try {
 			const configPath = join(baked.root, ".orch", "config.toml");
 			const original = await readFile(configPath, "utf8");
@@ -90,16 +89,12 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 			const accepted = await postAction(baked.base, baked.cookie, { kind: "plan", prd: "docs/prd.md" }, actionHeaders(baked.csrf));
 			expect(accepted.status).toBe(202);
 		} finally {
-			if (savedEnv === undefined) delete process.env["KIT_UI_CLI_BIN"]; else process.env["KIT_UI_CLI_BIN"] = savedEnv;
-			await baked.running.shutdown().catch(() => {});
-			await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+			await cleanup(baked);
 		}
 	});
 
 	it("failed job records carry their reason tail in /api/jobs and SSE payloads", async () => {
 		const baked = await bake({ skipJobSweep: false });
-		const savedEnv = process.env["KIT_UI_CLI_BIN"];
-		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
 		try {
 			const accept = await startAction(baked.root, { kind: "export" });
 			expect(accept.ok).toBe(true);
@@ -114,9 +109,7 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 				expect((httpPayload.jobs.find((x) => x.id === accept.job.id)?.tail ?? []).join("\n")).toMatch(/exported:|went wrong/);
 			}
 		} finally {
-			if (savedEnv === undefined) delete process.env["KIT_UI_CLI_BIN"]; else process.env["KIT_UI_CLI_BIN"] = savedEnv;
-			await baked.running.shutdown().catch(() => {});
-			await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+			await cleanup(baked);
 		}
 	});
 });
@@ -197,22 +190,94 @@ describe("argv construction: CLI only via argv arrays, never a shell", () => {
 		expect(buildArgv(cli, { kind: "stop" })).toEqual([]);
 	});
 
-	it("resolves KIT_UI_CLI_BIN and wraps .js bins through node", async () => {
-		const jsBin = join(await mkdtemp(join(tmpdir(), "stubbin-")), "llm-toolkit-001.js");
-		await writeFile(jsBin, "#!/usr/bin/env node\n", "utf8");
-		const rawBin = join(dirname(jsBin), "llm-toolkit-001");
-		await writeFile(rawBin, "#!/usr/bin/env node\n", "utf8");
-		process.env["KIT_UI_CLI_BIN"] = jsBin;
+	it("resolves the CLI from the host descriptor only — KIT_UI_CLI_BIN, target .bin and PATH cannot win", async () => {
+		const project = await mkdtemp(join(tmpdir(), "ui-target-"));
+		const pathDir = await mkdtemp(join(tmpdir(), "ui-path-"));
+		const trustedDir = await mkdtemp(join(tmpdir(), "ui-trusted-"));
 		try {
-			expect(resolveCli("/anywhere").argv).toEqual([process.execPath, jsBin]);
+			// every losing candidate is a real executable: prove none is selected
+			await mkdir(join(project, "node_modules", ".bin"), { recursive: true });
+			const targetBin = join(project, "node_modules", ".bin", "llm-toolkit-001");
+			await writeFile(targetBin, "#!/bin/sh\nexit 0\n", "utf8");
+			await chmod(targetBin, 0o755);
+			const pathBin = join(pathDir, "llm-toolkit-001");
+			await writeFile(pathBin, "#!/bin/sh\nexit 0\n", "utf8");
+			await chmod(pathBin, 0o755);
+			const trusted = join(trustedDir, "cli.js");
+			await writeFile(trusted, "// trusted cli\n", "utf8");
+			await chmod(trusted, 0o755);
+			const node = await trustedNodeFixture();
+			const installation = selectInstallation({
+				execPath: node,
+				installation: { cli: trusted, node },
+			});
+
+			const saved = { KIT_UI_CLI_BIN: process.env["KIT_UI_CLI_BIN"], PATH: process.env["PATH"] };
+			process.env["KIT_UI_CLI_BIN"] = pathBin;
+			process.env["PATH"] = `${pathDir}:${saved.PATH ?? ""}`;
+			try {
+				const resolved = await resolveCli(project, installation);
+				expect(resolved.argv).toEqual([node, trusted]);
+				expect(resolved.via).toMatch(/trusted installation/);
+				expect(resolved.argv.join(" ")).not.toContain(targetBin);
+				expect(resolved.argv.join(" ")).not.toContain(pathBin);
+				expect(resolved.identity).toMatchObject({
+					version: 1,
+					tool: "cli",
+					form: "built",
+					node,
+					entry: trusted,
+					argvPrefix: [node, trusted],
+				});
+				expect(resolved.identity.descriptorSha256).toMatch(/^[0-9a-f]{64}$/);
+				expect(existsSync(targetBin)).toBe(true); // never executed, just never selected
+			} finally {
+				if (saved.KIT_UI_CLI_BIN === undefined) delete process.env["KIT_UI_CLI_BIN"];
+				else process.env["KIT_UI_CLI_BIN"] = saved.KIT_UI_CLI_BIN;
+				if (saved.PATH === undefined) delete process.env["PATH"];
+				else process.env["PATH"] = saved.PATH;
+			}
 		} finally {
-			delete process.env["KIT_UI_CLI_BIN"];
+			await rm(pathDir, { recursive: true, force: true });
+			await rm(trustedDir, { recursive: true, force: true });
+			await rm(project, { recursive: true, force: true });
 		}
-		process.env["KIT_UI_CLI_BIN"] = rawBin; // no suffix: direct spawn
+	});
+
+	it("refuses an invalid selected entry without falling back to a target/PATH/KIT_UI_CLI_BIN candidate", async () => {
+		const project = await mkdtemp(join(tmpdir(), "ui-target-"));
+		const later = await mkdtemp(join(tmpdir(), "ui-later-"));
+		const marker = join(project, "forbidden-marker.txt");
 		try {
-			expect(resolveCli("/anywhere").argv).toEqual([rawBin]);
+			// VALID fallback candidates exist at every legacy source; the selected
+			// (invalid) entry must still refuse and none may execute.
+			await mkdir(join(project, "node_modules", ".bin"), { recursive: true });
+			const targetBin = join(project, "node_modules", ".bin", "llm-toolkit-001");
+			await writeFile(targetBin, `#!/bin/sh\ntouch "${marker}"\n`, "utf8");
+			await chmod(targetBin, 0o755);
+			const envBin = join(later, "env-cli.mjs");
+			await writeFile(envBin, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "env");\n`, "utf8");
+			const missing = join(later, "missing-cli.js");
+			const node = await trustedNodeFixture();
+			const installation = selectInstallation({
+				execPath: node,
+				installation: { cli: missing, node },
+			});
+			const saved = { KIT_UI_CLI_BIN: process.env["KIT_UI_CLI_BIN"], PATH: process.env["PATH"] };
+			process.env["KIT_UI_CLI_BIN"] = envBin;
+			process.env["PATH"] = `${later}:${saved.PATH ?? ""}`;
+			try {
+				await expect(resolveCli(project, installation)).rejects.toMatchObject({ code: "not-found" });
+				expect(existsSync(marker)).toBe(false); // zero executions
+			} finally {
+				if (saved.KIT_UI_CLI_BIN === undefined) delete process.env["KIT_UI_CLI_BIN"];
+				else process.env["KIT_UI_CLI_BIN"] = saved.KIT_UI_CLI_BIN;
+				if (saved.PATH === undefined) delete process.env["PATH"];
+				else process.env["PATH"] = saved.PATH;
+			}
 		} finally {
-			delete process.env["KIT_UI_CLI_BIN"];
+			await rm(later, { recursive: true, force: true });
+			await rm(project, { recursive: true, force: true });
 		}
 	});
 });
@@ -229,19 +294,13 @@ describe("exit-code mapping", () => {
 
 describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 	let baked: Baked;
-	const envStore = new Map<string, string | undefined>();
 
 	beforeEach(async () => {
 		baked = await bake({ skipJobSweep: false });
-		// route every spawned job's CLI to the stub: resolveCli runs in THIS process
-		for (const key of Object.keys(process.env)) if (key.startsWith("KIT_UI_")) envStore.set(key, process.env[key]);
-		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
 	});
 
 	afterEach(async () => {
-		await baked.running.shutdown().catch(() => {});
-		for (const [key, value] of envStore) if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+		await cleanup(baked);
 	});
 
 	it("mutations: 401 without cookie; 403 wrong/missing X-Kit-Token; 403 cross-origin", async () => {
@@ -279,15 +338,27 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 		expect(accept.status).toBe(202);
 		const { jobId, kind, via } = (await accept.json()) as { jobId: string; kind: string; via: string };
 		expect(kind).toBe("plan");
-		expect(via).toMatch(/KIT_UI_CLI_BIN/);
+		expect(via).toMatch(/trusted installation/);
 
 		const job = (await waitFor(() => readJobRecord(baked.root, jobId), (j) => j !== undefined && j.status !== "running", 8_000))!;
 		expect(job.status).toBe("exited");
 		expect(job.exitCode).toBe(0);
 		expect(job.endedAt).toBeGreaterThan(job.startedAt);
 		expect(job.cwd).toBe(baked.root);
-		// record argv is the stub CLI spawn — a real argv, no shell (.mjs stubs run via node)
-		expect(job.argv).toEqual([process.execPath, baked.stubCli, "plan", "--prd", "docs/prd.md"]);
+		// record argv is the trusted launch identity prefix + the human-typed flags
+		expect(job.argv).toEqual([baked.node, baked.stubCli, "plan", "--prd", "docs/prd.md"]);
+		// M1-P01 step (f): the record persists the canonical descriptor/argv identity
+		expect(job.identity).toMatchObject({
+			version: 1,
+			tool: "cli",
+			form: "built",
+			node: baked.node,
+			entry: baked.stubCli,
+			argvPrefix: [baked.node, baked.stubCli],
+		});
+		expect(job.identity!.descriptorSha256).toMatch(/^[0-9a-f]{64}$/);
+		expect(job.identity!.installationRoot).toMatch(/^\//);
+		expect(job.argv.slice(0, job.identity!.argvPrefix.length)).toEqual(job.identity!.argvPrefix);
 
 		const log = await fetch(`${baked.base}/api/jobs/${jobId}/log?n=5`, { headers: { cookie: baked.cookie } });
 		expect(log.status).toBe(200);
@@ -435,6 +506,142 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 		expect(existsSync(join(jobDir, "old-1.log"))).toBe(false);
 		expect(existsSync(join(jobDir, "mid-1.json"))).toBe(true);
 		expect(existsSync(join(jobDir, "new-1.json"))).toBe(true);
+	});
+});
+
+describe("trusted launch identity + runner refusal (M1-P01 step (f))", () => {
+	const RUNNER = join(import.meta.dirname, "..", "server", "job-runner.mjs");
+
+	/** Run the real detached runner against one record and wait for it to exit. */
+	async function runRunner(recordPath: string): Promise<number | null> {
+		const child = spawn(process.execPath, [RUNNER, "--record", recordPath], { stdio: "ignore" });
+		return await new Promise((done) => child.once("exit", (code) => done(code)));
+	}
+
+	it("an invalid selected CLI refuses the action with no job record and no forbidden execution", async () => {
+		const baked = await bake({ skipJobSweep: true });
+		try {
+			const marker = join(baked.root, "target-bin-ran.txt");
+			await mkdir(join(baked.root, "node_modules", ".bin"), { recursive: true });
+			const targetBin = join(baked.root, "node_modules", ".bin", "llm-toolkit-001");
+			await writeFile(targetBin, `#!/bin/sh\ntouch "${marker}"\n`, "utf8");
+			await chmod(targetBin, 0o755);
+			const invalid = selectInstallation({
+				execPath: baked.node,
+				installation: { cli: join(baked.stubDir, "missing-cli.js"), node: baked.node },
+			});
+			const result = await startAction(baked.root, { kind: "plan", prd: "docs/prd.md" }, invalid);
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.fail.status).toBe(500);
+				expect(result.fail.error).toMatch(/trusted CLI entry is refused/);
+				expect(result.fail.error).toMatch(/not-found/);
+			}
+			expect(await jobsList(baked.root)).toHaveLength(0); // zero records ⇒ zero spawns
+			expect(existsSync(marker)).toBe(false); // never fell back to the target .bin
+		} finally {
+			await cleanup(baked);
+		}
+	});
+
+	it("the runner refuses a tampered, foreign or identity-less record BEFORE any spawn", async () => {
+		const baked = await bake({ skipJobSweep: true });
+		try {
+			const marker = join(baked.root, "runner-spawned.txt");
+			const markerStub = join(baked.stubDir, "marker-cli.mjs");
+			await writeFile(markerStub, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`, "utf8");
+			const launched = await startAction(baked.root, { kind: "plan", prd: "docs/prd.md" });
+			expect(launched.ok).toBe(true);
+			if (!launched.ok) return;
+			const real = (await waitFor(() => readJobRecord(baked.root, launched.job.id), (j) => j !== undefined && j.status !== "running", 8_000))!;
+			const identity = JSON.parse(JSON.stringify(real.identity)) as typeof real.identity;
+			expect(identity?.argvPrefix?.[1]).toBe(baked.stubCli);
+
+			const dir = join(baked.root, ".orch", "ui", "jobs");
+			await mkdir(dir, { recursive: true });
+			const cases: { id: string; record: Record<string, unknown> }[] = [
+				{
+					id: "tampered-1",
+					record: { argv: [baked.node, markerStub, "plan"], identity },
+				},
+				{
+					id: "foreign-1",
+					record: { argv: [baked.node, baked.stubCli, "plan"], identity: { ...identity!, installationRoot: "/srv/other-kit" } },
+				},
+				{ id: "naked-1", record: { argv: [baked.node, markerStub, "plan"] } },
+			];
+			for (const { id, record } of cases) {
+				const recordPath = join(dir, `${id}.json`);
+				await writeFile(
+					recordPath,
+					JSON.stringify({ id, kind: "plan", cwd: baked.root, startedAt: Date.now(), status: "running", logPath: join(dir, `${id}.log`), ...record }),
+					"utf8",
+				);
+				expect(await runRunner(recordPath)).toBe(0);
+				const after = await readJobRecord(baked.root, id);
+				expect(after).toMatchObject({ status: "failed", exitCode: 127 });
+				expect(after?.detail).toMatch(/refused/);
+				expect(after?.pid).toBeUndefined(); // no CLI child was ever spawned
+				expect(existsSync(join(dir, `${id}.log`))).toBe(false); // refused before the log/spawn
+			}
+			expect(existsSync(marker)).toBe(false); // zero recorded-argv substitutions executed
+		} finally {
+			await cleanup(baked);
+		}
+	});
+
+	it("a job env keeps KIT_FAUX*/provider settings and drops every executable selector", async () => {
+		expect(
+			jobEnvironment({
+				KIT_FAUX: "1",
+				KIT_FAUX_SCRIPT: "smoke.replay",
+				KIT_UI_CLI_BIN: "/target/.bin/llm-toolkit-001",
+				KIT_OTHER: "x",
+				NODE_OPTIONS: "--require /tmp/evil.cjs",
+				LD_PRELOAD: "/tmp/evil.so",
+				ANTHROPIC_API_KEY: "key",
+				PATH: "/usr/bin:/bin",
+			}),
+		).toEqual({ KIT_FAUX: "1", KIT_FAUX_SCRIPT: "smoke.replay", ANTHROPIC_API_KEY: "key", PATH: "/usr/bin:/bin" });
+
+		const baked = await bake({ skipJobSweep: true });
+		const saved: Record<string, string | undefined> = {};
+		for (const name of ["KIT_FAUX", "KIT_FAUX_SCRIPT", "KIT_UI_CLI_BIN", "KIT_OTHER", "NODE_OPTIONS", "LD_PRELOAD"]) saved[name] = process.env[name];
+		try {
+			Object.assign(process.env, {
+				KIT_FAUX: "1",
+				KIT_FAUX_SCRIPT: "smoke.replay",
+				KIT_UI_CLI_BIN: join(baked.root, "node_modules", ".bin", "llm-toolkit-001"),
+				KIT_OTHER: "x",
+				NODE_OPTIONS: "--require /tmp/evil.cjs",
+				LD_PRELOAD: "/tmp/evil.so",
+			});
+			const { identity } = await resolveCli(baked.root, baked.installation);
+			const names = ["KIT_FAUX", "KIT_FAUX_SCRIPT", "KIT_UI_CLI_BIN", "NODE_OPTIONS", "LD_PRELOAD", "KIT_OTHER"];
+			const job = await spawnJob(baked.root, {
+				kind: "handoff",
+				spawnedArgv: [...identity.argvPrefix, "env", ...names],
+				identity,
+				cwd: baked.root,
+			});
+			const finished = (await waitFor(() => readJobRecord(baked.root, job.id), (j) => j !== undefined && j.status !== "running", 8_000))!;
+			expect(finished).toMatchObject({ status: "exited", exitCode: 0 });
+			const env = JSON.parse((await tailJobLog(finished.logPath, 20)).join("\n")) as Record<string, string | null>;
+			expect(env).toEqual({
+				KIT_FAUX: "1",
+				KIT_FAUX_SCRIPT: "smoke.replay",
+				KIT_UI_CLI_BIN: null,
+				NODE_OPTIONS: null,
+				LD_PRELOAD: null,
+				KIT_OTHER: null,
+			});
+		} finally {
+			for (const [name, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			await cleanup(baked);
+		}
 	});
 });
 

@@ -16,11 +16,11 @@
  *   2. platform      — `/proc` exists (liveness itself probes signal-0 on any
  *                      OS; the deeper checks need `/proc`);
  *   3. working dir   — `/proc/<pid>/cwd` realpath equals the project root;
- *   4. command line  — `/proc/<pid>/cmdline` argv contains exactly one token
- *                      after `argv[0]` whose realpath equals the CLI entry
- *                      this UI resolves for spawning its own jobs (same
- *                      chain as A.4/§7.2 resolution: bin override → the
- *                      project's `.bin` → kit `dist/cli.js` → PATH → tsx),
+ *   4. command line  — `/proc/<pid>/exe` and `/proc/<pid>/cmdline` match the
+ *                      SAME descriptor/argv identity this UI launches its own
+ *                      jobs from (M1-P01 step (f): `[node, ...(loader), entry]`
+ *                      selected and validated from the host descriptor — no
+ *                      independent `resolveCli`, no PATH/target fallback),
  *                      followed by a lock-holding subcommand (`plan`/`run`).
  *                      Nothing else in the argv is checked.
  *   5. one signal    — the full check re-runs immediately before signalling
@@ -39,7 +39,13 @@ import { readFile, readlink, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { readJson } from "../../src/util/fsx.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
-import { resolveCli } from "./actions.ts";
+import {
+	TrustedInstallationError,
+	currentTrustedInstallation,
+	requireLaunchPrefix,
+	type TrustedLaunchPrefix,
+} from "../../src/sandbox/trusted-exec.ts";
+import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 import { pidAlive } from "./jobs.ts";
 import type { AttachedStopView } from "./jobs.ts";
 
@@ -72,6 +78,12 @@ export interface VerifyOpts {
 	expectedPid?: number;
 	/** Pids that running UI job records already claim — a holder there belongs to the ordinary stop path. */
 	uiJobPids?: readonly number[];
+	/**
+	 * The host-owned descriptor the UI entry built at startup. The verified
+	 * argv is the SAME launch identity `ui/server/actions.ts` records for its
+	 * own jobs; omitting it uses the process descriptor (direct callers/tests).
+	 */
+	installation?: TrustedInstallationDescriptor;
 }
 
 function fail(status: 409 | 501, code: AttachedStopFailCode, pid: number | undefined, error: string): AttachedStopCheck {
@@ -111,6 +123,15 @@ async function procCwd(pid: number): Promise<string | undefined> {
 	}
 }
 
+/** The process's executable, realpathed; undefined when unreadable (gone, permissions). */
+async function procExe(pid: number): Promise<string | undefined> {
+	try {
+		return await realpath(`/proc/${pid}/exe`);
+	} catch {
+		return undefined;
+	}
+}
+
 /** Display a argv as a quoted, cap-stated command line (for the dialog/toast). */
 function displayArgv(argv: readonly string[]): string {
 	const quoted = argv.map((t) => (/[\s"]/.test(t) ? `"${t.replaceAll('"', '\\"')}"` : t));
@@ -119,21 +140,44 @@ function displayArgv(argv: readonly string[]): string {
 }
 
 /**
- * The index of the ONE argv token after `argv[0]` whose realpath equals the
- * resolved CLI entry (relative tokens resolve against the verified, project
- * cwd — the runner's own); -1 when none matches. Realpath of non-path tokens
- * (flags, subcommands) fails harmlessly and the scan continues.
+ * Canonical form of one argv token, resolved against the verified project cwd
+ * when it is not absolute; undefined when it names no file (a flag, a
+ * subcommand, a gone path).
  */
-async function matchEntryToken(argv: readonly string[], entryReal: string, cwd: string): Promise<number> {
-	for (let i = 1; i < argv.length; i++) {
-		const token = argv[i]!;
-		if (!token || token.length > 4096) continue;
-		const abs = token[0] === "/" ? token : join(cwd, token);
-		try {
-			if ((await realpath(abs)) === entryReal) return i;
-		} catch {
-			/* not a file (a flag, a subcommand, a gone path) — keep looking */
+async function canonicalToken(token: string, cwd: string): Promise<string | undefined> {
+	if (!token || token.length > 4096) return undefined;
+	const abs = token[0] === "/" ? token : join(cwd, token);
+	try {
+		return await realpath(abs);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The index of the ONE argv position where the recorded launch identity starts
+ * (`[node, ...(loader), entry]`, canonical token by token); -1 when none
+ * matches. Both sides are canonicalized against the verified cwd, so a
+ * symlinked or relative spelling of the SAME files still matches, while a
+ * different executable, loader or entry never does.
+ */
+async function matchLaunchPrefix(argv: readonly string[], prefix: readonly string[], cwd: string): Promise<number> {
+	const wanted: string[] = [];
+	for (const token of prefix) {
+		const canonical = await canonicalToken(token, cwd);
+		if (canonical === undefined) return -1;
+		wanted.push(canonical);
+	}
+	for (let i = 0; i + wanted.length <= argv.length; i++) {
+		let matches = true;
+		for (let j = 0; j < wanted.length; j++) {
+			const actual = await canonicalToken(argv[i + j]!, cwd);
+			if (actual !== wanted[j]) {
+				matches = false;
+				break;
+			}
 		}
+		if (matches) return i;
 	}
 	return -1;
 }
@@ -188,24 +232,36 @@ export async function verifyAttachedStop(projectRoot: string, opts: VerifyOpts =
 		return fail(409, "cwd", holder, `pid ${holder} is alive but its working directory is ${cwd}, not this project (${rootReal}) — nothing was signalled`);
 	}
 
-	// 4. command identity — the SAME entry this UI would resolve for its own jobs
-	let entryReal: string;
+	// 4. command identity — the SAME host-owned launch identity the UI records
+	// for its own jobs (one descriptor, one argv prefix; no re-resolution chain).
+	let launch: TrustedLaunchPrefix;
 	try {
-		const resolved = resolveCli(projectRoot);
-		entryReal = await realpath(resolved.argv[resolved.argv.length - 1]!);
+		const installation = opts.installation ?? (await currentInstallationForStop());
+		launch = await requireLaunchPrefix(installation, "cli", { targetRoot: projectRoot });
 	} catch (err) {
-		return fail(409, "cli-unresolved", holder, `the CLI entry this ui would use cannot be resolved (${(err as Error).message}) — cannot verify the attached run's identity against it; nothing was signalled`);
+		const reason = err instanceof TrustedInstallationError ? `${err.code}: ${err.message}` : (err as Error).message;
+		return fail(409, "cli-unresolved", holder, `the trusted CLI entry this ui launches cannot be resolved (${reason}) — cannot verify the attached run's identity against it; nothing was signalled`);
 	}
-	const entryIdx = await matchEntryToken(argv, entryReal, cwd);
-	if (entryIdx < 0) {
+	const launchNode = await canonicalToken(launch.node, cwd);
+	const exe = await procExe(holder);
+	if (exe === undefined || launchNode === undefined || exe !== launchNode) {
 		return fail(
 			409,
 			"identity",
 			holder,
-			`pid ${holder} is alive in this project, but its command line (${displayArgv(argv)}) does not run this project's installed CLI entry (${entryReal}) — the ui only signals a run loop it can name; stop it from its terminal`,
+			`pid ${holder} is alive in this project, but its executable (${exe ?? "unreadable"}) is not the trusted node interpreter this ui launches (${launchNode ?? launch.node}) — the ui only signals a run loop it can name; stop it from its terminal`,
 		);
 	}
-	const sub = argv[entryIdx + 1];
+	const prefixIdx = await matchLaunchPrefix(argv, launch.argv, cwd);
+	if (prefixIdx < 0) {
+		return fail(
+			409,
+			"identity",
+			holder,
+			`pid ${holder} is alive in this project, but its command line (${displayArgv(argv)}) is not this ui's trusted CLI launch identity (${displayArgv([...launch.argv])}) — the ui only signals a run loop it can name; stop it from its terminal`,
+		);
+	}
+	const sub = argv[prefixIdx + launch.argv.length];
 	if (!(STOPPABLE_SUBCOMMANDS as readonly string[]).includes(sub ?? "")) {
 		return fail(409, "subcommand", holder, `pid ${holder} runs ${sub ? `the CLI subcommand '${sub}'` : "the CLI with no subcommand"} — the ui only interrupts the plan/run loops that own .orch/lock; nothing was signalled`);
 	}
@@ -213,13 +269,23 @@ export async function verifyAttachedStop(projectRoot: string, opts: VerifyOpts =
 	return { ok: true, pid: holder, command: displayArgv(argv), argv, cwd };
 }
 
+/** The process descriptor for direct callers (tests); production passes the UI entry's descriptor. */
+async function currentInstallationForStop(): Promise<TrustedInstallationDescriptor> {
+	return await currentTrustedInstallation();
+}
+
 /**
  * The /api/jobs payload's `stop` affordance for an attached run: one
  * read-only verification round (a failed check never signals anything —
  * §7.2.1). `ok: true` is what enables the attached Stop affordance in the UI.
  */
-export async function attachedStopView(projectRoot: string, pid: number, uiJobPids: readonly number[]): Promise<AttachedStopView> {
-	const check = await verifyAttachedStop(projectRoot, { expectedPid: pid, uiJobPids });
+export async function attachedStopView(
+	projectRoot: string,
+	pid: number,
+	uiJobPids: readonly number[],
+	installation?: TrustedInstallationDescriptor,
+): Promise<AttachedStopView> {
+	const check = await verifyAttachedStop(projectRoot, { expectedPid: pid, uiJobPids, ...(installation ? { installation } : {}) });
 	if (check.ok) return { ok: true, pid: check.pid, command: check.command };
 	return { ok: false, pid, reason: check.error };
 }

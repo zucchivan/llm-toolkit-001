@@ -8,11 +8,9 @@
  * 1 error (incl. lock busy / invalid grant) · 130 SIGINT.
  */
 import { parseArgs } from "node:util";
-import { dirname, delimiter, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { cwd as procCwd } from "node:process";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 const pjson = createRequire(import.meta.url)("../package.json") as { name?: string; version: string };
 import { initProject } from "./init.ts";
 import { KIT_VERSION, ConfigError, loadConfig } from "./config.ts";
@@ -39,6 +37,12 @@ import { runResolution, loadResolutionEvidence, validateResolutionReason, Resolu
 import { readJson } from "./util/fsx.ts";
 import { publishHandoffNote, HandoffNoteTooLongError } from "./engine/handoffs.ts";
 import { runGatesCli } from "./adoption/cli.ts";
+import {
+	TrustedInstallationError,
+	loadTrustedInstallation,
+	requireLaunchPrefix,
+	type TrustedLaunchPrefix,
+} from "./sandbox/trusted-exec.ts";
 
 const CLI_NAME = pjson.name ?? "llm-toolkit-001";
 const we = console;
@@ -728,19 +732,29 @@ async function cmdHandoff(argv: string[]): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function cmdUi(argv: string[]): Promise<void> {
-	const bin = findUiBin();
-	if (!bin) {
-		we.error(`the web UI lives in its own package (${join("ui", "package.json")}) — install it once in the kit repo:`);
-		we.error(`  ${c.cyan}npm --prefix ui install${RESET}`);
-		we.error(`then rerun: ${CLI_NAME} ui`);
+	// M1-P01 step (f): ONE host-owned launch identity. The descriptor is built
+	// here (operator host profile + fixed defaults; never the target, cwd, PATH
+	// or a KIT_* value) and the UI entry is started as one fixed literal argv.
+	let launch: TrustedLaunchPrefix;
+	try {
+		const installation = await loadTrustedInstallation();
+		launch = await requireLaunchPrefix(installation, "ui", { targetRoot: resolve(procCwd()) });
+	} catch (err) {
+		const error = err as TrustedInstallationError;
+		if (error.code === "not-configured") {
+			we.error(`the web UI lives in its own package (${join("ui", "package.json")}) — install it once in the kit repo:`);
+			we.error(`  ${c.cyan}npm --prefix ui install${RESET}`);
+			we.error(`then rerun: ${CLI_NAME} ui`);
+		} else {
+			we.error(`the trusted web UI entry is refused: ${error.message}`);
+			we.error(`hint: build/install the kit (npm install && npm --prefix ui install) or name installation.ui in the operator host policy`);
+		}
+		if (process.env["KIT_DEBUG"]) we.error(`[kit-debug] ui launch refusal: ${error.code ?? "?"} ${error.message}`);
 		process.exitCode = 1;
 		return;
 	}
 	const { spawn } = await import("node:child_process");
-	// .bin shims spawn directly; a bin/<name>.js shim (npm does not self-link the
-	// package's own bin into .bin) runs through this same node.
-	const args = bin.route === "node" ? [process.execPath, bin.path, ...argv] : [bin.path, ...argv];
-	const child = spawn(args[0]!, args.slice(1), { stdio: "inherit", env: process.env, cwd: procCwd() });
+	const child = spawn(launch.argv[0]!, launch.argv.slice(1).concat(argv), { stdio: "inherit", env: process.env, cwd: procCwd() });
 	// Kill the signal contract: `kill <this pid>` (or a service manager) must take
 	// the spawned UI server with it, not orphan it holding the port. Ctrl-C still
 	// reaches both processes naturally (same process group).
@@ -751,7 +765,7 @@ async function cmdUi(argv: string[]): Promise<void> {
 	process.on("SIGINT", forward);
 	process.on("SIGTERM", forward);
 	child.on("error", (err) => {
-		we.error(`failed to start ${bin}: ${(err as Error).message}`);
+		we.error(`failed to start ${launch.entry}: ${(err as Error).message}`);
 		process.exitCode = 1;
 	});
 	const code: number | null = await new Promise((done) => {
@@ -759,39 +773,6 @@ async function cmdUi(argv: string[]): Promise<void> {
 		child.on("error", () => done(null));
 	});
 	if (code !== null && code !== 0) process.exitCode = code;
-}
-
-interface UiBinRoute {
-	path: string;
-	route: "direct" | "node";
-}
-
-/** Resolve the llm-toolkit-ui bin: kit repo ui/, the CWD ui/, then PATH. */
-function findUiBin(): UiBinRoute | undefined {
-	// This entry (src/cli.ts via tsx, dist/cli.js built) → the kit repo root.
-	const kitRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-	const suffixes = process.platform === "win32" ? ["", ".cmd", ".exe"] : [""];
-	const candidates: UiBinRoute[] = [];
-	const winSuffix = (item: string): UiBinRoute | undefined => {
-		if (!existsSync(item)) return undefined;
-		return { path: item, route: item.endsWith(".js") ? "node" : "direct" };
-	};
-	for (const root of new Set([kitRoot, procCwd()])) {
-		for (const suffix of suffixes) {
-			const hit = winSuffix(join(root, "ui", "node_modules", ".bin", `llm-toolkit-ui${suffix}`));
-			if (hit) return hit;
-		}
-		const shim = winSuffix(join(root, "ui", "bin", "llm-toolkit-ui.js"));
-		if (shim) return shim;
-	}
-	for (const dir of (process.env["PATH"] ?? "").split(delimiter)) {
-		if (!dir) continue;
-		for (const suffix of suffixes) {
-			const hit = winSuffix(join(dir, `llm-toolkit-ui${suffix}`));
-			if (hit) return hit;
-		}
-	}
-	return undefined;
 }
 
 // ---------------------------------------------------------------------------

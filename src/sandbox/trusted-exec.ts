@@ -20,6 +20,7 @@
  * happens, so `delivery.mode=none` cannot require `gh` and a static command
  * cannot acquire a Git/UI/helper prerequisite.
  */
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, isAbsolute, posix, win32 } from "node:path";
 import { execTrusted } from "../util/exec.ts";
@@ -46,6 +47,7 @@ import type {
 
 export type TrustedInstallationErrorCode =
 	| "not-configured"
+	| "unsupported-entry"
 	| "unsafe-path"
 	| "unsafe-file"
 	| "unsafe-permissions"
@@ -242,6 +244,180 @@ export async function currentTrustedInstallation(): Promise<TrustedInstallationD
 export function installTrustedInstallationForTests(descriptor: TrustedInstallationDescriptor | undefined): void {
 	injectedInstallation = descriptor;
 	cachedInstallation = undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Launch identity (step f): ONE descriptor/argv identity for job launch and
+// attached-stop. Pure selection first; validation happens per use below.
+// ---------------------------------------------------------------------------
+
+/** How a trusted CLI/UI entry is started (one fixed literal argv prefix). */
+export type TrustedLaunchForm = "built" | "source";
+
+/**
+ * The fixed literal argv prefix that launches one host entry, derived from the
+ * descriptor only. `built` is `[node, dist/cli.js]`/`[node, ui/bin/…js]`;
+ * `source` is the documented dev-in-kit `[node, ui tsx loader, src/cli.ts]`
+ * form, which is only allowed for the running installation's OWN entry.
+ */
+export interface TrustedLaunchPrefix {
+	readonly tool: "cli" | "ui";
+	readonly form: TrustedLaunchForm;
+	/** Absolute interpreter selected from the descriptor (`node`). */
+	readonly node: string;
+	/** Absolute selected entry (`cli`/`ui`). */
+	readonly entry: string;
+	/** Absolute tsx loader for the source form; absent for a built entry. */
+	readonly loader?: string;
+	/** Exactly `[node, ...(loader), entry]`. Never resolved through PATH/cwd. */
+	readonly argv: readonly string[];
+	readonly source: TrustedToolSource;
+	/** The proven running installation root (recorded with every job identity). */
+	readonly installationRoot: string;
+}
+
+export type TrustedLaunchSelection =
+	| { ok: true; value: TrustedLaunchPrefix }
+	| { ok: false; code: "not-configured" | "unsupported-entry"; message: string };
+
+function isJavaScriptEntry(path: string): boolean {
+	return /\.(c|m)?js$/i.test(path);
+}
+
+function isTypeScriptEntry(path: string): boolean {
+	return /\.(c|m)?ts$/i.test(path);
+}
+
+/**
+ * Select the launch prefix for the CLI or UI entry. This is pure: no PATH, cwd,
+ * target, project config/env or `KIT_*` input exists, and no other candidate is
+ * considered when the selected entry has no supported form.
+ */
+export function selectLaunchPrefix(descriptor: TrustedInstallationDescriptor, tool: "cli" | "ui"): TrustedLaunchSelection {
+	const running = descriptor.runningInstallation;
+	const node = descriptor.tools["node"];
+	if (!node) {
+		return {
+			ok: false,
+			code: "not-configured",
+			message: "no trusted node interpreter is selected; set installation.node in the operator host profile or run from the trusted installation",
+		};
+	}
+	const selected = descriptor.tools[tool];
+	if (!selected) {
+		return {
+			ok: false,
+			code: "not-configured",
+			message: `no trusted installation for ${tool}; set installation.${tool} in the operator host profile or run from the trusted installation`,
+		};
+	}
+	if (!running) {
+		return {
+			ok: false,
+			code: "not-configured",
+			message: `the running kit installation could not be proven from the loaded module, so a ${tool} launch cannot record its installation identity`,
+		};
+	}
+	const api = pathApi(descriptor.platform);
+	const entry = selected.path;
+	if (isJavaScriptEntry(entry)) {
+		return {
+			ok: true,
+			value: Object.freeze({
+				tool,
+				form: "built" as const,
+				node: node.path,
+				entry,
+				argv: Object.freeze([node.path, entry]),
+				source: selected.source,
+				installationRoot: running.root,
+			}),
+		};
+	}
+	if (!isTypeScriptEntry(entry)) {
+		return {
+			ok: false,
+			code: "unsupported-entry",
+			message: `the selected ${tool} entry ${entry} is not a JavaScript or TypeScript entry, so there is no fixed argv form to launch it with`,
+		};
+	}
+	// The documented dev-in-kit source form: the running installation's own entry
+	// through the ui package's tsx loader. A `.ts` copy elsewhere is not launchable.
+	const ownEntry = selected.runningEntry
+		&& running.trustedEntries.some((candidate) => isSameCanonicalPath(candidate, entry, descriptor.platform));
+	if (!ownEntry) {
+		return {
+			ok: false,
+			code: "unsupported-entry",
+			message: `the TypeScript ${tool} entry ${entry} is not the running installation's own entry; build the kit (npm run build) or select its built JavaScript entry`,
+		};
+	}
+	const loader = api.join(running.root, "ui", "node_modules", "tsx", "dist", "cli.mjs");
+	return {
+		ok: true,
+		value: Object.freeze({
+			tool,
+			form: "source" as const,
+			node: node.path,
+			entry,
+			loader,
+			argv: Object.freeze([node.path, loader, entry]),
+			source: selected.source,
+			installationRoot: running.root,
+		}),
+	};
+}
+
+/**
+ * Resolve AND validate the one selected launch identity: interpreter, entry,
+ * and (for the source form) the installation's own tsx loader. A missing or
+ * invalid selected entry refuses; there is no fallback, no PATH lookup and no
+ * alternate candidate.
+ */
+export async function requireLaunchPrefix(
+	descriptor: TrustedInstallationDescriptor,
+	tool: "cli" | "ui",
+	options: TrustedToolUseOptions,
+): Promise<TrustedLaunchPrefix> {
+	const selected = selectLaunchPrefix(descriptor, tool);
+	if (!selected.ok) throw new TrustedInstallationError(selected.code, selected.message, tool);
+	const prefix = selected.value;
+	const platform = options.platform ?? descriptor.platform;
+	try {
+		await requireTrustedTool(descriptor, "node", options);
+		await requireTrustedTool(descriptor, tool, options);
+		if (prefix.loader !== undefined) {
+			// Installation-owned loader: the dev-in-kit exception is proven
+			// structurally (it lives under the recorded installation root) and all
+			// non-containment checks still apply.
+			await validateTrustedExecutableFile(prefix.loader, `${tool} loader`, {
+				targetRoot: options.targetRoot,
+				platform,
+				...(options.uid !== undefined ? { uid: options.uid } : {}),
+				allowRunningInstallationEntry: true,
+			});
+		}
+	} catch (error) {
+		throw mapProfileError(error, tool);
+	}
+	return prefix;
+}
+
+/**
+ * Canonical digest of the descriptor's SELECTED tool paths (identity for job
+ * state, never authority). Recorded with each job so its launch provenance is
+ * auditable without storing the descriptor or any environment value.
+ */
+export function installationDescriptorDigest(descriptor: TrustedInstallationDescriptor): string {
+	const tools: Record<string, string | null> = {};
+	for (const tool of INSTALL_TOOLS) tools[tool] = descriptor.tools[tool]?.path ?? null;
+	const canonical = JSON.stringify({
+		version: descriptor.version,
+		platform: descriptor.platform,
+		runningRoot: descriptor.runningInstallation?.root ?? null,
+		tools,
+	});
+	return createHash("sha256").update(canonical).digest("hex");
 }
 
 // ---------------------------------------------------------------------------

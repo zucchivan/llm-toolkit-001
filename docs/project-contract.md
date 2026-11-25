@@ -404,11 +404,11 @@ no second persisted recipe bundle.
 
 The UI source payload reports a refusal as `refused:{code,message}` with no
 text (never as plain absence). The M0 delivery-only host-profile view
-(`readApprovedDeliveryOrigin`) is unchanged. Trusted CLI/UI launch
-resolution and the `inspect`/handoff/config readers are NOT yet cut over; they
-need a strict-path amendment recorded in
-`docs/engineering-plan/evidence/M1-P01.md`. No sandbox backend, rootfs or
-launch is enabled by this step, and M1-P01 is not complete or certified.
+(`readApprovedDeliveryOrigin`) is unchanged. CLI/UI launch and attached-stop
+now use the trusted installation's ONE descriptor/argv identity (step f); the
+`inspect`/handoff/config readers are NOT yet cut over and need step (g). No
+sandbox backend, rootfs or launch is enabled by this step, and M1-P01 is not
+complete or certified.
 
 ### Trusted host installation and callback-free Git (M1-P01 step (e), prepared — not certified)
 
@@ -448,10 +448,36 @@ sees:
   (`installTrustedInstallationForTests`); that is host authority, not a weaker
   validation mode.
 
-CLI/UI process launch and attached-stop identity (step f), the async config
-reads (step g) and gate/probe execution (P05) are NOT cut over by this step;
-P05 must consume this resolver rather than add another resolution chain. No
-sandbox launch, rootfs or certification follows from it.
+**CLI/UI launch and attached-stop use the SAME launch identity (step f).** The
+descriptor becomes one fixed literal argv prefix (`selectLaunchPrefix`):
+`[node, dist/cli.js]` / `[node, ui/bin/llm-toolkit-ui.js]` for a built entry,
+or the documented dev-in-kit
+`[node, <installation>/ui/node_modules/tsx/dist/cli.mjs, src/cli.ts]` form for
+the running installation's own TypeScript entry. `llm-toolkit-001 ui` builds
+the descriptor and starts the UI from that prefix — there is no
+`findUiBin`, no kit-repo/cwd/PATH candidate search, and an invalid selected
+entry refuses instead of trying another. The UI entry (`ui/server/cli.ts`)
+builds the descriptor once and passes it to the server; a job action records
+`{node, entry, (loader), form, argvPrefix, installationRoot, source,
+descriptorSha256}` in the private job record and the detached runner
+revalidates that record against the identity BEFORE spawning anything (a
+tampered, foreign or identity-less record fails the record and spawns
+nothing; there is no re-resolution after the record). A job inherits the UI
+server's environment minus executable selectors (`KIT_UI_CLI_BIN`, other
+undocumented `KIT_*`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`/`ENV`), so
+`KIT_FAUX`/`KIT_FAUX_SCRIPT` demo mode and provider credentials still reach
+the CLI while nothing in the environment can choose its executable.
+`attached-stop` compares `/proc/<pid>/exe` and `/proc/<pid>/cmdline` against
+that same prefix (plus cwd and the `plan`/`run` subcommand), never against an
+independently re-resolved CLI, and keeps its Linux-only refusal and its
+no-signal-on-failure guarantee.
+
+The async config reads (step g) and gate/probe execution (P05) are NOT cut
+over by this step; P05 must consume this resolver rather than add another
+resolution chain. No sandbox launch, rootfs or certification follows from it.
+On a host whose installation tree is group/world writable (including the
+running node interpreter's ancestors), launch refuses by the approved mode
+rule; that is an operator filesystem action, never a fallback path.
 
 ## Upgrade & migration notes
 

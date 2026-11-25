@@ -19,6 +19,7 @@ import { readOnce, type ReadoutSnapshot } from "./readout.ts";
 import { attachedRun, jobsDir, jobsList, jobsViewList, runningJobPids, type AttachedRun } from "./jobs.ts";
 import type { JobRecord, JobView } from "./jobs.ts";
 import { attachedStopView } from "./attached-stop.ts";
+import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 
 export interface HubOptions {
 	pollMs?: number;
@@ -28,6 +29,8 @@ export interface HubOptions {
 	minScanGapMs?: number;
 	/** Watch `.orch/ui/jobs` too (default true; tests may mute it). */
 	watchJobs?: boolean;
+	/** The UI entry's host-owned descriptor (job launch + attached-stop identity). */
+	installation?: TrustedInstallationDescriptor;
 }
 
 /** Payload of a `job` SSE event: the full job list + the attached run if any. Records carry a bounded reason tail on diagnostic outcomes (failed/stale/42) so toasts can cite it. */
@@ -37,13 +40,13 @@ export interface JobsEventPayload {
 	attached?: AttachedRun;
 }
 
-export async function currentJobsEvent(projectRoot: string): Promise<JobsEventPayload> {
+export async function currentJobsEvent(projectRoot: string, installation?: TrustedInstallationDescriptor): Promise<JobsEventPayload> {
 	const jobs = await jobsViewList(projectRoot);
 	const attached = await attachedRun(projectRoot, jobs);
 	if (attached) {
 		// §7.2.1: the attached run's stop affordance, verified read-only per
 		// payload (a failed check never signals; the POST re-verifies anyway).
-		attached.stop = await attachedStopView(projectRoot, attached.pid, runningJobPids(jobs));
+		attached.stop = await attachedStopView(projectRoot, attached.pid, runningJobPids(jobs), installation);
 	}
 	return { at: Date.now(), jobs, attached };
 }
@@ -67,6 +70,7 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 	const liveRefreshMs = options.liveRefreshMs ?? 2_000;
 	const minScanGapMs = options.minScanGapMs ?? 1_000;
 	const watchJobs = options.watchJobs ?? true;
+	const installation = options.installation;
 
 	const subs = new Set<Sub>();
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -137,7 +141,7 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 		if (!force && fp === lastJobsFingerprint) return;
 		lastJobsFingerprint = fp;
 		try {
-			const payload = await currentJobsEvent(projectRoot);
+			const payload = await currentJobsEvent(projectRoot, installation);
 			submit(`event: job\ndata: ${JSON.stringify(payload)}\n\n`);
 		} catch (err) {
 			console.error(`[llm-toolkit-ui] job event build failed: ${(err as Error).message}`);

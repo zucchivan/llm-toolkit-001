@@ -29,6 +29,7 @@ import { bindPostureFor, newToken } from "./auth.ts";
 import { bakeDemoProject } from "./demo.ts";
 import { startServer } from "./server.ts";
 import { openBrowser } from "./browser.ts";
+import { loadTrustedInstallation, TrustedInstallationError } from "../../src/sandbox/trusted-exec.ts";
 
 const here = dirname(fileURLToPath(import.meta.url)); // ui/server
 const uiRoot = dirname(here); // ui/
@@ -53,6 +54,19 @@ async function main(): Promise<void> {
 		},
 		strict: false,
 	});
+
+	// M1-P01 step (f): build the host-owned installation descriptor ONCE here,
+	// from the operator host profile + fixed defaults — never from the target,
+	// env, argv, cwd or a `KIT_*` value — and hand it to the server/jobs
+	// boundary. Job launch and attached-stop share this one descriptor/identity.
+	let installation: Awaited<ReturnType<typeof loadTrustedInstallation>>;
+	try {
+		installation = await loadTrustedInstallation();
+	} catch (err) {
+		const reason = err instanceof TrustedInstallationError ? `${err.code}: ${err.message}` : (err as Error).message;
+		console.error(`llm-toolkit-ui refused the operator host policy (${reason}) — fix the host profile and restart; nothing was launched`);
+		process.exit(1);
+	}
 
 	// Demo mode (§15.2): bake the simulated project BEFORE resolving the root.
 	// An explicit KIT_FAUX_SCRIPT in the environment is honored (e.g. the slow
@@ -100,7 +114,7 @@ async function main(): Promise<void> {
 	const host = typeof hostFlag === "string" && hostFlag.trim() ? hostFlag.trim() : envHost?.trim() ? envHost.trim() : "127.0.0.1";
 
 	const token = newToken();
-	const running = await startServer({ root, token, port: portRaw, distDir: join(uiRoot, "dist"), host });
+	const running = await startServer({ root, token, port: portRaw, distDir: join(uiRoot, "dist"), host, installation });
 
 	console.log(`llm-toolkit-001-ui ${packageVersion()} · project ${root}`);
 	if (bindPostureFor(host) === "lan") {

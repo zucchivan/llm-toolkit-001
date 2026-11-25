@@ -15,7 +15,7 @@ import { startServer, type RunningUiServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { readOnce } from "../server/readout.ts";
 import { jobsList, type JobRecord } from "../server/jobs.ts";
-import { resolveCli } from "../server/actions.ts";
+import { currentTrustedInstallation, requireLaunchPrefix } from "../../src/sandbox/trusted-exec.ts";
 import { postAction, actionHeaders, waitFor, spawnSleeper } from "./actions-helper.ts";
 import { bakeConfiguredDemo } from "./helpers.ts";
 
@@ -314,8 +314,8 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// gate — the stop window. The bake committed the demo gates into the
 		// baseline; the slow gate layers on top. Plan through the UI first
 		// (approve stamp), then spawn the runner like a terminal would: the SAME
-		// entry resolveCli() picks for spawning jobs, cwd = the project root,
-		// detached from jobs.
+		// descriptor/argv launch identity the ui records for its own jobs, cwd =
+		// the project root, detached from jobs.
 		root = await bakeConfiguredDemo();
 		await mkdir(join(root, "evals"), { recursive: true });
 		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
@@ -335,14 +335,17 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		const { jobId } = (await plan.json()) as { jobId: string };
 		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
 
-		// terminal-spawned run (NOT a UI job record): the same revision-qualified
+		// terminal-spawned run (NOT a UI job record): the SAME host-owned launch
+		// identity (M1-P01 step (f): descriptor-selected node + CLI entry, no
+		// KIT_UI_CLI_BIN/PATH/target resolution) plus the same revision-qualified
 		// argv a human types (M0-P06: --revision + repeated --tasks from the
 		// reviewed tuple; the bare/stamp-less form refuses), cwd on the project,
 		// the UI server's job layer left out entirely.
 		const planned = await readOnce(root);
 		const revision = planned.readout.storage?.router.identity?.planRevision!;
 		expect(revision).toMatch(/^[0-9a-f-]{36}$/);
-		const child = spawn(resolveCli(root).argv[0]!, [...resolveCli(root).argv.slice(1), "run", "--approve", "--revision", revision, "--tasks", "list-parse"], {
+		const launch = await requireLaunchPrefix(await currentTrustedInstallation(), "cli", { targetRoot: root });
+		const child = spawn(launch.argv[0]!, [...launch.argv.slice(1), "run", "--approve", "--revision", revision, "--tasks", "list-parse"], {
 			cwd: root,
 			stdio: "ignore",
 			env: { ...process.env }, // KIT_FAUX=1 + KIT_FAUX_SCRIPT ride the test env
