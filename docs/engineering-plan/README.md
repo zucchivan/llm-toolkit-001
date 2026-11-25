@@ -204,14 +204,69 @@ local = false                # private bounded JSONL emission; no endpoint here
 
 `configVersion` absent/1 reads old roles literally (no silent model substitution), `routing.policy` absent → `fixed`; in v2 absent → `tiered-v1`. Old `skepticSecondPass` absent/true → `always`, false → `never`; reject both keys, show replacement. Never disable mandatory scope (`enforceTargetPaths=false` errors with migration hint; previously the flag was ineffective). Majority of existing settings are not new. `piDurable` exact installed pin, `paths` normalized project-relative, refuse traversal/symlink/hidden inputs. Check rate conflicts for roles naming the same provider/model; for missing used-class rates see usage below. No repo-config endpoint, raw secret, trusted-binary path, image URL, spend bypass, open-ended extra flag or arbitrary mount. `init` never overwrites an existing config. Profiled fakes in tests are constructor injection only; `KIT_FAUX` changes inference, **not isolation**.
 
-**Trusted installation resolution (M1-P01):** CLI/UI entry points and host
-Node/Git/gh/helper/bwrap executables resolve from the operator-selected trusted
-installation, never target cwd/PATH. Optional absolute overrides live only in
-host policy `installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string}`;
-validate ownership, ancestry and exclusion from the target before use. No
-project config/env selector may override them. M4-P04 changes CLI discovery to
-installed package metadata; it must retain M1's trust validation, not re-enable
-project-local resolution. Tests inject explicit installation descriptors.
+**Trusted installation resolution (M1-P01; amended 2026-11-25):** one
+host-owned installation descriptor names the executable and argv prefix for
+each host tool. The Node interpreter is `process.execPath`; the CLI/UI entries
+are those of the running operator-selected kit installation (the running entry
+and its sibling UI bin), not a target copy. On Linux the validated defaults for
+Git/gh are `/usr/bin/git` and `/usr/bin/gh`; `helper`/`bwrap` have no default
+before P03/P05 and must come from the host profile/toolchain. Optional absolute
+overrides live only in host policy
+`installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string}`.
+
+- **Selection authority.** No PATH search, target `node_modules/.bin`,
+  cwd-relative candidate, project config/env, `KIT_*` value, argv token or job
+  record may select a host tool. `KIT_UI_CLI_BIN` is retired as authority.
+- **No fallback.** A present but invalid override refuses; it never falls
+  through to the fixed default. A missing default on a non-Linux host (or a
+  missing Linux default) also refuses; it never triggers a PATH search.
+- **On demand.** Resolve AND validate per use. An unused tool is never
+  resolved: `delivery.mode=none` must not require `gh`, and a static command must
+  not require Git, gh, the UI or a sandbox helper. An eager all-tool sweep may
+  back an explicit host check, never production launch.
+- **Trust.** Installation paths stay absolute, normalized, NUL-free and
+  symlink-free at every component, with executable and ancestor-directory trust
+  checks (regular non-symlink leaf; operator/root-owned; not group/world
+  writable) and exclusion from the target checkout. `process.execPath` is the
+  running process's resolved executable path and is validated the same way. A
+  symlinked installation path is never resolved to its target; it refuses. A
+  host whose fixed default is a symlink must name the canonical real file in
+  `installation.*`; the kit does not silently realpath a default.
+- **Dev-in-kit exception.** The running operator-selected source checkout is
+  the installation: its own `dist/cli.js`, `ui/bin/llm-toolkit-ui.js` and
+  `src/cli.ts`-via-`ui`-tsx entries are trusted even if the target is that same
+  checkout. The exception is proven by the running entry/installation identity
+  (the resolved module/entry URL), never inferred from `process.cwd()`,
+  `argv[0]`, a target path or a project value; a target checkout that merely
+  contains a kit copy is not trusted. It is limited to the outside-the-target
+  rule: symlink, ownership and mode checks still apply.
+- **Descriptor injection.** Production builds the descriptor from the profile
+  plus fixed defaults. Tests inject an explicit descriptor in-process or through
+  private job state; injection is host authority, not a weaker validation mode
+  and not a production-authority source. Job launch and attached-stop use one
+  descriptor/argv identity: the runner executes exactly the recorded canonical
+  argv without re-resolution, and attached-stop compares the process
+  argv/executable against that record.
+- **Config reads.** `.orch/config.toml` is read asynchronously through the
+  canonical root + `safe-read` + the pure `parseConfig`; absent, refused and
+  malformed stay distinct. A sync legacy config read is not packet completion and
+  no production caller may keep one.
+- **Git/gh.** An absolute Git path is necessary, not sufficient. Every call
+  uses fixed literal argv and a host-built environment with inherited
+  `GIT_*`/`GH_*`/`SSH_*`/proxy/`BASH_ENV`/`NODE_OPTIONS` stripped, inherited
+  `GIT_CONFIG*` removed, and hooks, fsmonitor, external diff/textconv, aliases and
+  smudge/clean filters disabled or avoided by plumbing. Repository-controlled
+  callbacks never execute on the host. `gh` is noninteractive,
+  destination-pinned, resolved only for `delivery.mode=pr` with `--deliver`, and
+  never receives a target-selected host or token.
+- **Platforms.** Where the read primitive or a tool default is unavailable, the
+  operation that needs it refuses with a typed result; commands that perform no
+  project read or host launch still run.
+
+M4-P04 changes CLI discovery to installed package metadata; it must retain M1's
+trust validation, not re-enable project-local resolution. P01 installs these
+host boundaries only; gate/probe containment and `[sandbox]` enforcement remain
+P05.
 
 **Host policy**, not repo config: path `~/.config/llm-toolkit-001/host-v1.json` (Windows `%LOCALAPPDATA%/llm-toolkit-001/host-v1.json`), user-owned, non-project, refuse insecure permissions/reparse points. Schema `{version:1,installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string},projects:[{root:absoluteCanonical, backends:("local"|"microvm"|"remote")[],toolchainId:string,publicValues:Record<string,string>,remoteProject?:string,deliveryOrigin?:string,otlpLoopback?:boolean}],toolchains:Record<string,{rootfs?:absoluteImmutablePath,manifestSha256:string,gondolinImage?:absoluteImmutablePath,daytonaSnapshot?:string,deps?:absoluteImmutablePath}>}`. Exact canonical root match, one entry, immutable image/deps validated against host manifest (manifest lists digests, platform, Node version and dependency lockfile digests); reject missing tier fields. One provisioned local default toolchain can be registered under `toolchains.default` for local, no-extra-env, no-network, no-upload projects without entries. No implicit remote use. Remote requires host allow + `--allow-remote` on **each** CLI invocation that might transfer bytes (`plan`, `run`, `verify`, executing `gates probe`, accepting `resolve`); UI does not add it. `deliveryOrigin` is operator-allowlisted HTTPS GitHub repository URL for PRs (no custom git transport or target-controlled gh host). OTLP export requires a separate foreground `telemetry export [--follow]`, local collection already enabled, and host `otlpLoopback:true`; fixed `http://127.0.0.1:4318/v1/traces`, no redirects, user-supplied headers, auth, or arbitrary network endpoint. Operators configure onward export in their collector.
 
