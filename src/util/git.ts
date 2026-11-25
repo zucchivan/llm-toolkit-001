@@ -1,9 +1,8 @@
 /** Git plumbing helpers: baseline tree capture, change detection, rollback, delivery. */
-import { exec } from "./exec.ts";
 import { createHash } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import { spawn } from "node:child_process";
+import { hashWorktreePaths, runGit, writeWorktreeTree } from "./git-objects.ts";
 
 // Prepared workspace callers use these immutable-tree helpers; the existing
 // checkout-oriented helpers below remain legacy driver plumbing until P14.
@@ -16,7 +15,11 @@ export interface GitResult {
 }
 
 async function run(argv: string[], cwd: string, timeoutMs = 30_000, env?: Record<string, string | undefined>): Promise<GitResult> {
-	const out = await exec(argv, { cwd, timeoutMs, env });
+	const overrides: Record<string, string> = {};
+	for (const [key, value] of Object.entries(env ?? {})) {
+		if (value !== undefined) overrides[key] = value;
+	}
+	const out = await runGit(cwd, argv.slice(1), { timeoutMs, ...(Object.keys(overrides).length ? { env: overrides } : {}) });
 	return { ok: out.code === 0, stdout: out.stdout.trim(), stderr: out.stderr.trim() };
 }
 
@@ -73,10 +76,15 @@ export async function worktreeFiles(cwd: string): Promise<string[]> {
 			const childRel = rel ? `${rel}/${name}` : name;
 			if (name.endsWith("/")) continue;
 			const full = `${cwd}/${dir}/${childRel}`;
-			// file-or-dir status
-			const stat = await import("node:fs").then((fs) => fs.statSync(full, { throwIfNoEntry: false } as never));
+			// lstat, never stat: a project symlink is a worktree ENTRY (Git
+			// records the link blob), not a directory to walk through. Following
+			// it here would disclose host files outside the checkout and make
+			// the baseline differ from `git add`.
+			const stat = await import("node:fs").then((fs) => fs.lstatSync(full, { throwIfNoEntry: false } as never));
 			if (!stat) continue;
-			if (stat.isDirectory()) {
+			if (stat.isSymbolicLink()) {
+				out.push(childRel);
+			} else if (stat.isDirectory()) {
 				if (SKIP_DIRS.has(name)) continue;
 				await walk(dir, childRel);
 			} else if (stat.isFile()) {
@@ -89,31 +97,14 @@ export async function worktreeFiles(cwd: string): Promise<string[]> {
 	return out;
 }
 
-/** Blobs of the given paths as git would see them (attributes-aware hashing). */
+/** Blobs of the given paths as raw worktree bytes (no attributes/filters). */
 export async function hashPaths(cwd: string, paths: readonly string[]): Promise<Map<string, string>> {
-	const map = new Map<string, string>();
-	if (paths.length === 0) return map;
-	const { spawn } = await import("node:child_process");
-	const lines = await new Promise<string>((resolve) => {
-		const proc = spawn("git", ["hash-object", "--stdin-paths"], { cwd, stdio: ["pipe", "pipe", "pipe"] });
-		let stdout = "";
-		proc.stdout!.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString("utf8");
-		});
-		proc.on("close", () => resolve(stdout));
-		proc.on("error", () => resolve(""));
-		proc.stdin!.end(`${paths.join("\n")}\n`);
-	});
-	const hashes = lines.trim().split("\n").filter(Boolean);
-	for (let i = 0; i < Math.min(hashes.length, paths.length); i++) {
-		map.set(paths[i]!, hashes[i]!.trim());
-	}
-	return map;
+	return await hashWorktreePaths(cwd, paths);
 }
 
 /** Tracked+untracked contents of a captured tree (the membership reference). */
 export async function treeContents(cwd: string, tree: string): Promise<Map<string, string>> {
-	const listing = await exec(["git", "ls-tree", "-r", "-z", tree], { cwd, timeoutMs: 30_000 });
+	const listing = await runGit(cwd, ["ls-tree", "-r", "-z", tree], { timeoutMs: 30_000 });
 	const map = new Map<string, string>();
 	if (listing.code !== 0) return map;
 	for (const entry of listing.stdout.split("\0").filter(Boolean)) {
@@ -149,19 +140,15 @@ export async function captureBaselineTree(cwd: string): Promise<string> {
 	// staged state (a pid-only name leaked it, so files deleted between captures
 	// wrongly survived in every later tree — A.7's wave trees made that visible).
 	const tmpIndex = `${cwd}/.orch/.baseline-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-	const env = { GIT_INDEX_FILE: tmpIndex };
 	try {
-		// -f: the snapshot must cover engine-relevant worktree bytes regardless
-		// of ignore status (router.md is now ignore-by-default paper trail, and
-		// user-ignored dirs like coverage/ were always walked). The throwaway
-		// index never pollutes the project index.
-		const add = await exec(["git", "add", "-f", "--", ...files], { cwd, timeoutMs: 120_000, env });
-		if (add.code !== 0) {
-			throw new Error(`baseline snapshot failed at git add: ${(add.stderr || "").slice(0, 200)}`);
-		}
-		const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env });
-		if (wt.code !== 0) throw new Error(`baseline snapshot failed: ${wt.stderr}`);
-		return wt.stdout.trim();
+		// -f semantics: the snapshot covers engine-relevant worktree bytes
+		// regardless of ignore status. Hash-object --no-filters + update-index
+		// plumbing replaces `git add -f`, so no repository clean filter, hook
+		// or argv-sized path list is involved; the throwaway index never
+		// pollutes the project index.
+		return await writeWorktreeTree(cwd, { paths: files, indexFile: tmpIndex });
+	} catch (error) {
+		throw new Error(`baseline snapshot failed: ${(error as Error).message}`);
 	} finally {
 		const fs = await import("node:fs/promises");
 		await fs.rm(tmpIndex, { force: true }).catch(() => {});
@@ -206,7 +193,7 @@ export async function summarizeChanges(cwd: string, baseTree: string): Promise<s
 	const lines: string[] = [];
 	for (const path of change.created.sort()) lines.push(`${path}  (new)`);
 	for (const path of change.modified.sort()) {
-		const stat = await run(["git", "diff", "--numstat", baseTree, "--", path], cwd, 30_000);
+		const stat = await run(["git", "diff", "--numstat", "--no-ext-diff", "--no-textconv", baseTree, "--", path], cwd, 30_000);
 		lines.push(stat.ok && stat.stdout ? stat.stdout.replace(/\t.*/, `  ${path}`) : `${path}  (modified)`);
 	}
 	for (const path of change.deleted.sort()) lines.push(`${path}  (deleted)`);
@@ -281,15 +268,22 @@ export async function recreateBranch(cwd: string, branch: string, fromTree: stri
 export async function savePatch(cwd: string, baseTree: string, outFile: string): Promise<boolean> {
 	const tmpIdx = `${cwd}/.orch/.patch-idx-${process.pid}`;
 	// Stage the CURRENT worktree into a throwaway index so untracked files enter
-	// the diff, then produce a binary patch against the baseline tree.
-	const add = await exec(["git", "add", "-A", "."], { cwd, timeoutMs: 120_000, env: { GIT_INDEX_FILE: tmpIdx } });
-	if (add.code !== 0) return false;
-	const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env: { GIT_INDEX_FILE: tmpIdx } });
-	if (wt.code !== 0) return false;
-	const r = await exec(["git", "diff", "--binary", baseTree, wt.stdout.trim()], { cwd, timeoutMs: 60_000 });
-	if (r.code !== 0 || !r.stdout.trim()) return false;
-	await import("node:fs/promises").then((fs) => fs.writeFile(outFile, r.stdout, "utf8"));
-	return true;
+	// the diff, then produce a binary patch against the baseline tree. The
+	// staging is filter-free plumbing (no `git add`, hooks or clean filters).
+	try {
+		const compareTree = await writeWorktreeTree(cwd, { indexFile: tmpIdx });
+		const r = await runGit(cwd, ["diff", "--binary", "--no-ext-diff", "--no-textconv", baseTree, compareTree], {
+			timeoutMs: 60_000,
+		});
+		if (r.code !== 0 || !r.stdout.trim()) return false;
+		await import("node:fs/promises").then((fs) => fs.writeFile(outFile, r.stdout, "utf8"));
+		return true;
+	} catch {
+		return false;
+	} finally {
+		await rm(tmpIdx, { force: true }).catch(() => {});
+		await rm(`${tmpIdx}.lock`, { force: true }).catch(() => {});
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -363,52 +357,25 @@ function noDisplayDiff(reason: string): DisplayPatchOutcome {
 }
 
 /**
- * Full-stream capture for display diffs: `exec` tail-caps at 256 KiB for gate
- * tails — patches must keep their `diff --git` headers and can reach the 5 MiB
- * seam cap, so this helper head-caps instead. `overflow` reports bytes beyond
- * the cap so the caller can set `truncated`.
+ * Head-capped trusted Git capture for display diffs: patches must keep their
+ * `diff --git` headers and can reach the 5 MiB seam cap. `overflow` reports
+ * bytes beyond the cap so the caller can set `truncated`.
  */
-function spawnCapture(argv: string[], cwd: string, timeoutMs: number, maxBytes: number, env?: Record<string, string | undefined>): Promise<{ code: number | null; stdout: string; overflow: boolean; stderr: string }> {
-	return new Promise((done) => {
-		const proc = spawn(argv[0] ?? "", argv.slice(1), {
-			cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-			env: env ? { ...process.env, ...env } : undefined,
-		});
-		const out: Buffer[] = [];
-		let size = 0;
-		let stderr = "";
-		const kill = setTimeout(() => {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* already exiting */
-			}
-		}, timeoutMs);
-		const decode = (): string => Buffer.concat(out).toString("utf8");
-		proc.stdout!.on("data", (chunk: Buffer) => {
-			size += chunk.length;
-			if (size <= maxBytes) out.push(chunk);
-		});
-		proc.stderr!.on("data", (chunk: Buffer) => {
-			stderr = (stderr + chunk.toString("utf8")).slice(-2000);
-		});
-		proc.on("close", (code) => {
-			clearTimeout(kill);
-			done({ code, stdout: decode(), overflow: size > maxBytes, stderr });
-		});
-		proc.on("error", () => {
-			clearTimeout(kill);
-			done({ code: null, stdout: decode(), overflow: false, stderr });
-		});
-	});
+async function captureGit(cwd: string, argv: string[], timeoutMs: number, maxBytes: number): Promise<{ code: number | null; stdout: string; overflow: boolean; stderr: string }> {
+	const outcome = await runGit(cwd, argv, { timeoutMs, maxOutputBytes: maxBytes, overflow: "head" });
+	return {
+		code: outcome.code,
+		stdout: outcome.stdout,
+		overflow: outcome.overflowed === true,
+		stderr: outcome.stderr,
+	};
 }
 
 /** numstat + name-status parses against two trees, engine-owned paths excluded. */
 async function statsAgainstTrees(cwd: string, baseTree: string, compareTree: string): Promise<DiffStats> {
 	const [numstat, nameStatus] = await Promise.all([
-		spawnCapture(["git", "diff", "--numstat", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, 32 * 1024 * 1024),
-		spawnCapture(["git", "diff", "--name-status", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, 32 * 1024 * 1024),
+		captureGit(cwd, ["diff", "--numstat", "--no-renames", "--no-ext-diff", "--no-textconv", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], 120_000, 32 * 1024 * 1024),
+		captureGit(cwd, ["diff", "--name-status", "--no-renames", "--no-ext-diff", "--no-textconv", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], 120_000, 32 * 1024 * 1024),
 	]);
 	const statuses = new Map<string, string>();
 	if (nameStatus.code === 0) {
@@ -450,11 +417,12 @@ export async function computeDisplayPatch(cwd: string, baseTree: string): Promis
 	const tmpIdx = `${cwd}/.orch/.patch-idx-${process.pid}-${Math.floor(Math.random() * 1e9).toString(36)}`;
 	try {
 		await mkdir(dirname(tmpIdx), { recursive: true });
-		const add = await exec(["git", "add", "-A", "."], { cwd, timeoutMs: 120_000, env: { GIT_INDEX_FILE: tmpIdx } });
-		if (add.code !== 0) return noDisplayDiff(`git add failed: ${(add.stderr || add.stdout).trim().slice(0, 200)}`);
-		const wt = await exec(["git", "write-tree"], { cwd, timeoutMs: 30_000, env: { GIT_INDEX_FILE: tmpIdx } });
-		if (wt.code !== 0) return noDisplayDiff(`git write-tree failed: ${(wt.stderr || wt.stdout).trim().slice(0, 200)}`);
-		const compareTree = wt.stdout.trim();
+		let compareTree: string;
+		try {
+			compareTree = await writeWorktreeTree(cwd, { indexFile: tmpIdx });
+		} catch (error) {
+			return noDisplayDiff(`worktree staging failed: ${(error as Error).message.slice(0, 200)}`);
+		}
 		return await displayPatchBetweenTrees(cwd, baseTree, compareTree);
 	} finally {
 		await rm(tmpIdx, { force: true }).catch(() => {});
@@ -469,7 +437,7 @@ export async function computeDisplayPatch(cwd: string, baseTree: string): Promis
  * nothing is persisted — the caller renders (and optionally stores).
  */
 async function displayPatchBetweenTrees(cwd: string, baseTree: string, compareTree: string): Promise<DisplayPatchOutcome> {
-	const diff = await spawnCapture(["git", "diff", "--binary", "--no-renames", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], cwd, 120_000, DISPLAY_PATCH_CAP_BYTES + 1);
+	const diff = await captureGit(cwd, ["diff", "--binary", "--no-renames", "--no-ext-diff", "--no-textconv", baseTree, compareTree, ...DISPLAY_DIFF_PATHSPECS], 120_000, DISPLAY_PATCH_CAP_BYTES + 1);
 	if (diff.code !== 0) return noDisplayDiff(`git diff failed: ${(diff.stderr || diff.stdout).trim().slice(0, 200)}`);
 	if (diff.stdout.trim() === "") return noDisplayDiff("no display diff (nothing changed outside engine-owned paths)");
 	// Cap by bytes: slice whole bytes, then drop a UTF-8 rune cut in half.

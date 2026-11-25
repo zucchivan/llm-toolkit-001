@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec } from "../../src/util/exec.ts";
 import { loadConfig } from "../../src/config.ts";
+import { installTrustedInstallationForTests, runningInstallationFrom, selectInstallation } from "../../src/sandbox/trusted-exec.ts";
 import { bakeDemoProject } from "../server/demo.ts";
 import { startServer } from "../server/server.ts";
 
@@ -46,6 +47,28 @@ describe("bakeDemoProject", () => {
 		const head = await exec(["git", "rev-parse", "--verify", "HEAD"], { cwd: root, timeoutMs: 15_000 });
 		expect(head.code).toBe(0);
 		expect(replay.endsWith("smoke.replay")).toBe(true);
+	});
+
+	it("bakes through the host-owned installation and refuses an invalid selected Git", async () => {
+		installTrustedInstallationForTests(selectInstallation({
+			platform: "linux",
+			running: runningInstallationFrom("file:///srv/kit/src/sandbox/trusted-exec.ts", "linux"),
+			execPath: process.execPath,
+			installation: { git: "/nonexistent/kit-ui-demo-git" },
+		}));
+		try {
+			await expect(bakeDemoProject(REPO_ROOT)).rejects.toThrow(/trusted installation refused/);
+		} finally {
+			installTrustedInstallationForTests(undefined);
+		}
+
+		// With the host default selected, the bake commits the same filter-free
+		// plumbing tree (config + reviewed gate bytes present).
+		const { root } = await bakeDemoProject(REPO_ROOT);
+		const tree = await exec(["git", "ls-tree", "-r", "--name-only", "HEAD"], { cwd: root, timeoutMs: 15_000 });
+		expect(tree.code).toBe(0);
+		expect(tree.stdout).toContain(".orch/config.toml");
+		expect(tree.stdout).toContain("evals/smoke-gate.cjs");
 	});
 
 	it("a real server on the baked project serves the readout (seam 1)", async () => {

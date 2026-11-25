@@ -4,7 +4,6 @@
  * PR publication. M0-P14's serial driver calls these operations instead of
  * staging, restoring, checking out, or delivering from the operator worktree.
  */
-import { exec } from "../util/exec.ts";
 import type { LoopAndLock } from "./harness.ts";
 import { classifyProjectPath } from "../hygiene.ts";
 import { parseApprovedGitHubOrigin, readApprovedDeliveryOrigin } from "../sandbox/host-profile.ts";
@@ -21,7 +20,7 @@ import type {
 import { ReceiptsDoc } from "./receipts.ts";
 import { BACKGROUND_CONTEXT } from "./kit.ts";
 import {
-	assertGitOid, compareAndSwapRef, createCommitObject, isBranchCheckedOut, readCommit, readRef, readTreeEntries, resolveTree,
+	assertGitOid, compareAndSwapRef, createCommitObject, isBranchCheckedOut, readCommit, readRef, readTreeEntries, resolveTree, runGh, runGit,
 } from "../util/git-objects.ts";
 import { validateApprovingCriteria } from "./review.ts";
 import { discard as discardWorkspace, observeLease, requireFencedWorkspace } from "./workspace.ts";
@@ -654,7 +653,7 @@ async function publicationBase(
 			throw new Error("PR delivery requires the reviewed base branch captured by the plan; detached-base plans cannot publish");
 		}
 		const ref = assertBranchRef(`refs/heads/${baseBranch}`);
-		const check = await exec(["git", "check-ref-format", ref], { cwd: root, timeoutMs: 10_000 });
+		const check = await runGit(root, ["check-ref-format", ref], { timeoutMs: 10_000 });
 		if (check.code !== 0) throw new Error(`reviewed base branch ${JSON.stringify(baseBranch)} is not a valid Git branch`);
 		return ref;
 	}
@@ -691,7 +690,7 @@ export async function preflightPullRequest(
 	}
 	await readApprovedDeliveryOrigin(kit.loop.paths.root, options.profilePath);
 	const baseRef = assertBranchRef(`refs/heads/${plan.baseBranch}`);
-	const check = await exec(["git", "check-ref-format", baseRef], { cwd: kit.loop.paths.root, timeoutMs: 10_000 });
+	const check = await runGit(kit.loop.paths.root, ["check-ref-format", baseRef], { timeoutMs: 10_000 });
 	if (check.code !== 0) throw new Error(`reviewed base branch ${JSON.stringify(plan.baseBranch)} is not a valid Git branch`);
 }
 
@@ -937,14 +936,21 @@ export class TrustedGitRemoteTransport implements RemoteGitTransport {
 	}
 }
 
+/** Host-resolved GitHub credential for delivery subprocesses only. */
+function hostGitHubToken(): string | undefined {
+	const token = process.env["GH_TOKEN"] ?? process.env["GITHUB_TOKEN"];
+	return typeof token === "string" && token.length > 0 ? token : undefined;
+}
+
 /** Trusted gh adapter; every operation pins --repo, --base, and --head explicitly. */
 export class GhPullRequestHost implements PullRequestHost {
 	constructor(private readonly root: string) {}
 
 	async findForHead(identity: PullRequestIdentity): Promise<RemotePullRequest[]> {
-		const result = await exec(["gh", "pr", "list", "--repo", identity.repository, "--head", identity.headRef,
+		const result = await runGh(this.root, ["pr", "list", "--repo", identity.repository, "--head", identity.headRef,
 			"--state", "all", "--json", "number,url,headRefName,headRefOid,baseRefName,baseRefOid,state"], {
-			cwd: this.root, timeoutMs: 30_000, env: trustedHostEnv(true),
+			timeoutMs: 30_000,
+			...(hostGitHubToken() !== undefined ? { gitHubToken: hostGitHubToken()! } : {}),
 		});
 		if (result.code !== 0 || result.stdoutCapped || result.stderrCapped) throw new Error(`gh pr list failed: ${result.stderr.trim().slice(0, 500)}`);
 		let parsed: unknown;
@@ -967,27 +973,22 @@ export class GhPullRequestHost implements PullRequestHost {
 	}
 
 	async create(identity: PullRequestIdentity & { title: string; body: string }): Promise<void> {
-		const result = await exec(["gh", "pr", "create", "--repo", identity.repository, "--base", identity.baseRef,
+		const result = await runGh(this.root, ["pr", "create", "--repo", identity.repository, "--base", identity.baseRef,
 			"--head", identity.headRef, "--title", identity.title, "--body", identity.body], {
-			cwd: this.root, timeoutMs: 60_000, env: trustedHostEnv(true),
+			timeoutMs: 60_000,
+			...(hostGitHubToken() !== undefined ? { gitHubToken: hostGitHubToken()! } : {}),
 		});
 		if (result.code !== 0) throw new Error(`gh pr create failed: ${(result.stderr || result.stdout).trim().slice(0, 500)}`);
 	}
 }
 
-function trustedHostEnv(includeGitHubCredentials = false): Record<string, string | undefined> {
-	const env: Record<string, string | undefined> = {};
-	for (const [key, value] of Object.entries(process.env)) {
-		if (key.startsWith("GIT_") || key === "GH_DEBUG" || key === "GH_ENTERPRISE_TOKEN"
-			|| (!includeGitHubCredentials && (key === "GH_TOKEN" || key === "GITHUB_TOKEN"))) env[key] = undefined;
-		else env[key] = value;
-	}
-	env["GIT_TERMINAL_PROMPT"] = "0";
-	env["GH_HOST"] = "github.com";
-	return env;
-}
-
-async function trustedGit(root: string, args: string[], timeoutMs: number): Promise<Awaited<ReturnType<typeof exec>>> {
+/**
+ * One trusted Git remote invocation: the approved canonical origin, the
+ * callback-free host environment, and (only for an HTTPS GitHub origin) the
+ * absolute resolved gh credential helper. No PATH search, no inherited
+ * credential/proxy/SSH state, no repository-controlled URL rewrite.
+ */
+async function trustedGit(root: string, args: string[], timeoutMs: number): Promise<Awaited<ReturnType<typeof runGit>>> {
 	const origin = args[0] === "ls-remote" ? args[2] : args[0] === "push" ? args.at(-2) : undefined;
 	if (!origin) throw new Error("trusted Git transport requires an explicit origin argument");
 	let includeCredentials = false;
@@ -996,20 +997,15 @@ async function trustedGit(root: string, args: string[], timeoutMs: number): Prom
 		if (approved.origin !== origin) throw new Error("trusted Git transport requires the canonical approved GitHub origin");
 		includeCredentials = true;
 	}
-	const safeEnv = trustedHostEnv(includeCredentials);
-	const rewrite = await exec(["git", "config", "--local", "--no-includes", "--get-regexp", "^url\\..*\\.(insteadOf|pushInsteadOf)$"], {
-		cwd: root, timeoutMs: 10_000, env: safeEnv,
+	const rewrite = await runGit(root, ["config", "--local", "--no-includes", "--get-regexp", "^url\\..*\\.(insteadOf|pushInsteadOf)$"], {
+		timeoutMs: 10_000,
 	});
 	if (rewrite.code === 0 && rewrite.stdout.trim()) throw new Error("local Git URL rewrite config is not allowed for approved-origin publication");
+	if (rewrite.signaledBy === "trusted-installation") throw new Error(rewrite.stderr.trim());
 	if (rewrite.code !== 1 && rewrite.code !== 0) throw new Error(`cannot inspect local Git URL rewrite config: ${rewrite.stderr.trim().slice(0, 300)}`);
-	const env = safeEnv;
-	env["GIT_CONFIG_NOSYSTEM"] = "1";
-	env["GIT_CONFIG_GLOBAL"] = process.platform === "win32" ? "NUL" : "/dev/null";
-	env["GIT_ATTR_NOSYSTEM"] = "1";
-	env["GIT_OPTIONAL_LOCKS"] = "0";
-	env["GIT_TERMINAL_PROMPT"] = "0";
-	const result = await exec(["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=!gh auth git-credential", ...args], {
-		cwd: root, timeoutMs, env,
+	const result = await runGit(root, args, {
+		timeoutMs,
+		...(includeCredentials ? { credentialHelper: true, ...(hostGitHubToken() !== undefined ? { gitHubToken: hostGitHubToken()! } : {}) } : {}),
 	});
 	if (result.timedOut || result.stdoutCapped || result.stderrCapped) throw new Error("trusted Git remote operation timed out or exceeded output limits");
 	return result;

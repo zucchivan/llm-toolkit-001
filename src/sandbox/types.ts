@@ -28,6 +28,52 @@ export interface InstallationPaths {
 	bwrap?: string;
 }
 
+/** Where one selected host tool came from (never a PATH/cwd lookup). */
+export type TrustedToolSource = "profile" | "fixed-default" | "running-installation";
+
+/**
+ * The running operator-selected kit installation, proven from the resolved
+ * module URL of `src/sandbox/trusted-exec.ts` — never from cwd, `argv[0]`, a
+ * target path or the presence of a kit copy in the target.
+ */
+export interface RunningInstallationIdentity {
+	/** The resolved `file:` module URL the identity was derived from. */
+	readonly moduleUrl: string;
+	readonly root: string;
+	readonly runtimeKind: "source" | "built";
+	/** The default CLI/UI entry for this runtime kind. */
+	readonly entries: Readonly<{ cli: string; ui: string }>;
+	/**
+	 * Every entry the proven installation may trust under the narrow
+	 * dev-in-kit exception (`src/cli.ts`, `dist/cli.js` and the UI bin).
+	 */
+	readonly trustedEntries: readonly string[];
+}
+
+/** One selected tool: the canonical path plus its provenance. */
+export interface TrustedToolSelection {
+	readonly path: string;
+	readonly source: TrustedToolSource;
+	/**
+	 * True only when `path` is one of the running installation's own trusted
+	 * entries (see `RunningInstallationIdentity.trustedEntries`). The dev-in-kit
+	 * exception is granted from this structural equality at use time.
+	 */
+	readonly runningEntry: boolean;
+}
+
+/**
+ * The host-owned installation descriptor. Built once from the operator profile
+ * plus fixed defaults; a tool that is absent is refused on use, never resolved
+ * through PATH. Production callers must never accept one from project input.
+ */
+export interface TrustedInstallationDescriptor {
+	readonly version: 1;
+	readonly platform: NodeJS.Platform;
+	readonly runningInstallation?: RunningInstallationIdentity;
+	readonly tools: Readonly<Partial<Record<InstallTool, TrustedToolSelection>>>;
+}
+
 export interface HostToolchain {
 	rootfs?: string;
 	manifestSha256: string;

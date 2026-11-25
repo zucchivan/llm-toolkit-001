@@ -3,9 +3,12 @@
  * These helpers address immutable Git objects/trees only; they never inspect or
  * mutate the operator worktree or its index.
  */
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, readlink, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { runTrustedTool } from "../sandbox/trusted-exec.ts";
+import type { TrustedExecOutcome } from "../util/exec.ts";
+import type { TrustedInstallationDescriptor } from "../sandbox/types.ts";
 
 export type GitOid = string;
 export type GitTreeEntry = { path: string; mode: string; type: string; oid: GitOid };
@@ -20,35 +23,60 @@ export type GitCommit = { oid: GitOid; tree: GitOid; parents: GitOid[] };
 const OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_TEXT_OUTPUT = 64 * 1024 * 1024;
 const MAX_BLOB_BYTES = 32 * 1024 * 1024;
-const GIT_CONFIG_ARGS = [
-	"-c", "core.hooksPath=/dev/null",
-	"-c", "core.attributesFile=/dev/null",
-	"-c", "core.autocrlf=false",
-	"-c", "core.safecrlf=false",
-	"-c", "core.fsmonitor=false",
-	"-c", "diff.external=",
-];
 
 export function assertGitOid(oid: string): GitOid {
 	if (!OID_RE.test(oid)) throw new Error(`invalid full Git object ID: ${JSON.stringify(oid)}`);
 	return oid;
 }
 
-function gitEnv(extra?: Record<string, string | undefined>): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env };
-	delete env["GIT_DIR"];
-	delete env["GIT_WORK_TREE"];
-	delete env["GIT_INDEX_FILE"];
-	delete env["GIT_PREFIX"];
-	Object.assign(env, {
-		GIT_CONFIG_NOSYSTEM: "1",
-		GIT_CONFIG_GLOBAL: "/dev/null",
-		GIT_ATTR_NOSYSTEM: "1",
-		GIT_OPTIONAL_LOCKS: "0",
-		GIT_TERMINAL_PROMPT: "0",
-		...(extra ?? {}),
+export interface RunGitOptions {
+	timeoutMs?: number;
+	/** Allowed plumbing overrides only (index path / commit identity). */
+	env?: Readonly<Record<string, string>>;
+	input?: Buffer | string;
+	maxOutputBytes?: number;
+	overflow?: "tail" | "head" | "refuse";
+	/** Add the absolute resolved gh credential helper (PR publication only). */
+	credentialHelper?: boolean;
+	signal?: AbortSignal;
+	hostInstallation?: TrustedInstallationDescriptor;
+}
+
+/**
+ * One Git call through the host-owned resolver: fixed literal argv, the
+ * selected absolute executable and the callback-free host environment. A
+ * refusal (missing/invalid selection) is a failed outcome with zero spawns.
+ */
+export async function runGit(
+	root: string,
+	args: readonly string[],
+	options: RunGitOptions = {},
+): Promise<TrustedExecOutcome> {
+	return await runTrustedTool("git", args, {
+		targetRoot: root,
+		timeoutMs: options.timeoutMs ?? 30_000,
+		...(options.env ? { env: options.env } : {}),
+		...(options.input !== undefined ? { input: options.input } : {}),
+		...(options.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
+		...(options.overflow !== undefined ? { overflow: options.overflow } : {}),
+		...(options.credentialHelper ? { credentialHelper: true } : {}),
+		...(options.signal ? { signal: options.signal } : {}),
+		...(options.hostInstallation ? { installation: options.hostInstallation } : {}),
 	});
-	return env;
+}
+
+/** `gh` through the same resolver + host-built noninteractive environment. */
+export async function runGh(
+	root: string,
+	args: readonly string[],
+	options: { timeoutMs?: number; gitHubToken?: string; hostInstallation?: TrustedInstallationDescriptor } = {},
+): Promise<TrustedExecOutcome> {
+	return await runTrustedTool("gh", args, {
+		targetRoot: root,
+		timeoutMs: options.timeoutMs ?? 30_000,
+		...(options.gitHubToken !== undefined ? { gitHubToken: options.gitHubToken } : {}),
+		...(options.hostInstallation ? { installation: options.hostInstallation } : {}),
+	});
 }
 
 /** Execute a fixed git argv with bounded byte capture and checked status. */
@@ -58,63 +86,24 @@ export async function gitBytes(
 	options: { input?: Buffer | string; env?: Record<string, string | undefined>; maxOutputBytes?: number; timeoutMs?: number } = {},
 ): Promise<Buffer> {
 	const max = options.maxOutputBytes ?? MAX_TEXT_OUTPUT;
-	return await new Promise<Buffer>((resolve, reject) => {
-		const proc = spawn("git", [...GIT_CONFIG_ARGS, ...args], {
-			cwd: root,
-			env: gitEnv(options.env),
-			stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-			detached: process.platform !== "win32",
-			windowsHide: true,
-		});
-		const stdout: Buffer[] = [];
-		let stdoutSize = 0;
-		let stderr = "";
-		let settled = false;
-		let overflow = false;
-		const timeout = setTimeout(() => terminate("SIGTERM"), options.timeoutMs ?? 120_000);
-		let killTimeout: NodeJS.Timeout | undefined;
-		const terminate = (signal: NodeJS.Signals): void => {
-			if (proc.pid === undefined) return;
-			try {
-				if (process.platform !== "win32") process.kill(-proc.pid, signal);
-				else proc.kill(signal);
-			} catch { /* already exited */ }
-		};
-		const fail = (error: Error): void => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (killTimeout) clearTimeout(killTimeout);
-			reject(error);
-		};
-		proc.stdout!.on("data", (chunk: Buffer) => {
-			stdoutSize += chunk.length;
-			if (stdoutSize > max) {
-				overflow = true;
-				terminate("SIGTERM");
-				killTimeout ??= setTimeout(() => terminate("SIGKILL"), 1000);
-			} else stdout.push(chunk);
-		});
-		proc.stderr!.on("data", (chunk: Buffer) => {
-			stderr = (stderr + chunk.toString("utf8")).slice(-8192);
-		});
-		proc.on("error", (error) => fail(error));
-		proc.on("close", (code, signal) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (killTimeout) clearTimeout(killTimeout);
-			if (overflow) return reject(new Error(`git ${args[0]} output exceeded ${max} bytes`));
-			if (code !== 0) return reject(new Error(`git ${args[0]} failed (${signal ?? code}): ${stderr.trim().slice(0, 1000)}`));
-			resolve(Buffer.concat(stdout));
-		});
-		if (options.input !== undefined) {
-			proc.stdin!.on("error", (error) => {
-				if ((error as NodeJS.ErrnoException).code !== "EPIPE") fail(error);
-			});
-			proc.stdin!.end(options.input);
-		}
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(options.env ?? {})) {
+		if (value === undefined) continue;
+		env[key] = value;
+	}
+	const outcome = await runGit(root, args, {
+		timeoutMs: options.timeoutMs ?? 120_000,
+		...(Object.keys(env).length ? { env } : {}),
+		...(options.input !== undefined ? { input: options.input } : {}),
+		maxOutputBytes: max,
+		overflow: "refuse",
 	});
+	if (outcome.timedOut) throw new Error(`git ${args[0]} timed out after ${options.timeoutMs ?? 120_000}ms`);
+	if (outcome.overflowed) throw new Error(`git ${args[0]} output exceeded ${max} bytes`);
+	if (outcome.code !== 0) {
+		throw new Error(`git ${args[0]} failed (${outcome.signaledBy ?? outcome.code}): ${(outcome.stderr || outcome.stdout).trim().slice(0, 1000)}`);
+	}
+	return outcome.stdoutBytes ?? Buffer.from(outcome.stdout, "utf8");
 }
 
 export async function gitText(root: string, args: readonly string[], options: { env?: Record<string, string | undefined>; timeoutMs?: number; input?: Buffer | string } = {}): Promise<string> {
@@ -232,6 +221,153 @@ export async function readBlob(root: string, oid: string): Promise<Buffer> {
 export async function hashBlob(root: string, bytes: Buffer): Promise<GitOid> {
 	if (bytes.length > MAX_BLOB_BYTES) throw new Error("workspace file exceeds the 32 MiB limit");
 	return assertGitOid((await gitText(root, ["hash-object", "-w", "--no-filters", "--stdin"], { timeoutMs: 120_000, input: bytes })).trim());
+}
+
+// ---------------------------------------------------------------------------
+// Filter-free worktree staging (no repository clean filters/hooks can run)
+// ---------------------------------------------------------------------------
+
+const MAX_STAGED_ENTRIES = 100_000;
+
+interface StagedEntry {
+	path: string;
+	mode: "100644" | "100755" | "120000" | "160000";
+	oid: GitOid;
+}
+
+/**
+ * Validate one worktree-relative path before it enters a Git index record or a
+ * newline-delimited plumbing input. Control characters, empty/`.`/`..`
+ * components, absolute paths and `.git` entries are refused, never rewritten.
+ */
+function assertStageablePath(path: string): string {
+	if (typeof path !== "string" || path.length === 0 || path.length > 4096) throw new Error("invalid worktree path for staging");
+	if (/[\0\n\r]/.test(path)) throw new Error(`worktree path contains a control character: ${JSON.stringify(path)}`);
+	if (path.includes("\uFFFD")) throw new Error(`worktree path is not valid UTF-8: ${JSON.stringify(path)}`);
+	if (path.startsWith("/") || path.split("/").some((part) => part === "" || part === "." || part === "..")) {
+		throw new Error(`worktree path is not a normalized project-relative path: ${JSON.stringify(path)}`);
+	}
+	if (path === ".git" || path.startsWith(".git/")) throw new Error(`worktree path names Git metadata: ${JSON.stringify(path)}`);
+	return path;
+}
+
+async function hashRegularPaths(root: string, paths: readonly string[], write: boolean): Promise<GitOid[]> {
+	if (paths.length === 0) return [];
+	const bytes = await gitBytes(root, ["hash-object", ...(write ? ["-w"] : []), "--no-filters", "--stdin-paths"], {
+		input: `${paths.join("\n")}\n`,
+		timeoutMs: 120_000,
+		maxOutputBytes: MAX_TEXT_OUTPUT,
+	});
+	const oids = bytes.toString("utf8").split("\n").filter(Boolean);
+	if (oids.length !== paths.length) throw new Error("git hash-object returned a different object count than the staged path list");
+	return oids.map((oid) => assertGitOid(oid.trim()));
+}
+
+async function hashSymlink(root: string, path: string, write: boolean): Promise<GitOid> {
+	const target = await readlink(join(root, path), { encoding: "buffer" });
+	const bytes = await gitBytes(root, ["hash-object", ...(write ? ["-w"] : []), "--stdin"], {
+		input: target,
+		timeoutMs: 30_000,
+	});
+	return assertGitOid(bytes.toString("utf8").trim());
+}
+
+/**
+ * Raw worktree entries for staging: regular files are hashed with
+ * `--no-filters` and symlinks as link-target blobs, so a repository
+ * `.gitattributes` clean filter is never executed. A missing path is a deletion
+ * (omitted); a tracked gitlink is preserved by its recorded index object rather
+ * than inspecting the submodule.
+ */
+async function worktreeEntries(
+	root: string,
+	paths: readonly string[],
+	options: { write: boolean; tracked?: ReadonlyMap<string, { mode: string; oid: GitOid }> },
+): Promise<StagedEntry[]> {
+	const unique = [...new Set(paths.map(assertStageablePath))];
+	if (unique.length > MAX_STAGED_ENTRIES) throw new Error(`Git staging exceeds the ${MAX_STAGED_ENTRIES}-entry limit`);
+	const entries: StagedEntry[] = [];
+	const regular: { path: string; mode: "100644" | "100755" }[] = [];
+	for (const path of unique) {
+		let info;
+		try {
+			info = await lstat(join(root, path));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw new Error(`cannot inspect worktree path ${JSON.stringify(path)}: ${(error as Error).message}`);
+		}
+		if (info.isSymbolicLink()) {
+			entries.push({ path, mode: "120000", oid: await hashSymlink(root, path, options.write) });
+		} else if (info.isFile()) {
+			regular.push({ path, mode: (info.mode & 0o100) !== 0 ? "100755" : "100644" });
+		} else if (info.isDirectory()) {
+			const tracked = options.tracked?.get(path);
+			if (tracked?.mode !== "160000") throw new Error(`cannot stage non-regular worktree entry ${JSON.stringify(path)}`);
+			entries.push({ path, mode: "160000", oid: assertGitOid(tracked.oid) });
+		} else {
+			throw new Error(`cannot stage non-regular worktree entry ${JSON.stringify(path)}`);
+		}
+	}
+	const oids = await hashRegularPaths(root, regular.map((entry) => entry.path), options.write);
+	regular.forEach((entry, index) => entries.push({ path: entry.path, mode: entry.mode, oid: oids[index]! }));
+	return entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
+/** OIDs for the given worktree paths (raw bytes; symlinks as link-target blobs). */
+export async function hashWorktreePaths(root: string, paths: readonly string[]): Promise<Map<string, GitOid>> {
+	const entries = await worktreeEntries(root, paths, { write: false });
+	return new Map(entries.map((entry) => [entry.path, entry.oid]));
+}
+
+function parseStagedIndex(raw: Buffer): Map<string, { mode: string; oid: GitOid }> {
+	const map = new Map<string, { mode: string; oid: GitOid }>();
+	for (const record of raw.toString("utf8").split("\0")) {
+		if (!record) continue;
+		const tab = record.indexOf("\t");
+		if (tab < 0) throw new Error("malformed git ls-files --stage record");
+		const [mode, oid] = record.slice(0, tab).split(" ");
+		const path = record.slice(tab + 1);
+		if (!mode || !oid || !path) throw new Error("invalid git ls-files --stage record");
+		map.set(path, { mode, oid: assertGitOid(oid) });
+	}
+	return map;
+}
+
+/**
+ * Every path `git add -A` would stage (tracked current content + untracked
+ * non-ignored files), read through plumbing rather than the add machinery.
+ */
+async function gitAddAllEntries(root: string): Promise<StagedEntry[]> {
+	const tracked = parseStagedIndex(await gitBytes(root, ["ls-files", "--stage", "-z", "--", "."], { maxOutputBytes: MAX_TEXT_OUTPUT }));
+	const untracked = (await gitBytes(root, ["ls-files", "-z", "--others", "--exclude-standard", "--", "."], { maxOutputBytes: MAX_TEXT_OUTPUT }))
+		.toString("utf8").split("\0").filter(Boolean);
+	return await worktreeEntries(root, [...tracked.keys(), ...untracked], { write: true, tracked });
+}
+
+export interface WorktreeTreeOptions {
+	/** Throwaway index file under private `.orch` state. */
+	indexFile: string;
+	/** Exact project-relative paths to stage (capture); omit for `git add -A` semantics. */
+	paths?: readonly string[];
+}
+
+/**
+ * Build a tree from the current worktree through a private index, using
+ * `hash-object --no-filters` + `update-index --index-info` stubs. No `git add`,
+ * no clean filters, no hooks and no argv-sized path list. The caller owns the
+ * throwaway index file and removes it afterwards.
+ */
+export async function writeWorktreeTree(root: string, options: WorktreeTreeOptions): Promise<GitOid> {
+	const entries = options.paths !== undefined
+		? await worktreeEntries(root, options.paths, { write: true })
+		: await gitAddAllEntries(root);
+	const env = { GIT_INDEX_FILE: options.indexFile };
+	await gitBytes(root, ["read-tree", "--empty"], { env, timeoutMs: 15_000 });
+	if (entries.length > 0) {
+		const input = Buffer.concat(entries.map((entry) => Buffer.from(`${entry.mode} ${entry.oid}\t${entry.path}\0`, "utf8")));
+		await gitBytes(root, ["update-index", "-z", "--index-info"], { env, input, timeoutMs: 120_000 });
+	}
+	return assertGitOid((await gitText(root, ["write-tree"], { env })).trim());
 }
 
 /**

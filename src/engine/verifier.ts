@@ -13,8 +13,8 @@
  * passing gate, or an existing line in a safe text blob). Each pass is
  * committed (pass receipt + verdict row) BEFORE the next pass is dispatched.
  */
-import { exec } from "../util/exec.ts";
 import { captureBaselineTree, diffStatVsTree, computeDisplayPatch, diffDisplayTrees } from "../util/git.ts";
+import { runGit } from "../util/git-objects.ts";
 import { ConversationKit } from "./conversations.ts";
 import { idOfConversation } from "./kit.ts";
 import type { LoopAndLock } from "./harness.ts";
@@ -97,7 +97,7 @@ export interface VerifyTask {
 /** Diff vs baseline (so uncommitted prior waves never bleed into this verdict). */
 async function diffVsBaseline(root: string, baseline: string): Promise<{ stat: string; files: string[]; display?: Awaited<ReturnType<typeof diffDisplayTrees>> }> {
 	const stat = await diffStatVsTree(root, baseline);
-	const list = await exec(["git", "diff", "--name-only", baseline], { cwd: root, timeoutMs: 30_000 });
+	const list = await runGit(root, ["diff", "--name-only", "--no-ext-diff", "--no-textconv", baseline], { timeoutMs: 30_000 });
 	return { stat, files: (list.stdout || "").trim().split("\n").filter(Boolean) };
 }
 
