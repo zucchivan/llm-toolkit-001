@@ -513,9 +513,9 @@ JSON errors: `{ error: string, detail?: string }` with the listed status codes.
 | GET | `/api/tasks/:id/diff?wave=N` | A.7 per-wave isolated diff between the wave's recorded trees; computed on demand, never persisted; `400` bad wave, `409` not isolatable (plain reason) |
 | GET | `/api/tasks/:id/diff/live` | P15: the in-flight task's latest frozen checkpoint, tree-to-tree (`frozenAt` timestamp label; never the operator checkout); `409` if not in flight or before the first checkpoint (stated reason) |
 | GET | `/api/conversations/:id/entries` | A.5 bounded transcript excerpt (≤ 2,000 entries; storage-mode lock-per-read; `404` unknown id, `409` while a run owns the lock) |
-| GET | `/api/project/sources` | M5 read-only source viewers' data — M5-a: config + PRD; M5-b: PROMPT.md (fixed root path) + `evals/recipes.toml` (the engine gate loader's verdict; absence = defined empty-gates state). Raw text + verdicts; static files, no lock, ≤ 5 MiB text, `binary` labeled; there is NO mutation route for these files (§5) |
+| GET | `/api/project/sources` | M5 read-only source viewers' data — M5-a: config + PRD; M5-b: PROMPT.md (fixed root path) + `evals/recipes.toml` (the engine gate loader's verdict; absence = defined empty-gates state). Raw text + verdicts; static files, no lock, ≤ 5 MiB text, `binary` labeled; there is NO mutation route for these files (§5). M1-P01: reads are canonical-root/root-relative and no-follow — a symlinked/escaping/oversized source returns `refused:{code,message}` with no `text` (not plain absence) |
 | GET | `/api/artifacts` | artifact list (same as readout) |
-| GET | `/api/artifacts/:name` | artifact text; allowlisted names, size cap |
+| GET | `/api/artifacts/:name` | artifact text; allowlisted names, size cap; M1-P01: the bytes come from the no-follow host boundary (a symlinked artifact is `404`, never the link target) |
 
 Action body shapes:
 

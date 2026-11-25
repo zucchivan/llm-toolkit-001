@@ -20,8 +20,10 @@
  * `?download=1` streams the stored patch as an attachment (≤5 MiB at write time).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { startServer, type RunningUiServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { bakeConfiguredDemo } from "./helpers.ts";
@@ -430,3 +432,40 @@ describe("auth stays on the diff routes", () => {
 });
 
 void stat;
+
+describe("M1-P01: artifacts are read through the no-follow boundary", () => {
+	it("a symlinked patch artifact is refused: 404 with no bytes, never the link target", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-diff-outside-"));
+		try {
+			await writeFile(join(outside, "secret.patch"), "HOST SECRET PATCH BYTES\n", "utf8");
+			const name = `candidate-${REVISION}-linked-w1.patch`;
+			await symlink(join(outside, "secret.patch"), join(root, ".orch", "artifacts", name));
+			const diff = await get("/api/tasks/linked/diff");
+			expect(diff.status).toBe(404);
+			const raw = await diff.text();
+			expect(raw).not.toContain("HOST SECRET PATCH BYTES");
+			const artifact = await get(`/api/artifacts/${name}`);
+			expect(artifact.status).toBe(404);
+			expect(await artifact.text()).not.toContain("HOST SECRET PATCH BYTES");
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("a symlinked stats side-car is not parsed into the diff payload", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-diff-outside-"));
+		try {
+			await writeFile(join(outside, "stats.json"), JSON.stringify({ task: "linked2", wave: 1, baselineTreeSha: "LEAKED", files: [], totalInsertions: 0, totalDeletions: 0, bytes: 1, truncated: false }), "utf8");
+			const patch = `candidate-${REVISION}-linked2-w1.patch`;
+			await writeFile(join(root, ".orch", "artifacts", patch), "diff --git a/linked2 b/linked2\n", "utf8");
+			await symlink(join(outside, "stats.json"), join(root, ".orch", "artifacts", `candidate-${REVISION}-linked2-w1.json`));
+			const res = await get("/api/tasks/linked2/diff");
+			expect(res.status).toBe(200);
+			const payload = (await res.json()) as TaskDiffPayload;
+			expect(payload.statsJson).toBeUndefined();
+			expect(payload.baselineTreeSha).toBeUndefined();
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+});

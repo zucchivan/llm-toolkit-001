@@ -348,6 +348,32 @@ empty panel). While another process owns the lock, the same commands degrade
 to side-car-only reads. The pinned SDK seam itself is documented and
 mechanically enforced per `docs/api-map.md` (M0-P02).
 
+### Host path refusal (M1-P01 step (c), prepared — not certified)
+
+When the host reads a PRD (`[paths] prd` or `--prd`), the reviewed control inputs
+(`PROMPT.md`, `evals/checklist.md`, `evals/recipes*.toml`,
+`.orch/gate-remediations.json`), the gate recipes at execution time, or the UI's
+config/PRD/source/artifact views, it:
+
+- canonicalizes the project root once and reads only root-relative names
+  through a no-follow component walk (`src/util/safe-read.ts`);
+- refuses a symlink at any component (including the `.orch` or `evals`
+  ancestor), an absolute/`..`/drive/UNC escape, a non-regular leaf, malformed
+  UTF-8/NUL text, and a file past the §2 cap (32 MiB/file, 512 MiB per shared
+  read budget, 100k entries per walk);
+- keeps a genuine ENOENT as the defined "absent" input (an absent recipe file
+  is still empty gates; absent controls still hash as absent);
+- never falls back to `realpath`-then-open, PATH, cwd or a project env selector
+  when the race-safe primitive is unavailable — it refuses instead.
+
+The UI source payload reports a refusal as `refused:{code,message}` with no
+text (never as plain absence). The M0 delivery-only host-profile view
+(`readApprovedDeliveryOrigin`) is unchanged. Trusted CLI/UI/node/git/gh launch
+resolution and the `inspect`/handoff readers are NOT yet cut over; they need a
+strict-path amendment recorded in
+`docs/engineering-plan/evidence/M1-P01.md`. No sandbox backend, rootfs or
+launch is enabled by this step, and M1-P01 is not complete or certified.
+
 ## Upgrade & migration notes
 
 - The kit is versioned semver; `.orch/kit-version` records which pairs

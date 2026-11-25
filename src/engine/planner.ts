@@ -7,8 +7,9 @@
  * the old identity is archived and any prior approval is invalidated in the
  * same commit. A failed parse leaves the old plan untouched.
  */
-import { lstat, readFile, realpath } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join } from "node:path";
+import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
+import { readSafeText } from "../util/safe-read.ts";
 import { ConversationKit } from "./conversations.ts";
 import type { LoopAndLock, ToolRegistration } from "./harness.ts";
 import { commitState, flushStatusSnapshot, readSessionState } from "./state.ts";
@@ -53,22 +54,29 @@ export interface PlanInputs {
 	toolBox: { read: ToolRegistration; write: ToolRegistration; edit: ToolRegistration; bash: ToolRegistration };
 }
 
-/** Load the PRD from the project paths (errors in plain words). */
+/**
+ * Load the PRD from the project paths (errors in plain words).
+ *
+ * M1-P01 step (c): the root is canonicalized once and the configured/`--prd`
+ * file is read root-relative through the no-follow, capped host reader. A
+ * symlink (leaf or ancestor), an escaping/absolute path, a non-regular file or
+ * a file past the §2 cap is refused before any bytes are disclosed. Only a
+ * genuine ENOENT is "not found"; every other failure keeps the refusal code.
+ */
 export async function loadPrd(kit: LoopAndLock, prdPathArg?: string): Promise<string> {
 	const path = prdPathArg ?? kit.loop.config.paths.prd;
 	let rel: string;
 	try { rel = normalizeRelPath(kit.loop.paths.root, path); }
 	catch { throw new PlanParseError(`unsafe PRD path ${JSON.stringify(path)} — use a project-relative regular file`); }
 	const abs = join(kit.loop.paths.root, rel);
-	try {
-		const info = await lstat(abs);
-		const actual = await realpath(abs);
-		const root = await realpath(kit.loop.paths.root);
-		if (!info.isFile() || info.isSymbolicLink() || relative(root, actual).startsWith("..")) throw new Error("unsafe PRD file");
-		return await readFile(abs, "utf8");
-	} catch {
-		throw new PlanParseError(`PRD not found or unsafe at ${abs} — use a regular project file (init --with-demo adds a fixture)`);
-	}
+	const unavailable = (detail: string): PlanParseError =>
+		new PlanParseError(`PRD not found or unsafe at ${abs} — use a regular project file (init --with-demo adds a fixture): ${detail}`);
+	let root: string;
+	try { root = await resolveCanonicalProjectRoot(kit.loop.paths.root); }
+	catch (error) { throw unavailable((error as Error).message); }
+	const read = await readSafeText({ root, path: rel });
+	if (read.kind === "ok") return read.value;
+	throw unavailable(read.kind === "absent" ? "absent" : `${read.code}: ${read.message}`);
 }
 
 /** Run the one planning conversation and commit "planned" state. */

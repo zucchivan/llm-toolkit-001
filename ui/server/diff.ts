@@ -19,8 +19,9 @@
  */
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve as resolvePath, sep } from "node:path";
-import { readJson } from "../../src/util/fsx.ts";
 import { diffDisplayTrees, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
+import { resolveCanonicalProjectRoot } from "../../src/sandbox/host-profile.ts";
+import { openSafeFile, readSafeText } from "../../src/util/safe-read.ts";
 import type { DiffStats, DisplayDiffStats } from "../../src/util/git.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
 import type { WaveRow } from "../../src/engine/infos.ts";
@@ -63,9 +64,23 @@ export interface PatchLocation {
 	historical?: boolean;
 }
 
+/** Canonical root for this request; undefined when the root itself is unusable. */
+async function canonicalRoot(root: string): Promise<string | undefined> {
+	try { return await resolveCanonicalProjectRoot(root); } catch { return undefined; }
+}
+
+/** Read one small `.orch` side-car through the no-follow boundary (JSON or undefined). */
+async function readSidecarJson<T>(rootInput: string, path: string): Promise<T | undefined> {
+	const root = await canonicalRoot(rootInput);
+	if (!root) return undefined;
+	const read = await readSafeText({ root, path });
+	if (read.kind !== "ok") return undefined;
+	try { return JSON.parse(read.value) as T; } catch { return undefined; }
+}
+
 /** The current plan revision from the status side-car (undefined when unknown). */
 async function currentPlanRevision(root: string): Promise<string | undefined> {
-	const payload = await readJson<StatusPayloads>(join(root, ".orch", "status.json")).catch(() => undefined);
+	const payload = await readSidecarJson<StatusPayloads>(root, ".orch/status.json");
 	return typeof payload?.planRevision === "string" ? payload.planRevision : undefined;
 }
 
@@ -167,8 +182,11 @@ export async function readTaskDiff(root: string, taskId: string): Promise<Api<Ta
 		return { ok: false, status: 404, error: `no diff artifacts for task ${taskId} yet (only done/quarantined tasks persist a patch)` };
 	}
 	// Artifacts are written capped, but any hand-seeded file stays within §11.4.
-	const raw = await readFile(located.patchPath, "utf8").catch(() => undefined);
-	if (raw === undefined) return { ok: false, status: 404, error: `patch artifact ${located.patch} is unreadable` };
+	// The patch (and its stats side-car) are read through the no-follow boundary:
+	// a symlinked artifact or `.orch` ancestor is refused, never disclosed.
+	const locatedPatch = await readArtifactFile(root, located.patch);
+	if (locatedPatch === undefined) return { ok: false, status: 404, error: `patch artifact ${located.patch} is unreadable` };
+	const raw = locatedPatch.text;
 	const truncatedOnDisk = Buffer.byteLength(raw, "utf8") > DISPLAY_PATCH_CAP_BYTES;
 	const text = truncatedOnDisk ? Buffer.from(raw, "utf8").subarray(0, DISPLAY_PATCH_CAP_BYTES).toString("utf8") : raw;
 	const payload: TaskDiffPayload = {
@@ -176,13 +194,13 @@ export async function readTaskDiff(root: string, taskId: string): Promise<Api<Ta
 		task: taskId,
 		patch: located.patch,
 		stats: located.stats ?? null,
-		bytes: (await stat(located.patchPath).catch(() => ({ size: 0 }))).size,
+		bytes: locatedPatch.size,
 		truncated: false,
 		diff: text,
 		...(located.historical ? { historical: true } : {}),
 	};
-	if (located.statsPath) {
-		const stats = await readJson<DisplayDiffStats>(located.statsPath).catch(() => undefined);
+	if (located.stats) {
+		const stats = await readSidecarJson<DisplayDiffStats>(root, `.orch/artifacts/${located.stats}`);
 		if (stats) {
 			payload.statsJson = stats;
 			payload.truncated = stats.truncated === true || truncatedOnDisk;
@@ -192,6 +210,24 @@ export async function readTaskDiff(root: string, taskId: string): Promise<Api<Ta
 		payload.truncated = truncatedOnDisk;
 	}
 	return { ok: true, payload };
+}
+
+/**
+ * One validated artifact read: root-relative, no-follow, §2-capped (32 MiB).
+ * Undefined means absent OR refused; callers never see bytes from a link target.
+ */
+async function readArtifactFile(rootInput: string, name: string): Promise<{ text: string; size: number } | undefined> {
+	const root = await canonicalRoot(rootInput);
+	if (!root || !validateName(name)) return undefined;
+	const opened = await openSafeFile({ root, path: `.orch/artifacts/${name}` });
+	if (opened.kind !== "ok") return undefined;
+	try {
+		const read = await opened.value.readBytes();
+		if (read.kind !== "ok") return undefined;
+		return { text: read.value.toString("utf8"), size: opened.value.size };
+	} finally {
+		await opened.value.close();
+	}
 }
 
 export interface LiveDiffPayload {
@@ -226,7 +262,7 @@ export interface LiveDiffPayload {
 export async function liveTaskDiff(root: string, taskId: string): Promise<Api<LiveDiffPayload>> {
 	const id = validateTaskId(taskId);
 	if (!id.ok) return id;
-	const payload = await readJson<StatusPayloads>(join(root, ".orch", "status.json")).catch(() => undefined);
+	const payload = await readSidecarJson<StatusPayloads>(root, ".orch/status.json");
 	if (!payload?.task || payload.phase !== "wave-running" || payload.task.id !== taskId) {
 		return {
 			ok: false,
@@ -425,16 +461,26 @@ export function artifactPath(root: string, name: string): string | undefined {
 /**
  * One artifact: JSON `{name, bytes, mtimeMs}` metadata for oversized text,
  * `binary` for content with NUL bytes, plain text otherwise (≤ 5 MiB).
+ * The bytes come from the no-follow, capped boundary; the path/stat check here
+ * only picks the metadata branch and never discloses file content.
  */
 export async function readArtifact(root: string, name: string): Promise<ArtifactRead> {
 	const path = artifactPath(root, name);
-	const meta = path ? await stat(path).catch(() => undefined) : undefined;
-	if (!path || !meta?.isFile()) return { kind: "missing", name };
-	if (meta.size > DISPLAY_PATCH_CAP_BYTES) {
-		return { kind: "metadata", name, bytes: meta.size, download: `/api/artifacts/${encodeURIComponent(name)}?download=1` };
+	if (!path) return { kind: "missing", name };
+	const canonical = await canonicalRoot(root);
+	if (!canonical) return { kind: "missing", name };
+	const opened = await openSafeFile({ root: canonical, path: `.orch/artifacts/${name}` });
+	if (opened.kind !== "ok") return { kind: "missing", name };
+	try {
+		const size = opened.value.size;
+		if (size > DISPLAY_PATCH_CAP_BYTES) {
+			return { kind: "metadata", name, bytes: size, download: `/api/artifacts/${encodeURIComponent(name)}?download=1` };
+		}
+		const read = await opened.value.readBytes();
+		if (read.kind !== "ok") return { kind: "missing", name };
+		if (read.value.includes(0)) return { kind: "binary", name, bytes: size };
+		return { kind: "text", name, text: read.value.toString("utf8"), bytes: read.value.length, truncated: false };
+	} finally {
+		await opened.value.close();
 	}
-	const buf = await readFile(path).catch(() => undefined);
-	if (buf === undefined) return { kind: "missing", name };
-	if (buf.includes(0)) return { kind: "binary", name, bytes: meta.size };
-	return { kind: "text", name, text: buf.toString("utf8"), bytes: buf.length, truncated: false };
 }
