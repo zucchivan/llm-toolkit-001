@@ -207,15 +207,15 @@ every failure answers with its plain-words reason and sends NO signal:
 3. **Working directory** — `/proc/<pid>/cwd` realpath equals the project
    root. Failure text: "pid N is alive but its working directory is X, not
    this project".
-4. **Command identity** — `/proc/<pid>/cmdline` argv contains exactly ONE
-   token after `argv[0]` whose realpath equals the CLI entry this UI resolves
-   for spawning its own jobs (the same chain: explicit bin override → the
-   project's `.bin` → the kit's `dist/cli.js` → PATH → tsx; relative tokens
-   resolve against the verified cwd), and the token immediately following it
-   is a lock-holding subcommand (`plan` or `run`). Required tokens: the entry
-   token and that subcommand token. NOT required: any other token — flags,
-   task lists, the node interpreter, `argv[0]` form. Anything else visible in
-   the argv is ignored.
+4. **Command identity** — `/proc/<pid>/exe` and `/proc/<pid>/cmdline` match
+   the SAME host-owned launch identity this UI records for its own jobs
+   (M1-P01 step (f): `[node, ...(loader), entry]` selected and validated from
+   the operator-selected trusted installation descriptor — never
+   `KIT_UI_CLI_BIN`, the project's `.bin`, cwd or PATH), and the token
+   immediately following the prefix is a lock-holding subcommand (`plan` or
+   `run`). Tokens are compared canonically against the verified cwd. NOT
+   required: any other token — flags, task lists. Anything else visible in the
+   argv is ignored.
 5. **One re-verified signal** — immediately before signalling, the full check
    re-runs (the run may have exited, or the holder may have changed between
    the browser's confirmation and now); then exactly one `SIGINT` is sent —
@@ -926,11 +926,16 @@ semantics, config, docs, or CLI output for users who never open the UI.
 
 ### A.4 CLI forwarder
 
-- `llm-toolkit-001 ui [args…]` resolves `llm-toolkit-ui` from PATH or
-  `ui/node_modules/.bin`, then spawns it with the same args and inherited
-  stdio/env. No import of UI code from the kit.
-- Missing UI package: print `npm --prefix ui install` (repo) / the package
-  install hint and exit 1.
+- `llm-toolkit-001 ui [args…]` builds the host-owned installation descriptor
+  (operator host profile + fixed defaults; never the target, cwd, PATH or a
+  `KIT_*` value) and spawns the UI entry as ONE fixed literal argv —
+  `node ui/bin/llm-toolkit-ui.js` — with the same args and inherited stdio/env
+  (M1-P01 step (f)). There is no `ui/node_modules/.bin`, cwd or PATH candidate
+  search; an invalid selected entry refuses and never tries another. No import
+  of UI code from the kit.
+- Missing/unselected UI package: print `npm --prefix ui install` (repo) / the
+  package install hint and exit 1. An invalid selected UI entry prints the
+  typed refusal reason and exits 1.
 - No other core CLI changes.
 
 ### A.5 Conversation transcript excerpts (additive, inspector-level)
@@ -1009,7 +1014,7 @@ it does not claim that hardening is already shipped.
 | Receipt-based badges | **SHIPPED (M0-P15, ui 0.13.0):** review, checks, workspace-recovery, and publication render as four separate labels from the receipt projection (core-shared `receiptLabels()` derivation; the CLI views render the same words). Each label keeps not-requested/pending/unknown/no-receipt states; quarantined does not imply discarded/rolled back; review approval does not imply delivered. |
 | Checkpoint diff, not working-copy diff | **SHIPPED (M0-P15, ui 0.13.0):** the UI's live view reads the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists; the freeze timestamp labels the view. Operator-checkout edits are not task changes. |
 | Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
-| Trusted launcher resolution | **DESIGN, activates M1-P01:** validate an operator-selected trusted installation and reject target-local `.bin`, cwd/PATH and symlink escapes for CLI/host executable resolution; attached-stop uses the same resolved identity. Explicit absolute overrides belong only to the non-project host profile. No sandbox execution, package export, v2 DTO or UI state-writing authority is added by this amendment. **M4-P04** later locates that trusted CLI through installed package metadata and must preserve the M1 trust boundary. |
+| Trusted launcher resolution | **SHIPPED (M1-P01 step (f)):** the UI/CLI launch and attached-stop use ONE host-owned descriptor/argv identity (`[node, entry]`, or the documented dev-in-kit `[node, ui tsx loader, src/cli.ts]` form) selected and validated from the operator-selected installation; target-local `.bin`, cwd/PATH and `KIT_UI_CLI_BIN` can no longer select the CLI, job records persist the identity the detached runner revalidates before spawning, and attached-stop verifies `/proc` `exe`/argv against that same prefix. Explicit absolute overrides belong only to the non-project host profile. No sandbox execution, package export, v2 DTO or UI state-writing authority is added by this amendment. **M4-P04** later locates that trusted CLI through installed package metadata and must preserve the M1 trust boundary. |
 
 **Reserved for a separate M4 amendment:** live-plan/sequence side-car facts,
 `seam: 2` and nullable read DTOs, the packaged read-only entry point, and
@@ -1028,8 +1033,14 @@ resolution/delivery command.
 ## Appendix B — Detached job runner
 
 - Job record: `.orch/ui/jobs/<id>.json`
-  `{ id, kind, argv, cwd, pid, startedAt, endedAt?, exitCode?, status:
-  "running" | "exited" | "failed" | "stale", logPath }`.
+  `{ id, kind, argv, identity, cwd, pid, startedAt, endedAt?, exitCode?,
+  status: "running" | "exited" | "failed" | "stale", logPath }`. `identity` is
+  the host-owned launch identity recorded at spawn (M1-P01 step (f)):
+  `{version, tool, installationRoot, node, entry, loader?, form, argvPrefix,
+  source, descriptorSha256}`; the runner refuses a record whose `argv` does not
+  start with exactly that prefix, whose files changed into symlinks/
+  writable/foreign paths, or whose installation root is not its own — before
+  spawning anything.
 - Log: `.orch/ui/jobs/<id>.log` (stdout + stderr, line-buffered).
 - Spawn a small Node runner detached (no shell), which spawns the CLI, pipes
   its output to the log, writes the exit code atomically, then exits. The UI
@@ -1038,8 +1049,11 @@ resolution/delivery command.
   history (bounded, e.g. last 50 or 14 days).
 - Attached runs are discovered from `status.json.lockedByPid`; liveness is a
   best-effort PID check. They are not job records unless launched by the UI.
-- Env is inherited from the UI server (including `KIT_FAUX*`, provider keys).
-  No secrets are written to job records.
+- Env is inherited from the UI server (including `KIT_FAUX*`, provider keys)
+  MINUS executable selectors: `KIT_UI_CLI_BIN`, undocumented `KIT_*` names,
+  `NODE_OPTIONS`/`NODE_PATH`, `LD_*`/`DYLD_*` loader variables and
+  `BASH_ENV`/`ENV`. The CLI's executable is the recorded absolute argv, never
+  anything the environment names. No secrets are written to job records.
 
 ## Appendix C — Auth flow
 

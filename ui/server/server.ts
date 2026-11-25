@@ -44,6 +44,7 @@ import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
 import { currentJobsEvent, startSnapshotHub, type SnapshotHub } from "./sse.ts";
 import { jobsList, jobsViewList, markStaleRecords, pruneJobs, readJobRecord, runningJobPids, tailJobLog } from "./jobs.ts";
+import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 
 export interface UiServerOptions {
 	/** The project directory this server reads (one project per server). */
@@ -63,6 +64,12 @@ export interface UiServerOptions {
 	heartbeatMs?: number;
 	/** Test seam: skip the startup jobs sweep (markStale/prune). */
 	skipJobSweep?: boolean;
+	/**
+	 * The host-owned installation descriptor the UI entry built at startup
+	 * (M1-P01 step (f)). Job launch and attached-stop share this ONE identity;
+	 * direct callers/tests may omit it and use the process descriptor.
+	 */
+	installation?: TrustedInstallationDescriptor;
 }
 
 export interface RunningUiServer {
@@ -78,7 +85,7 @@ export function startServer(opts: UiServerOptions): Promise<RunningUiServer> {
 	const bindHost = opts.host ?? "127.0.0.1";
 	// C.1: decided from the BIND string, never from the request (see auth.ts).
 	const posture = bindPostureFor(bindHost);
-	const hub = startSnapshotHub(opts.root);
+	const hub = startSnapshotHub(opts.root, { ...(opts.installation ? { installation: opts.installation } : {}) });
 	if (!opts.skipJobSweep) {
 		void markStaleRecords(opts.root)
 			.then((stale) => {
@@ -215,7 +222,7 @@ async function route(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 		}
 		if (pathname === "/api/jobs") {
 			if (req.method !== "GET") return void jsonError(res, 405, `method ${req.method ?? "?"} not allowed`);
-			const payload = await currentJobsEvent(opts.root);
+			const payload = await currentJobsEvent(opts.root, opts.installation);
 			res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
 			res.end(JSON.stringify(payload));
 			return;
@@ -488,6 +495,7 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 			const attached = await attachedStopAction(opts.root, {
 				expectedPid: body.pid,
 				uiJobPids: runningJobPids(await jobsList(opts.root)),
+				...(opts.installation ? { installation: opts.installation } : {}),
 			});
 			if (!attached.ok) {
 				jsonError(res, attached.fail.status, attached.fail.error, {
@@ -513,7 +521,7 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 		res.end(JSON.stringify({ jobId: result.jobId, pid: result.pid, kind: "stop" }));
 		return;
 	}
-	const result = await startAction(opts.root, body);
+	const result = await startAction(opts.root, body, opts.installation);
 	if (!result.ok) {
 		jsonError(res, result.fail.status, result.fail.error, {
 			...(result.fail.holderPid ? { holderPid: result.fail.holderPid } : {}),
@@ -543,7 +551,7 @@ function serveEvents(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 	void readOnce(opts.root)
 		.then((snapshot) => write(`event: readout\ndata: ${JSON.stringify(snapshot)}\n\n`))
 		.catch(() => write("event: readout\ndata: null\n\n"));
-	void currentJobsEvent(opts.root)
+	void currentJobsEvent(opts.root, opts.installation)
 		.then((payload) => write(`event: job\ndata: ${JSON.stringify(payload)}\n\n`))
 		.catch(() => {});
 	const unsubscribe = hub.subscribe(write);

@@ -32,11 +32,14 @@ import {
 	currentTrustedInstallation,
 	gitHardeningArgs,
 	installTrustedInstallationForTests,
+	installationDescriptorDigest,
 	loadTrustedInstallation,
+	requireLaunchPrefix,
 	requireTrustedTool,
 	runningInstallationFrom,
 	runTrustedTool,
 	selectInstallation,
+	selectLaunchPrefix,
 } from "../src/sandbox/trusted-exec.ts";
 import { execTrusted } from "../src/util/exec.ts";
 import { validateTrustedExecutableFile } from "../src/sandbox/host-profile.ts";
@@ -314,6 +317,110 @@ describe("per-use validation", () => {
 		const target = await tempDir("kit-te-target-");
 		await installExecutable(root, "git");
 		await expect(validateTrustedExecutableFile(join(root, "git"), "git", { targetRoot: target })).resolves.toBeTruthy();
+	});
+});
+
+describe("launch identity (step f)", () => {
+	it("selects a built entry as exactly [node, entry] — with no PATH/cwd/target/env input", () => {
+		const saved = { PATH: process.env["PATH"], KIT_UI_CLI_BIN: process.env["KIT_UI_CLI_BIN"] };
+		process.env["PATH"] = "/target/node_modules/.bin:/usr/bin";
+		process.env["KIT_UI_CLI_BIN"] = "/target/node_modules/.bin/llm-toolkit-001";
+		try {
+			const running = runningInstallationFrom("file:///srv/kit/dist/sandbox/trusted-exec.js", "linux");
+			const descriptor = selectInstallation({ platform: "linux", running, execPath: "/usr/bin/node" });
+			const selected = selectLaunchPrefix(descriptor, "cli");
+			expect(selected.ok).toBe(true);
+			if (!selected.ok) return;
+			expect(selected.value).toMatchObject({
+				tool: "cli",
+				form: "built",
+				node: "/usr/bin/node",
+				entry: "/srv/kit/dist/cli.js",
+				argv: ["/usr/bin/node", "/srv/kit/dist/cli.js"],
+				installationRoot: "/srv/kit",
+			});
+			expect(selected.value.loader).toBeUndefined();
+			// the UI launch identity is the installation's own bin, through the same node
+			const ui = selectLaunchPrefix(descriptor, "ui");
+			expect(ui.ok && ui.value.argv).toEqual(["/usr/bin/node", "/srv/kit/ui/bin/llm-toolkit-ui.js"]);
+		} finally {
+			for (const [name, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+	});
+
+	it("uses the documented dev-in-kit source form [node, ui tsx loader, src/cli.ts]", async () => {
+		const kit = await tempDir("kit-te-kit-");
+		await fixtureKit(kit);
+		const runtime = await tempDir("kit-te-runtime-");
+		const node = await installExecutable(runtime, "bin/node", "// node\n");
+		const loader = await installExecutable(kit, "ui/node_modules/tsx/dist/cli.mjs", "// tsx\n");
+		const target = await tempDir("kit-te-target-");
+		const descriptor = selectInstallation({ platform: "linux", running: runningFrom(kit), execPath: node });
+		const prefix = await requireLaunchPrefix(descriptor, "cli", { targetRoot: target });
+		expect(prefix).toMatchObject({
+			form: "source",
+			node,
+			entry: join(kit, "src", "cli.ts"),
+			loader,
+			argv: [node, loader, join(kit, "src", "cli.ts")],
+			installationRoot: kit,
+		});
+		// Dev-in-kit: the same launch validates when the project IS the installation.
+		await expect(requireLaunchPrefix(descriptor, "ui", { targetRoot: kit })).resolves.toMatchObject({
+			form: "built",
+			entry: join(kit, "ui", "bin", "llm-toolkit-ui.js"),
+		});
+		expect(spawned).toHaveLength(0);
+	});
+
+	it("refuses a TypeScript entry that is not the running installation's own — never a candidate search", () => {
+		const descriptor = selectInstallation({
+			platform: "linux",
+			running: runningInstallationFrom("file:///srv/kit/src/sandbox/trusted-exec.ts", "linux"),
+			execPath: "/usr/bin/node",
+			installation: { cli: "/srv/other/cli.ts" },
+		});
+		expect(selectLaunchPrefix(descriptor, "cli")).toMatchObject({ ok: false, code: "unsupported-entry" });
+	});
+
+	it("refuses a missing/in-target selected entry before any spawn (no default fallback)", async () => {
+		const kit = await tempDir("kit-te-kit-");
+		await fixtureKit(kit);
+		const runtime = await tempDir("kit-te-runtime-");
+		const node = await installExecutable(runtime, "bin/node", "// node\n");
+		const target = await tempDir("kit-te-target-");
+		await installExecutable(target, "node_modules/.bin/llm-toolkit-001.js");
+		const descriptor = selectInstallation({
+			platform: "linux",
+			running: runningFrom(kit),
+			execPath: node,
+			installation: { cli: join(target, "node_modules", ".bin", "llm-toolkit-001.js") },
+		});
+		await expect(requireLaunchPrefix(descriptor, "cli", { targetRoot: target }))
+			.rejects.toMatchObject({ code: "installation-inside-target" });
+
+		const missing = selectInstallation({
+			platform: "linux",
+			running: runningFrom(kit),
+			execPath: node,
+			installation: { cli: join(kit, "dist", "absent-cli.js") },
+		});
+		await expect(requireLaunchPrefix(missing, "cli", { targetRoot: target })).rejects.toMatchObject({ code: "not-found" });
+		expect(spawned).toHaveLength(0);
+	});
+
+	it("has one canonical descriptor digest and refuses a tool it never selected", async () => {
+		const kit = await tempDir("kit-te-kit-");
+		await fixtureKit(kit);
+		const descriptor = selectInstallation({ platform: "linux", running: runningFrom(kit), execPath: process.execPath });
+		const digest = installationDescriptorDigest(descriptor);
+		expect(digest).toMatch(/^[0-9a-f]{64}$/);
+		expect(installationDescriptorDigest(selectInstallation({ platform: "linux", running: runningFrom(kit), execPath: process.execPath }))).toBe(digest);
+		const helpers = { version: 1 as const, platform: "linux" as const, tools: { node: { path: process.execPath, source: "fixed-default" as const, runningEntry: false } } };
+		expect(selectLaunchPrefix(helpers, "cli")).toMatchObject({ ok: false, code: "not-configured" });
 	});
 });
 

@@ -657,7 +657,7 @@ not an OS sandbox.
   project value after that point; a missing/relative/non-normalized root is a
   typed `HostProfileError`, never a guess.
 
-## Host-owned trusted installation (M1-P01 step (e)) — `src/sandbox/trusted-exec.ts`
+## Host-owned trusted installation (M1-P01 steps (e)–(f)) — `src/sandbox/trusted-exec.ts`
 
 One host-owned descriptor names the executable for each host tool. It is built
 from the operator host-profile `installation.*` overrides plus fixed defaults;
@@ -690,6 +690,29 @@ config/env, `KIT_*` or argv.
 - **Injection.** `installTrustedInstallationForTests(descriptor)` supplies an
   in-process descriptor; it is host authority (production builds from the
   profile), not a bypass of per-use validation.
+- **Launch identity (step f).** `selectLaunchPrefix(descriptor, "cli"|"ui")`
+  turns the descriptor into the ONE fixed literal argv prefix:
+  `[node, entry]` for a built/JavaScript entry (`dist/cli.js`,
+  `ui/bin/llm-toolkit-ui.js`) and the documented dev-in-kit
+  `[node, <installation>/ui/node_modules/tsx/dist/cli.mjs, src/cli.ts]` form
+  for the running installation's own TypeScript entry (a `.ts` path elsewhere
+  is refused — there is no fallback or second candidate).
+  `requireLaunchPrefix(...)` validates interpreter, entry and (source form) the
+  installation's own tsx loader per use with the same file-trust rules.
+  `installationDescriptorDigest(descriptor)` is a SHA-256 over the selected
+  tool paths — recorded identity, never authority.
+- **UI/CLI launch and attached-stop share it.** `src/cli.ts` `cmdUi` builds the
+  descriptor and starts the UI from the `ui` prefix (no `findUiBin`, no
+  kit/cwd/PATH candidate search). `ui/server/cli.ts` builds the descriptor once
+  and hands it to `startServer` → `startAction`/`resolveCli` → `spawnJob`, which
+  records `{node, entry, (loader), form, argvPrefix, installationRoot, source,
+  descriptorSha256}` in the private job record; `job-runner.mjs` revalidates
+  the record's argv/files/installation against that identity BEFORE any spawn
+  (a tampered, foreign or identity-less record fails the record and spawns
+  nothing). `ui/server/attached-stop.ts` compares `/proc/<pid>/exe` and
+  `/proc/<pid>/cmdline` against the same prefix (plus cwd + subcommand), with no
+  independent `resolveCli` and no PATH/target fallback. `KIT_UI_CLI_BIN` is
+  retired as authority and is dropped from job environments.
 - **Spawn.** `runTrustedTool(tool, literalArgv, options)` resolves/validates the
   tool, prepends fixed hardened Git config when the tool is Git, builds the
   host environment, and calls `execTrusted` in `src/util/exec.ts` with
@@ -712,10 +735,10 @@ config/env, `KIT_*` or argv.
   `src/engine/delivery.ts` (`git`/`gh` publication; `gh` only for
   `delivery.mode=pr` + explicit `--deliver`), `src/hygiene.ts` (init-time Git)
   and `ui/server/demo.ts` (demo bake through filter-free plumbing).
-- **Still deferred.** Step (f): CLI/UI launch + attached-stop identity
-  (`src/cli.ts` `cmdUi`/`findUiBin`, `ui/server/{actions,cli,jobs}.ts`,
-  `job-runner.mjs`, `attached-stop.ts`) and the `KIT_UI_CLI_BIN` retirement.
-  Step (g): async config reads. P05: gate/probe execution
+- **Still deferred.** Step (g): async config reads (`src/config.ts`,
+  `src/engine/{harness,inspector,handoffs}.ts`, `ui/server/readout.ts`,
+  `src/adoption/cli.ts`, `src/adoption/gaps.ts`) and the remaining
+  artifact/download/SSE reads. P05: gate/probe execution
   (`src/engine/recipe-runner.ts`) must consume this resolver, not add another.
 
 ## Host read boundary (M1-P01 steps c–d) — `src/util/safe-read.ts` + call sites
@@ -755,15 +778,13 @@ config/env, `KIT_*` or argv.
   strict paths (`src/engine/inspector.ts`, `ui/server/readout.ts`,
   `src/adoption/cli.ts`). `loadRecipes`/`loadRecipeFile` likewise remain for
   `src/adoption/gaps.ts` and existing tests.
-- NOT wired (deferred to P01 steps f/g or P05; recorded in
-  `docs/engineering-plan/evidence/M1-P01.md`): trusted CLI/UI launch and
-  attached-stop identity (`src/cli.ts` `cmdUi`/`findUiBin`, `ui/server/actions.ts`
-  `resolveCli`/`KIT_UI_CLI_BIN`, `ui/server/jobs.ts` + `job-runner.mjs`,
-  `ui/server/attached-stop.ts`), gate/probe recipe execution
-  (`src/engine/recipe-runner.ts`, P05 — it must consume the step (e) resolver),
-  `.orch/wave-log.jsonl` tail reads, `ui/server/sse.ts` `.orch`/jobs metadata
-  fingerprints, `src/engine/handoffs.ts`, `src/engine/inspector.ts`, the sync
-  config callers, artifact listing and the `ui/server/server.ts` download routes.
+- NOT wired (deferred to P01 step (g) or P05; recorded in
+  `docs/engineering-plan/evidence/M1-P01.md`): the async config cutover, the
+  remaining `inspect`/handoff/source/artifact/download/SSE reads and
+  gate/probe recipe execution (`src/engine/recipe-runner.ts`, P05 — it must
+  consume the step (e) resolver, not add another chain). CLI/UI launch and
+  attached-stop are wired to the trusted installation's launch identity in
+  step (f).
 
 ## src/views/*.ts + src/cli.ts
 

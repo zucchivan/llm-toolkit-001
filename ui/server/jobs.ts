@@ -21,8 +21,109 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
+import {
+	installationDescriptorDigest,
+	type TrustedLaunchPrefix,
+} from "../../src/sandbox/trusted-exec.ts";
+import type { TrustedInstallationDescriptor, TrustedToolSource } from "../../src/sandbox/types.ts";
 
 export type JobKind = "plan" | "run" | "verify" | "export" | "handoff";
+
+/**
+ * The host-owned launch identity recorded with a job (M1-P01 step (f)).
+ *
+ * The UI resolves it ONCE per action from the host descriptor, records it in
+ * private job state, and the detached runner revalidates the recorded argv
+ * against exactly this identity before spawning. There is no re-resolution
+ * (no descriptor read, no PATH, no target `.bin`, no `KIT_*` value) after the
+ * record, and attached-stop compares a live process against the same prefix.
+ */
+export interface JobLaunchIdentity {
+	version: 1;
+	tool: "cli";
+	/** The proven running installation root (a foreign record is refused). */
+	installationRoot: string;
+	/** Absolute interpreter; byte-equal to `argvPrefix[0]`. */
+	node: string;
+	/** Absolute selected CLI entry. */
+	entry: string;
+	/** Absolute tsx loader for the documented source form; absent when built. */
+	loader?: string;
+	form: "built" | "source";
+	/** Exactly `[node, ...(loader), entry]` — the recorded argv must start with it. */
+	argvPrefix: string[];
+	/** Where the selected CLI entry came from (provenance, not authority). */
+	source: TrustedToolSource;
+	/** SHA-256 over the descriptor's selected tool paths (identity, not authority). */
+	descriptorSha256: string;
+}
+
+/** Build the record identity from the validated launch prefix. */
+export function jobLaunchIdentity(
+	prefix: TrustedLaunchPrefix,
+	descriptor: TrustedInstallationDescriptor,
+): JobLaunchIdentity {
+	return {
+		version: 1,
+		tool: "cli",
+		installationRoot: prefix.installationRoot,
+		node: prefix.node,
+		entry: prefix.entry,
+		...(prefix.loader !== undefined ? { loader: prefix.loader } : {}),
+		form: prefix.form,
+		argvPrefix: [...prefix.argv],
+		source: prefix.source,
+		descriptorSha256: installationDescriptorDigest(descriptor),
+	};
+}
+
+/**
+ * Kit-named variables that carry inference/debug selection and ARE documented
+ * as inherited by UI jobs (ui/PRD.md Appendix B, §15.2 demo mode). Every other
+ * `KIT_*` name — including the retired `KIT_UI_CLI_BIN` executable selector —
+ * is dropped from a job's environment.
+ */
+const JOB_ENV_ALLOWED_KIT = new Set(["KIT_FAUX", "KIT_FAUX_SCRIPT", "KIT_DEBUG", "KIT_DEBUG_FAUX"]);
+
+/**
+ * Env names that can select/inject a different executable or module into the
+ * launched CLI. They are never inherited by a job; the job's executable is the
+ * recorded absolute argv, not anything these variables could redirect.
+ */
+const JOB_ENV_DENIED = new Set([
+	"NODE_OPTIONS",
+	"NODE_PATH",
+	"NODE_REPL_EXTERNAL_MODULE",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"DYLD_INSERT_LIBRARIES",
+	"DYLD_LIBRARY_PATH",
+	"DYLD_FRAMEWORK_PATH",
+	"BASH_ENV",
+	"ENV",
+	"SHELLOPTS",
+	"BASHOPTS",
+	"KIT_UI_CLI_BIN",
+	"KIT_UI_HOST",
+	"KIT_UI_JOB",
+]);
+
+/**
+ * The environment a detached job inherits: the UI server's env minus executable
+ * authority and non-documented `KIT_*` names. Provider credentials, proxies and
+ * `KIT_FAUX*` stay (the CLI needs them); nothing here selects a binary.
+ */
+export function jobEnvironment(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [name, value] of Object.entries(env)) {
+		if (typeof value !== "string") continue;
+		if (JOB_ENV_DENIED.has(name)) continue;
+		if (name.startsWith("KIT_") && !JOB_ENV_ALLOWED_KIT.has(name)) continue;
+		out[name] = value;
+	}
+	return out;
+}
 
 export interface JobRecord {
 	id: string;
@@ -30,6 +131,8 @@ export interface JobRecord {
 	/** The exact argv the runner spawned (interpreter included). Never a shell string. */
 	argv: string[];
 	cwd: string;
+	/** The host-owned launch identity `argv` must start with (step (f)). */
+	identity?: JobLaunchIdentity;
 	/** The CLI child's pid (the lock holder); the runner writes it right after spawn. */
 	pid?: number;
 	/** The detached runner's own pid (liveness fallback while the CLI is still starting). */
@@ -260,8 +363,10 @@ export interface SpawnJobInput {
 	kind: JobKind;
 	/** Full argv incl. interpreter — argv-only, never a shell string (PRD §11.2). */
 	spawnedArgv: string[];
+	/** The host-owned launch identity the argv was built from (step (f)). */
+	identity: JobLaunchIdentity;
 	cwd: string;
-	/** Extra env for the job (merged over process.env). */
+	/** Extra env for the job (sanitized by jobEnvironment; never an executable selector). */
 	env?: Record<string, string>;
 }
 
@@ -281,6 +386,7 @@ export async function spawnJob(projectRoot: string, input: SpawnJobInput): Promi
 		id,
 		kind: input.kind,
 		argv: input.spawnedArgv,
+		identity: input.identity,
 		cwd: input.cwd,
 		startedAt: Date.now(),
 		status: "running",
@@ -294,7 +400,9 @@ export async function spawnJob(projectRoot: string, input: SpawnJobInput): Promi
 		cwd: projectRoot,
 		detached: true, // own process group: the UI server's death cannot take the run down
 		stdio: "ignore",
-		env: { ...process.env, ...(input.env ?? {}) },
+		// Sanitized: the job never inherits an executable selector (the recorded
+		// absolute argv is the executable), while KIT_FAUX*/provider keys/are kept.
+		env: jobEnvironment({ ...process.env, ...(input.env ?? {}) }),
 	});
 	child.unref?.();
 	// Record the runner's own pid for the liveness fallback ONLY — `pid` stays

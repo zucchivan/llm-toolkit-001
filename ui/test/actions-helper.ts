@@ -1,16 +1,50 @@
 /** Shared test scaffolding for the action/jobs suite (§15.1). */
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { startServer, type RunningUiServer } from "../server/server.ts";
+import { installTrustedInstallationForTests, selectInstallation } from "../../src/sandbox/trusted-exec.ts";
+import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 import { bakeConfiguredDemo } from "./helpers.ts";
 
 const STUB = await readFile(join(import.meta.dirname, "stub-cli.mjs"), "utf8");
 
+/**
+ * A controlled 0755 interpreter path: a hard link (or copy) of the running node
+ * binary in a private 0755 temp dir. The approved installation rule refuses the
+ * host's group-writable node installation ancestry on this machine (see the
+ * M1-P01 evidence, residual R1); fixtures use this path to prove the launch
+ * identity while the mode rule itself stays unchanged. It is test scaffolding,
+ * never a production fallback.
+ */
+let runtimeFixture: Promise<string> | undefined;
+export function trustedNodeFixture(): Promise<string> {
+	runtimeFixture ??= (async () => {
+		const dir = await mkdtemp(join(tmpdir(), "ui-runtime-"));
+		await chmod(dir, 0o755);
+		const target = join(dir, "node");
+		try {
+			await link(process.execPath, target);
+		} catch {
+			await copyFile(process.execPath, target);
+		}
+		await chmod(target, 0o755);
+		return target;
+	})();
+	return runtimeFixture;
+}
+
 export interface Baked {
 	root: string;
+	/** The stub CLI entry, outside the project root (a target-local one refuses). */
 	stubCli: string;
+	/** The temp directory holding the stub (removed by `cleanup`). */
+	stubDir: string;
+	/** The host-owned descriptor injected for this server (step (f)). */
+	installation: TrustedInstallationDescriptor;
+	/** The controlled interpreter path recorded in the launch identity. */
+	node: string;
 	running: RunningUiServer;
 	cookie: string;
 	csrf: string;
@@ -19,27 +53,48 @@ export interface Baked {
 
 export async function bake(opts: { heartbeatMs?: number; skipJobSweep?: boolean } = {}): Promise<Baked> {
 	const root = await bakeConfiguredDemo();
-	// a stub CLI the jobs can run fast and deterministically (direct spawn needs +x + shebang)
-	const stubCli = join(root, "stub-cli.mjs");
+	// M1-P01 step (f): the CLI is selected by the host-owned descriptor — never
+	// KIT_UI_CLI_BIN, a target `.bin` or PATH. The stub lives OUTSIDE the project
+	// root because a target-local executable is refused by the installation rule.
+	const stubDir = await mkdtemp(join(tmpdir(), "ui-stub-cli-"));
+	const stubCli = join(stubDir, "stub-cli.mjs");
 	await writeFile(stubCli, STUB, "utf8");
 	await chmod(stubCli, 0o755);
-	const running = await startServer({
+	const node = await trustedNodeFixture();
+	const installation = selectInstallation({
+		execPath: node,
+		installation: { cli: stubCli, node },
+	});
+	installTrustedInstallationForTests(installation);
+	const started = await startServer({
 		root,
 		token: "testtoken-typescript",
 		port: 0,
 		distDir: await fakeDistDir(),
 		heartbeatMs: opts.heartbeatMs,
 		skipJobSweep: opts.skipJobSweep,
+		installation,
 	});
 	return {
 		root,
 		stubCli,
-		running,
+		stubDir,
+		installation,
+		node,
+		running: started,
 		// Both cookies like a real browser session (the SPA echoes the CSRF one in X-Kit-Token).
 		cookie: "kit_ui=testtoken-typescript; kit_ui_csrf=testtoken-typescript",
 		csrf: "testtoken-typescript",
-		base: `http://127.0.0.1:${running.port}`,
+		base: `http://127.0.0.1:${started.port}`,
 	};
+}
+
+/** Tear a baked fixture down: server, project root, stub dir, injected descriptor. */
+export async function cleanup(baked: Baked): Promise<void> {
+	await baked.running.shutdown().catch(() => {});
+	await rm(baked.root, { recursive: true, force: true }).catch(() => {});
+	await rm(baked.stubDir, { recursive: true, force: true }).catch(() => {});
+	installTrustedInstallationForTests(undefined);
 }
 
 let distDir: Promise<string> | undefined;

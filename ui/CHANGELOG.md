@@ -4,6 +4,34 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## Unreleased — M1-P01 step (f): one trusted launch identity for jobs and attached stop
+
+Host-boundary change; no UI component, package or lockfile change, so no
+version bump in this packet (the bump lands with the next UI milestone
+release). `readout.seam` stays 1.
+
+- **The UI no longer resolves the CLI itself.** `resolveCli` now takes the
+  host-owned installation descriptor the UI entry (`ui/server/cli.ts`) builds
+  at startup and returns ONE fixed literal argv prefix (`[node, dist/cli.js]`,
+  or the documented dev-in-kit `[node, ui tsx loader, src/cli.ts]` form plus
+  the canonical identity). `KIT_UI_CLI_BIN`, a target
+  `node_modules/.bin/llm-toolkit-001`, a kit-root copy and PATH are never
+  consulted; an invalid selected entry refuses instead of falling back.
+- **Job records carry the identity.** `.orch/ui/jobs/<id>.json` gains
+  `identity {version, tool, installationRoot, node, entry, loader?, form,
+  argvPrefix, source, descriptorSha256}`. The detached runner revalidates the
+  recorded argv, files and installation against it BEFORE opening the log or
+  spawning: a tampered, foreign or identity-less record is marked
+  `failed` with a plain `refused:` reason, and nothing runs. Job env keeps
+  `KIT_FAUX`/`KIT_FAUX_SCRIPT` (demo mode) and provider credentials while
+  dropping executable selectors (`KIT_UI_CLI_BIN`, other `KIT_*`,
+  `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`/`ENV`).
+- **Attached stop verifies the same identity.** `/proc/<pid>/exe` and
+  `/proc/<pid>/cmdline` are compared against the recorded prefix (plus cwd and
+  the `plan`/`run` subcommand); a second entry reachable through
+  `KIT_UI_CLI_BIN`/PATH/target `.bin` cannot verify, and the Linux-only
+  refusal + no-signal-on-failure guarantees are unchanged.
+
 ## Unreleased — M1-P01 step (c): no-follow source and artifact reads
 
 Security-boundary change in the server read paths; no UI component, package or

@@ -7,7 +7,7 @@
  * project.
  */
 import { describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec } from "../../src/util/exec.ts";
@@ -15,6 +15,8 @@ import { loadConfig } from "../../src/config.ts";
 import { installTrustedInstallationForTests, runningInstallationFrom, selectInstallation } from "../../src/sandbox/trusted-exec.ts";
 import { bakeDemoProject } from "../server/demo.ts";
 import { startServer } from "../server/server.ts";
+import { readJobRecord } from "../server/jobs.ts";
+import { postAction, trustedNodeFixture, waitFor } from "./actions-helper.ts";
 
 const REPO_ROOT = new URL("../../", import.meta.url).pathname;
 
@@ -90,6 +92,42 @@ describe("bakeDemoProject", () => {
 			expect(snap.readout.identity.root).toBe(root);
 		} finally {
 			await running.shutdown();
+		}
+	});
+
+	it("the demo project runs a job through the injected descriptor identity (step (f), no real CLI needed)", async () => {
+		const { root } = await bakeDemoProject(REPO_ROOT);
+		const stubDir = await mkdtemp(join(tmpdir(), "ui-demo-stub-"));
+		const stub = join(stubDir, "stub-cli.mjs");
+		await writeFile(stub, await readFile(join(import.meta.dirname, "stub-cli.mjs"), "utf8"), "utf8");
+		await chmod(stub, 0o755);
+		const node = await trustedNodeFixture();
+		const installation = selectInstallation({
+			execPath: node,
+			installation: { cli: stub, node },
+		});
+		installTrustedInstallationForTests(installation);
+		const dist = await mkdtemp(join(tmpdir(), "ui-demo-dist-"));
+		await mkdir(join(dist, "assets"), { recursive: true });
+		await writeFile(join(dist, "index.html"), "<!doctype html><title>ok</title>", "utf8");
+		const token = "demotoken";
+		const running = await startServer({ root, token, port: 0, distDir: dist, installation, skipJobSweep: true });
+		try {
+			const base = `http://127.0.0.1:${running.port}`;
+			const res = await postAction(base, `kit_ui=${token}; kit_ui_csrf=${token}`, { kind: "plan" }, { "x-kit-token": token });
+			expect(res.status).toBe(202);
+			const { jobId, via } = (await res.json()) as { jobId: string; via: string };
+			expect(via).toMatch(/trusted installation/);
+			const job = (await waitFor(() => readJobRecord(root, jobId), (j) => j !== undefined && j.status !== "running", 8_000))!;
+			expect(job).toMatchObject({ status: "exited", exitCode: 0 });
+			expect(job.argv).toEqual([node, stub, "plan"]);
+			expect(job.identity).toMatchObject({ version: 1, form: "built", entry: stub });
+			const log = await readFile(job.logPath, "utf8");
+			expect(log).toContain("PLANNED — 3 task(s)");
+		} finally {
+			await running.shutdown();
+			installTrustedInstallationForTests(undefined);
+			await rm(stubDir, { recursive: true, force: true }).catch(() => {});
 		}
 	});
 });

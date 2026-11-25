@@ -7,10 +7,17 @@
 //   handoff note        → prints "queued", exits 0
 //   die                 → exits 7 (failed mapping)
 //   sleep <sec>         → sleeps that long, then exits 0 (runner-liveness tests)
+//   env NAME…           → prints the selected env names as JSON (job-env tests)
 const args = process.argv.slice(2);
 const cmd = args[0] ?? "";
 const sleepFor = (ms) => new Promise((done) => setTimeout(done, ms));
 
+if (cmd === "env") {
+	const out = {};
+	for (const name of args.slice(1)) out[name] = process.env[name] ?? null;
+	console.log(JSON.stringify(out));
+	process.exit(0);
+}
 if (cmd === "die") {
 	console.error("stub: something went wrong");
 	process.exit(7);

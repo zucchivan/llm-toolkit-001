@@ -3,13 +3,13 @@
  * at subscribe (second client) and when a record changes (spawn/finish).
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { readJobRecord } from "../server/jobs.ts";
-import { bake, postAction, actionHeaders, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
+import { bake, cleanup, postAction, actionHeaders, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
 
 /** Accumulate SSE bytes until `event: job` appears with parseable JSON. */
 async function firstJobEvent(base: string, cookie: string, budgetMs = 8_000): Promise<{ jobs: { id: string }[]; attached?: unknown }> {
@@ -40,13 +40,11 @@ describe("sse job events", () => {
 	let baked: Baked;
 	const dists: string[] = [];
 	afterAll(async () => {
-		await baked?.running.shutdown().catch(() => {});
-		await rm(baked?.root, { recursive: true, force: true }).catch(() => {});
+		if (baked) await cleanup(baked);
 	});
 
 	it("subscribe receives the current job list; a spawned job is announced", async () => {
 		baked = await bake({ skipJobSweep: false });
-		process.env["KIT_UI_CLI_BIN"] = baked.stubCli;
 		const first = await firstJobEvent(baked.base, baked.cookie); // immediate snapshot on connect
 		expect(first.jobs).toEqual([]);
 
