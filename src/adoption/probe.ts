@@ -48,7 +48,8 @@ export async function probeGates(root: string, options: ProbeOptions): Promise<P
 	const context = options.executionContext;
 	if (context && context.controlPaths.root !== root) throw new Error("probe execution context does not match the explicitly selected project root");
 	const executionRoot = context?.frozenReadView.viewPath ?? root;
-	const recipes = context ? recipesFromBundle(context.recipeBundle) : inventoryGates(root).effective;
+	// M1-P01 step (g): `inventoryGates` reads recipes through the safe boundary.
+	const recipes = context ? recipesFromBundle(context.recipeBundle) : (await inventoryGates(root)).effective;
 	if (!recipes.length) {
 		say("No gate recipes to probe. Scope checking still runs during waves.");
 		return { consented: false, allPassed: true, results: [], messages };

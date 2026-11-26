@@ -51,7 +51,14 @@ canonical-root/root-relative no-follow reader: a symlinked file or ancestor
 (including a symlinked `.orch`), an escaping configured PRD path, a
 non-regular file or one past the kit's §2 cap is reported as
 `refused:{code,message}` with no text (never as plain absence), and the same
-boundary serves the diff patch/stats and artifact-preview reads.
+boundary serves the diff patch/stats and artifact-preview reads. **M1-P01 step
+(g):** the `.orch/config.toml` read behind these views and the model chips is
+now asynchronous over that boundary too (a refused config reaches the dialog
+as `configError`, never as defaults), artifact downloads stream from the same
+pinned read handle (`404` absent, `409` + typed code for a refusal, no bytes),
+the `.orch/wave-log.jsonl` tail is bounded, and the SSE fingerprint stats only
+pinned entries — a hostile `.orch` refuses the snapshot instead of publishing a
+partial readout.
 Scope of **M5-slice-3** (0.7.0, this release):
 safe stop for TERMINAL-started runs — the attached Stop affordance ships,
 gated behind a full process-identity verification (PRD §7.2.1): live pid,

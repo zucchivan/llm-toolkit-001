@@ -21,8 +21,8 @@ import type { StatusPayloads } from "../../src/engine/harness.ts";
 import { conversationEntries, readout } from "../../src/engine/inspector.ts";
 import type { ConvEntriesView, KitReadout } from "../../src/engine/inspector.ts";
 import { LockBusyError } from "../../src/util/lockfile.ts";
-import { dirname, join } from "node:path";
-import { readJson } from "../../src/util/fsx.ts";
+import { dirname } from "node:path";
+import { readSafeText } from "../../src/util/safe-read.ts";
 import { loadConfig, ROLES } from "../../src/config.ts";
 
 /** One configured role, as the plan/run dialogs render it (§7.2 friendliness). */
@@ -121,9 +121,25 @@ export async function readConversationEntries(projectRoot: string, conversationI
 	}
 }
 
+/**
+ * `.orch/status.json` extras through the canonical-root + no-follow read
+ * boundary (M1-P01 step (g)): this is the same side-car the readout itself
+ * reads, so absent/corrupt/refused all leave these DISPLAY extras undefined
+ * rather than following a link — the authoritative refusal (if any) is already
+ * raised by `readout()`, which throws on a refused side-car.
+ */
+async function readStatusExtras(projectRoot: string): Promise<StatusPayloads | undefined> {
+	const read = await readSafeText({ root: projectRoot, path: ".orch/status.json" });
+	if (read.kind !== "ok") return undefined;
+	try {
+		return JSON.parse(read.value) as StatusPayloads;
+	} catch {
+		return undefined;
+	}
+}
+
 async function statusExtras(projectRoot: string): Promise<Pick<ReadoutSnapshot, "sleep" | "prdPath" | "roles" | "configError">> {
-	const statusPath = join(projectRoot, ".orch", "status.json");
-	const payload = await readJson<StatusPayloads>(statusPath).catch(() => undefined);
+	const payload = await readStatusExtras(projectRoot);
 	const sleep =
 		payload?.sleepUntil !== undefined
 			? { until: payload.sleepUntil, cycleCount: payload.sleepCycleCount, alert: payload.alert }
@@ -131,9 +147,11 @@ async function statusExtras(projectRoot: string): Promise<Pick<ReadoutSnapshot, 
 	// One config load per snapshot covers every config-derived extra: the plan
 	// prefill (§8.2), the visible role models (§7.2 — "is a model even set?"),
 	// and a mid-session config break rendered in kind words. Read-only; the UI
-	// never writes the config (the CLI is the only mutation path).
+	// never writes the config (the CLI is the only mutation path). M1-P01 step
+	// (g): awaited through the canonical-root + no-follow boundary; an absent OR
+	// refused config lands in `configError` (never an absence-shaped default).
 	try {
-		const config = loadConfig(projectRoot);
+		const config = await loadConfig(projectRoot);
 		const prdPath = payload?.prdPath ?? config.paths.prd;
 		const roles = ROLES.map((name) => ({ name, provider: config.roles[name].provider, modelId: config.roles[name].modelId }));
 		return { sleep, prdPath, roles };

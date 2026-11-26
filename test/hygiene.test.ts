@@ -16,7 +16,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -33,6 +33,7 @@ import {
 	applyHygieneBlock,
 	classifyProjectPath,
 	hygieneBlockText,
+	installProjectHygiene,
 } from "../src/hygiene.ts";
 import { exec } from "../src/util/exec.ts";
 
@@ -268,6 +269,32 @@ describe("warn-don't-unstage for already-tracked files", () => {
 		const second = await initProject(root);
 		expect(second.appended).toEqual([]);
 	}, 60_000);
+});
+
+describe("M1-P01 step (g): the .gitignore read goes through the host boundary", () => {
+	it("a symlinked .gitignore (or a symlinked ancestor) REFUSES before any write: the link target is untouched", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "kit-hygiene-outside-"));
+		const target = join(outside, ".gitignore");
+		await writeFile(target, "# OUTSIDE GITIGNORE\n", "utf8");
+		const root = await tmpProject();
+		await symlink(target, join(root, ".gitignore"));
+
+		const error = await installProjectHygiene(root).catch((err: unknown) => err);
+		expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+		// Forbidden effect: nothing was appended through the link.
+		expect(await readFile(target, "utf8")).toBe("# OUTSIDE GITIGNORE\n");
+	});
+
+	it("an absent .gitignore is the defined empty input (a fresh block is written), and a re-run is idempotent", async () => {
+		const root = await tmpProject();
+		const first = await installProjectHygiene(root);
+		expect(first.installed).toBe(true);
+		const content = await readFile(join(root, ".gitignore"), "utf8");
+		expect(content).toContain(HYGIENE_BLOCK_BEGIN);
+		const second = await installProjectHygiene(root);
+		expect(second.installed).toBe(false);
+		expect(await readFile(join(root, ".gitignore"), "utf8")).toBe(content);
+	});
 });
 
 describe("kit root .gitignore (anchored corresponding rules)", () => {

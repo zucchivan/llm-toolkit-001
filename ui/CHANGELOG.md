@@ -4,6 +4,33 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## Unreleased — M1-P01 step (g): config read and the remaining read owners behind the host boundary
+
+Host-boundary change; no UI component, package or lockfile change, so no
+version bump in this packet (the bump lands with the next UI milestone
+release). `readout.seam` stays 1.
+
+- **Config is read asynchronously through the canonical root + no-follow
+  cap.** `src/config.ts#loadConfig` is async (`readConfig` exposes
+  `ok`/`absent`/`refused` distinctly, `parseConfig` stays pure). The UI entry
+  (`ui/server/cli.ts`) now refuses to start on a REFUSED config with the typed
+  code instead of starting over a linked file; an absent config keeps the
+  documented `init` message. `ui/server/readout.ts` and
+  `ui/server/actions.ts#configPreflight` await it, so a refused config lands in
+  `configError` (a 422 preflight), never in defaults.
+- **Downloads are served from one pinned safe-read handle.**
+  `/api/artifacts/:name?download=1` and `/api/tasks/:id/diff?download=1` no
+  longer use `stat` + `createReadStream` (which could follow a project
+  symlink): the bytes come from the opened descriptor, `404` means absent, and
+  a refused read answers `409` with the typed refusal code and no bytes.
+- **Listings, tails and SSE fingerprints stay on the boundary.** The artifact
+  listing skips symlinked/special entries (no link-target size/mtime); the
+  `.orch/wave-log.jsonl` read is a bounded tail (4 MiB / 20k rows, whole lines);
+  SSE fingerprints use fstat on pinned `.orch`/`.orch/ui/jobs` entries, so a
+  symlinked side-car can never contribute a link target's metadata. A hostile
+  `.orch` read refuses the snapshot (the connect frame is `null`) instead of
+  publishing a partial readout.
+
 ## Unreleased — M1-P01 step (f): one trusted launch identity for jobs and attached stop
 
 Host-boundary change; no UI component, package or lockfile change, so no

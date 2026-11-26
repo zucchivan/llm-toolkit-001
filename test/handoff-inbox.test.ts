@@ -7,11 +7,13 @@
  * diagnosis, and the one-time legacy pending-handoff.json import.
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { publishHandoffNote, readHandoffClaim, settleHandoffClaim, discardConsumedHandoffNotes,
 	importLegacyHandoff, handoffClaimRows, HANDOFF_NOTE_MAX_CHARS, HandoffNoteTooLongError } from "../src/engine/handoffs.ts";
+import { HANDOFF_NOTE_FILE_MAX_BYTES } from "../src/engine/handoffs.ts";
 import { projectPaths } from "../src/engine/harness.ts";
 import { HandoffDoc } from "../src/engine/infos.ts";
 import { readSessionState } from "../src/engine/state.ts";
@@ -217,6 +219,11 @@ describe("handoff inbox: driver claims at wave boundaries", () => {
 		const kit = await (await import("../src/engine/harness.ts")).openProjectHarness(project.root, "test", { modelsOverride: models });
 		const paths = kit.loop.paths;
 		const noteA = await publishHandoffNote(paths, "a".repeat(1600));
+		// Fixture determinism (M1-P01 step g): the claim orders by (ts,id), so
+		// two notes published in the same millisecond are ordered by random id.
+		// Give the "oldest" note a distinct timestamp so the intent — wave 1 takes
+		// the OLDEST note, wave 2 the overflow — is what the assertions test.
+		await new Promise((resolve) => setTimeout(resolve, 5));
 		const noteB = await publishHandoffNote(paths, "b".repeat(1600));
 		const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
 		const planOutcome = await runPlan(kit, "docs/prd.md", await loadPrd(kit));
@@ -239,6 +246,94 @@ describe("handoff inbox: driver claims at wave boundaries", () => {
 		await kit.loop.close();
 		kit.lock.release();
 		expect(await readdir(join(project.root, ".orch", "handoffs", "inbox"))).toEqual([]);
+	});
+});
+
+describe("handoff inbox: host-read refusals (M1-P01 step g)", () => {
+	beforeEach(() => {
+		process.env["NO_COLOR"] = "1";
+	});
+
+	it("a symlinked note (or a symlinked inbox) refuses the claim instead of importing outside bytes", async () => {
+		const root = await newProject();
+		const paths = projectPaths(root);
+		await mkdir(paths.handoffInbox, { recursive: true });
+		const outside = await mkdtemp(join(tmpdir(), "kit-handoff-outside-"));
+		try {
+			const secret = join(outside, "secret.json");
+			await writeFile(secret, JSON.stringify({ id: "attacker", ts: 1, note: "OUTSIDE NOTE BYTES" }), "utf8");
+			await symlink(secret, join(paths.handoffInbox, "attacker.json"));
+
+			const error = await readHandoffClaim(paths).catch((err: unknown) => err);
+			expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+			expect(JSON.stringify((error as Error).message)).not.toContain("OUTSIDE NOTE BYTES");
+			// Forbidden effect: no note was selected/bound at all.
+			expect(error).not.toHaveProperty("taken");
+
+			// The inbox DIRECTORY itself as a link refuses too (ancestor escape).
+			const linkRoot = await newProject();
+			const linkPaths = projectPaths(linkRoot);
+			await rm(linkPaths.handoffInbox, { recursive: true, force: true });
+			await mkdir(join(linkRoot, ".orch", "handoffs"), { recursive: true });
+			await writeFile(join(outside, "note.json"), JSON.stringify({ id: "n", ts: 1, note: "OUTSIDE NOTE BYTES" }), "utf8");
+			await symlink(outside, linkPaths.handoffInbox);
+			const ancestor = await readHandoffClaim(linkPaths).catch((err: unknown) => err);
+			expect(ancestor).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("an unreadable or over-cap note is a refusal, not a diagnosed import", async () => {
+		if (typeof process.getuid === "function" && process.getuid() !== 0) {
+			const root = await newProject();
+			const paths = projectPaths(root);
+			await mkdir(paths.handoffInbox, { recursive: true });
+			const locked = join(paths.handoffInbox, "locked.json");
+			await writeFile(locked, JSON.stringify({ id: "locked", ts: 1, note: "n" }), "utf8");
+			const { chmod } = await import("node:fs/promises");
+			await chmod(locked, 0o000);
+			const error = await readHandoffClaim(paths).catch((err: unknown) => err);
+			expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "unreadable" });
+		}
+
+		// A note FILE past the per-file cap is refused (the claim is never truncated).
+		const capRoot = await newProject();
+		const capPaths = projectPaths(capRoot);
+		await mkdir(capPaths.handoffInbox, { recursive: true });
+		await writeFile(
+			join(capPaths.handoffInbox, "huge.json"),
+			JSON.stringify({ id: "huge", ts: 1, note: "x".repeat(HANDOFF_NOTE_FILE_MAX_BYTES) }),
+			"utf8",
+		);
+		const capped = await readHandoffClaim(capPaths).catch((err: unknown) => err);
+		expect(capped).toMatchObject({ name: "SafeReadRefusalError", code: "too-large" });
+	});
+
+	it("a symlinked pending-handoff.json refuses the import: no inbox note, no import receipt", async () => {
+		const root = await newProject();
+		const { openProjectHarness } = await import("../src/engine/harness.ts");
+		const kit = await openProjectHarness(root, "test", { modelsOverride: buildFauxModels([]).models });
+		const paths = kit.loop.paths;
+		const outside = await mkdtemp(join(tmpdir(), "kit-handoff-outside-"));
+		try {
+			const secret = join(outside, "pending.json");
+			await writeFile(secret, JSON.stringify({ ts: 1, notes: ["OUTSIDE LEGACY NOTE"] }), "utf8");
+			await symlink(secret, paths.pendingHandoff);
+
+			const error = await importLegacyHandoff(kit).catch((err: unknown) => err);
+			expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+			expect(JSON.stringify((error as Error).message)).not.toContain("OUTSIDE LEGACY NOTE");
+
+			// Forbidden effects: nothing imported, the hash never recorded, the link untouched.
+			expect(existsSync(paths.handoffInbox) ? await readdir(paths.handoffInbox) : []).toEqual([]);
+			expect((await readSessionState(kit.loop.harness)).runStatus.handoffImportedSha256 ?? []).toEqual([]);
+			expect(existsSync(paths.pendingHandoff)).toBe(true);
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+		await kit.loop.close();
+		kit.lock.release();
 	});
 });
 

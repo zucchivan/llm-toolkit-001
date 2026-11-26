@@ -17,7 +17,8 @@
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -161,6 +162,31 @@ describe("readView harnesses are inert (M0-P02)", () => {
 		const statusRun = await runCli(project.root, ["status"]);
 		expect(statusRun.stdout).toContain("phase empty");
 		expect(existsSync(database)).toBe(false);
+	}, 90_000);
+
+	it("a REFUSED config is reported as a refusal by the CLI (never as absence, no lock left behind)", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+		const outside = await mkdtemp(join(tmpdir(), "kit-config-outside-"));
+		try {
+			const target = join(outside, "config.toml");
+			await writeFile(target, demoConfigToml(), "utf8");
+			const configPath = join(project.root, ".orch", "config.toml");
+			await rm(configPath);
+			await symlink(target, configPath);
+
+			const failure = (await runCli(project.root, ["status"]).catch((err: { code?: number; stdout?: string; stderr?: string }) => err)) as { code?: number; stderr?: string };
+			expect(failure.code).toBe(1);
+			expect(failure.stderr).toContain("status failed");
+			expect(failure.stderr).toContain("config refused");
+			expect(failure.stderr).toMatch(/\(symlink\)/);
+			// No lease was taken for the refused observation.
+			expect(existsSync(join(project.root, ".orch", "lock"))).toBe(false);
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
 	}, 90_000);
 
 	it("kit identity is the package version everywhere, and observation never rewrites recorded history", async () => {

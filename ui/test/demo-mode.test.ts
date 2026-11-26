@@ -24,7 +24,7 @@ describe("bakeDemoProject", () => {
 	it("produces a complete faux-role project with a git base commit", async () => {
 		const { root, replay } = await bakeDemoProject(REPO_ROOT);
 
-		const config = loadConfig(root);
+		const config = await loadConfig(root);
 		for (const role of ["planner", "implementer", "verifier"] as const) {
 			expect(config.roles[role].provider).toBe("faux");
 			expect(config.roles[role].modelId).toMatch(/^kit-/);

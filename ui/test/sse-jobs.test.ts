@@ -3,12 +3,13 @@
  * at subscribe (second client) and when a record changes (spawn/finish).
  */
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { readJobRecord } from "../server/jobs.ts";
+import { jobsDirectoryFingerprint, readoutFingerprint } from "../server/sse.ts";
 import { bake, cleanup, postAction, actionHeaders, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
 
 /** Accumulate SSE bytes until `event: job` appears with parseable JSON. */
@@ -98,4 +99,132 @@ describe("sse job events", () => {
 			12_000,
 		);
 	});
+});
+
+describe("M1-P01 step (g): SSE fingerprints use the pinned no-follow boundary", () => {
+	it("snapshot inputs are fingerprinted from fstat on the pinned entries (absent = '-')", async () => {
+		const root = await mkdtemp(join(tmpdir(), "ui-sse-fp-"));
+		try {
+			// fresh project: no .orch at all = the defined "none" state
+			expect(await readoutFingerprint(root)).toBe("none");
+
+			await mkdir(join(root, ".orch", "artifacts"), { recursive: true });
+			await writeFile(join(root, ".orch", "status.json"), "{}", "utf8");
+			await writeFile(join(root, ".orch", "wave-log.jsonl"), "", "utf8");
+			const token = await readoutFingerprint(root);
+			// three parts: two files (mtime:size) and the artifacts directory (mtime:size)
+			expect(token.split("|")).toHaveLength(3);
+			expect(token.split("|")[0]).toMatch(/^\d+(\.\d+)?:2$/);
+			expect(token.split("|")[2]).toMatch(/^\d+(\.\d+)?:\d+$/);
+
+			// an absent file within an existing .orch stays a distinct token
+			await rm(join(root, ".orch", "wave-log.jsonl"));
+			expect((await readoutFingerprint(root)).split("|")[1]).toBe("-");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("a symlinked status/wave-log/artifacts or jobs record is a refusal token, never the link target's metadata", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-sse-fp-outside-"));
+		const root = await mkdtemp(join(tmpdir(), "ui-sse-fp-"));
+		try {
+			await writeFile(join(outside, "status.json"), "{".repeat(100), "utf8");
+			await mkdir(join(root, ".orch"), { recursive: true });
+			await symlink(join(outside, "status.json"), join(root, ".orch", "status.json"));
+
+			const token = await readoutFingerprint(root);
+			expect(token.split("|")[0]).toBe("refused:symlink");
+			// No outside size/mtime ever reaches the fingerprint (only the refusal code).
+			expect(token).not.toMatch(/:\d/);
+
+			// A symlinked .orch ancestor refuses the whole snapshot fingerprint.
+			const linkedRoot = await mkdtemp(join(tmpdir(), "ui-sse-fp-"));
+			try {
+				await symlink(outside, join(linkedRoot, ".orch"));
+				expect(await readoutFingerprint(linkedRoot)).toBe("refused:symlink");
+			} finally {
+				await rm(linkedRoot, { recursive: true, force: true });
+			}
+
+			// Jobs dir: an absent dir is "none"; a symlinked record is a refusal token.
+			expect(await jobsDirectoryFingerprint(root)).toEqual(["none"]);
+			await mkdir(join(root, ".orch", "ui", "jobs"), { recursive: true });
+			await writeFile(join(root, ".orch", "ui", "jobs", "job-1.json"), "{}", "utf8");
+			await symlink(join(outside, "status.json"), join(root, ".orch", "ui", "jobs", "job-2.json"));
+			const jobs = await jobsDirectoryFingerprint(root);
+			expect(jobs.some((part) => part.startsWith("job-1.json:"))).toBe(true);
+			expect(jobs).toContain("job-2.json:refused:symlink");
+			expect(JSON.stringify(jobs)).not.toMatch(/status\.json/);
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("M1-P01 step (g): a hostile .orch read is refused on the SSE snapshot frame", () => {
+	it("a symlinked wave-log makes the connect frame `null` — no partial snapshot, no outside rows", async () => {
+		const baked = await bake({ skipJobSweep: true });
+		const outside = await mkdtemp(join(tmpdir(), "ui-sse-outside-"));
+		try {
+			const secretRow = { ts: 1, kind: "wave", task: "LEAKED-TASK", wave: 1, verb: "start", treeSha: "a".repeat(40) };
+			await writeFile(join(outside, "wave-log.jsonl"), `${JSON.stringify(secretRow)}\n`, "utf8");
+			const log = join(baked.root, ".orch", "wave-log.jsonl");
+			await rm(log, { force: true });
+			await symlink(join(outside, "wave-log.jsonl"), log);
+
+			const events = await fetch(`${baked.base}/api/events`, { headers: { cookie: baked.cookie } });
+			expect(events.status).toBe(200);
+			const reader = events.body!.getReader();
+			const decoder = new TextDecoder();
+			let acc = "";
+			const deadline = Date.now() + 8_000;
+			try {
+				while (Date.now() < deadline) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					acc += decoder.decode(value, { stream: true });
+					if (acc.includes("event: readout")) break;
+				}
+			} finally {
+				await reader.cancel().catch(() => {});
+			}
+			const frame = acc.split("event: readout\ndata: ").pop()!.split("\n")[0]!;
+			expect(frame).toBe("null");
+			expect(acc).not.toContain("LEAKED-TASK");
+		} finally {
+			await rm(join(baked.root, ".orch", "wave-log.jsonl"), { force: true });
+			await rm(outside, { recursive: true, force: true });
+			await cleanup(baked);
+		}
+	}, 30_000);
+});
+
+describe("M1-P01 step (g): a hostile status.json refuses the snapshot, never its extras", () => {
+	it("reports the typed refusal instead of the link target's sleep/prdPath fields", async () => {
+		const baked = await bake({ skipJobSweep: true });
+		const outside = await mkdtemp(join(tmpdir(), "ui-sse-status-outside-"));
+		try {
+			await writeFile(
+				join(outside, "status.json"),
+				JSON.stringify({ phase: "idle", sleepUntil: 1, prdPath: "OUTSIDE/host-prd.md", tasks: [] }),
+				"utf8",
+			);
+			const statusPath = join(baked.root, ".orch", "status.json");
+			await rm(statusPath, { force: true });
+			await symlink(join(outside, "status.json"), statusPath);
+
+			const res = await fetch(`${baked.base}/api/readout`, { headers: { cookie: baked.cookie } });
+			expect(res.status).toBe(500);
+			const raw = await res.text();
+			expect(raw).toContain("symbolic link");
+			expect(raw).not.toContain("OUTSIDE/host-prd.md");
+			expect(raw).not.toContain("sleepUntil");
+		} finally {
+			await rm(join(baked.root, ".orch", "status.json"), { force: true });
+			await rm(outside, { recursive: true, force: true });
+			await cleanup(baked);
+		}
+	}, 30_000);
 });

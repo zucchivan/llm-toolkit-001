@@ -383,7 +383,8 @@ export async function configPreflight(projectRoot: string, body: ActionBody): Pr
 	const needed = ACTION_ROLE_NEEDS[body.kind as keyof typeof ACTION_ROLE_NEEDS];
 	if (!needed) return undefined;
 	try {
-		const config = loadConfig(projectRoot);
+		// M1-P01 step (g): awaited through the canonical-root + no-follow boundary.
+		const config = await loadConfig(projectRoot);
 		const missing = needed.filter((role) => {
 			const r = config.roles[role];
 			return !r || !String(r.provider).trim() || !String(r.modelId).trim();

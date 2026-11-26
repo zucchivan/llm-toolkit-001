@@ -1,8 +1,9 @@
 /** Evidence-based gate inventory and cross-cutting coverage analysis. */
 import { createHash } from "node:crypto";
-import { loadRecipeFile, recipeCommandText, recipesEquivalent } from "../engine/gates.ts";
+import { loadRecipeFileSafe, recipeCommandText, recipesEquivalent } from "../engine/gates.ts";
 import { isSimpleCommand } from "../engine/recipe-runner.ts";
 import type { Recipe } from "../engine/gates.ts";
+import { SafeReadBudget, requireSafeReadRoot } from "../util/safe-read.ts";
 import { discoverProject } from "./discovery.ts";
 import type {
 	DecisionStore, DiscoveredPackage, Evidence, GateCategory, GateFinding, GateInventory, GapReport,
@@ -35,12 +36,22 @@ const SCRIPT_NAMES: Record<GateCategory, string[]> = {
 	accessibility: ["test:a11y", "a11y", "accessibility", "test:accessibility", "axe"],
 };
 
-/** Read both recipe files without changing them; human duplicates win in effective. */
-export function inventoryGates(root: string): GateInventory {
-	const make = (source: "human" | "generated", file: string): RecipeSource[] =>
-		loadRecipeFile(root, file).map((recipe) => ({ ...recipe, source, file: `evals/${file}`, category: categoryForRecipe(recipe) }));
-	const generated = make("generated", "recipes.auto.toml");
-	const human = make("human", "recipes.toml");
+/**
+ * Read both recipe files without changing them; human duplicates win in effective.
+ *
+ * M1-P01 step (g): recipes are read through the canonical-root + no-follow,
+ * capped boundary (`loadRecipeFileSafe`, the same loader the gate step uses)
+ * under one shared budget. There is no production synchronous recipe read:
+ * a symlinked/escaping/oversized recipe file refuses with the gate loader's
+ * own message instead of being parsed.
+ */
+export async function inventoryGates(root: string): Promise<GateInventory> {
+	const canonical = await requireSafeReadRoot(root);
+	const budget = new SafeReadBudget();
+	const make = async (source: "human" | "generated", file: string): Promise<RecipeSource[]> =>
+		(await loadRecipeFileSafe(canonical, file, budget)).map((recipe) => ({ ...recipe, source, file: `evals/${file}`, category: categoryForRecipe(recipe) }));
+	const generated = await make("generated", "recipes.auto.toml");
+	const human = await make("human", "recipes.toml");
 	const effective = new Map<string, RecipeSource>();
 	for (const recipe of [...generated, ...human]) effective.set(recipe.name, recipe);
 	return { human, generated, effective: [...effective.values()] };
@@ -49,7 +60,7 @@ export function inventoryGates(root: string): GateInventory {
 /** Analyze a project without executing scripts or reading CI as executable YAML. */
 export async function analyzeGaps(root: string, discovery?: ProjectDiscovery, decisions?: DecisionStore): Promise<GapReport> {
 	const found = discovery ?? await discoverProject(root);
-	const inventory = inventoryGates(root);
+	const inventory = await inventoryGates(root);
 	const findings: GateFinding[] = [];
 	const rootPkg = found.rootPackage;
 	const packages = [rootPkg, ...found.workspaces].filter((pkg): pkg is DiscoveredPackage => Boolean(pkg));

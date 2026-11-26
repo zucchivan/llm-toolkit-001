@@ -469,3 +469,74 @@ describe("M1-P01: artifacts are read through the no-follow boundary", () => {
 		}
 	});
 });
+
+describe("M1-P01 step (g): downloads and the wave-log tail stay inside the pinned safe-read boundary", () => {
+	it("a symlinked artifact download is REFUSED (409, typed code) and serves no outside bytes", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-diff-outside-"));
+		try {
+			await writeFile(join(outside, "secret.log"), "HOST SECRET DOWNLOAD BYTES\n", "utf8");
+			const name = "gate-linked-w1.log";
+			await symlink(join(outside, "secret.log"), join(root, ".orch", "artifacts", name));
+
+			const res = await get(`/api/artifacts/${name}?download=1`);
+			expect(res.status).toBe(409);
+			const raw = await res.text();
+			expect(raw).not.toContain("HOST SECRET DOWNLOAD BYTES");
+			const body = JSON.parse(raw) as { error: string };
+			expect(body.error).toContain("refused (symlink)");
+			expect(body.error).toContain("no bytes were served");
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("a symlinked task patch download is REFUSED with no bytes (the listing never names it)", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-diff-outside-"));
+		try {
+			await writeFile(join(outside, "secret.patch"), "HOST SECRET PATCH DOWNLOAD\n", "utf8");
+			const name = `candidate-${REVISION}-linked3-w1.patch`;
+			await symlink(join(outside, "secret.patch"), join(root, ".orch", "artifacts", name));
+
+			// The pinned artifact LISTING skips the symlink, so the diff download has
+			// no located artifact to serve (404, the established "no artifacts").
+			const res = await get("/api/tasks/linked3/diff?download=1");
+			expect(res.status).toBe(404);
+			const body = (await res.json()) as { error: string };
+			expect(body.error).not.toContain("HOST SECRET PATCH DOWNLOAD");
+
+			const list = await get("/api/artifacts");
+			expect(list.status).toBe(200);
+			const names = ((await list.json()) as { artifacts: { name: string }[] }).artifacts.map((a) => a.name);
+			expect(names).not.toContain(name);
+		} finally {
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+
+	it("a symlinked wave-log is not tail-read: the wave diff degrades to 409, never the outside rows", async () => {
+		const outside = await mkdtemp(join(tmpdir(), "ui-diff-outside-"));
+		try {
+			const tree = "a".repeat(40);
+			await writeFile(
+				join(outside, "wave-log.jsonl"),
+				[
+					JSON.stringify({ ts: 1, kind: "wave", task: "leaky", wave: 1, verb: "start", treeSha: tree }),
+					JSON.stringify({ ts: 2, kind: "wave", task: "leaky", wave: 1, verb: "end", treeSha: tree, outcome: "fail" }),
+				].join("\n") + "\n",
+				"utf8",
+			);
+			const log = join(root, ".orch", "wave-log.jsonl");
+			await rm(log, { force: true });
+			await symlink(join(outside, "wave-log.jsonl"), log);
+
+			const res = await get("/api/tasks/leaky/diff?wave=1");
+			expect(res.status).toBe(409);
+			const body = (await res.json()) as { error: string };
+			expect(body.error).toMatch(/no start row/);
+			expect(JSON.stringify(body)).not.toContain(tree.slice(0, 12));
+		} finally {
+			await rm(join(root, ".orch", "wave-log.jsonl"), { force: true });
+			await rm(outside, { recursive: true, force: true });
+		}
+	});
+});

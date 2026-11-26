@@ -22,7 +22,7 @@ import type { Dirent, Stats } from "node:fs";
 import { lstat, open, opendir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { TextDecoder } from "node:util";
-import { assertCanonicalAbsolutePath } from "../sandbox/host-profile.ts";
+import { assertCanonicalAbsolutePath, resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
 
 export const SAFE_READ_LIMITS = Object.freeze({
 	/** Per regular file. */
@@ -75,6 +75,59 @@ export type SafeReadResult<T> =
 		/** Bytes observed before a cap refusal; 0 means nothing was read. */
 		bytesRead?: number;
 	};
+
+/**
+ * A refusal as an exception, for callers whose operation cannot express a
+ * partial result (a listing/readout either happens or refuses). The `code` is
+ * the documented refusal code; there is no synthetic success path.
+ */
+export class SafeReadRefusalError extends Error {
+	readonly code: SafeReadRefusalCode;
+	readonly path: string;
+
+	constructor(refusal: { code: SafeReadRefusalCode; path: string; message: string }) {
+		super(refusal.message);
+		this.name = "SafeReadRefusalError";
+		this.code = refusal.code;
+		this.path = refusal.path;
+	}
+}
+
+/**
+ * Canonical root for ONE host read operation. The operator-selected input is
+ * resolved once (`realpath`); a missing, relative, non-normalized or otherwise
+ * unprovable root is a typed refusal, never an implicit fallback to cwd.
+ */
+export type SafeRootResult =
+	| { kind: "ok"; root: string }
+	| { kind: "refused"; code: SafeReadRefusalCode; path: string; message: string };
+
+export async function resolveSafeReadRoot(input: string): Promise<SafeRootResult> {
+	try {
+		return { kind: "ok", root: await resolveCanonicalProjectRoot(input) };
+	} catch (error) {
+		return {
+			kind: "refused",
+			code: "unsafe-root",
+			path: typeof input === "string" ? input : String(input),
+			message: (error as Error).message,
+		};
+	}
+}
+
+/** `resolveSafeReadRoot` for callers that refuse instead of returning a union. */
+export async function requireSafeReadRoot(input: string): Promise<string> {
+	const resolved = await resolveSafeReadRoot(input);
+	if (resolved.kind === "ok") return resolved.root;
+	throw new SafeReadRefusalError(resolved);
+}
+
+/** Throw the typed refusal for a non-ok result; return the value otherwise. */
+export function requireSafeRead<T>(result: SafeReadResult<T>): T {
+	if (result.kind === "ok") return result.value;
+	if (result.kind === "refused") throw new SafeReadRefusalError(result);
+	throw new SafeReadRefusalError({ code: "changed", path: result.path, message: `${result.path} is absent where the operation requires it` });
+}
 
 export type SafeDirEntryKind = "file" | "directory" | "symlink" | "other";
 
@@ -149,6 +202,9 @@ export interface SafeListEntriesOptions {
 export interface SafeDirectory {
 	/** Root-relative display path (empty for the root). */
 	readonly path: string;
+	/** fstat metadata at open time (pinned inode; never a later path stat). */
+	readonly size: number;
+	readonly mtimeMs: number;
 	list(options?: SafeListEntriesOptions): Promise<SafeReadResult<readonly SafeDirEntry[]>>;
 	openFile(name: string): Promise<SafeReadResult<SafeFile>>;
 	openDirectory(name: string): Promise<SafeReadResult<SafeDirectory>>;
@@ -161,9 +217,27 @@ export interface SafeFile {
 	readonly path: string;
 	/** fstat size at open time; the read loop still caps growth. */
 	readonly size: number;
+	/** fstat mtime at open time (display/fingerprint metadata, not content). */
+	readonly mtimeMs: number;
 	readBytes(options?: SafeReadOptions): Promise<SafeReadResult<Buffer>>;
 	readText(options?: SafeReadOptions): Promise<SafeReadResult<string>>;
+	/**
+	 * Bounded TAIL read: at most `maxBytes` from the end, through the same pinned
+	 * descriptor (no re-open, no path stat). A truncated window drops its
+	 * possibly-partial first line, so the result is always whole lines after the
+	 * cut. The whole-file cap therefore never requires loading a growing
+	 * append-only log; `truncated` says whether the start was cut.
+	 */
+	readTailText(options?: SafeReadOptions): Promise<SafeReadResult<SafeTail>>;
 	close(): Promise<void>;
+}
+
+export interface SafeTail {
+	text: string;
+	/** Bytes read from the tail window (before the partial-line trim). */
+	bytes: number;
+	/** True when the file was longer than the window and its start was cut. */
+	truncated: boolean;
 }
 
 export interface SafeFileRequest extends SafeDirectoryRef {
@@ -417,13 +491,15 @@ function decodeText(bytes: Buffer): string | undefined {
 class PinnedFile implements SafeFile {
 	readonly path: string;
 	readonly size: number;
+	readonly mtimeMs: number;
 	#handle: FileHandle;
 	#closed = false;
 
-	constructor(handle: FileHandle, path: string, size: number) {
+	constructor(handle: FileHandle, path: string, size: number, mtimeMs: number) {
 		this.#handle = handle;
 		this.path = path;
 		this.size = size;
+		this.mtimeMs = mtimeMs;
 	}
 
 	async close(): Promise<void> {
@@ -493,18 +569,75 @@ class PinnedFile implements SafeFile {
 		}
 		return { kind: "ok", value: text };
 	}
+
+	async readTailText(options: SafeReadOptions = {}): Promise<SafeReadResult<SafeTail>> {
+		if (this.#closed) return refuse("unreadable", this.path, "file handle is closed");
+		const maxBytes = effectiveBytes(options.maxBytes);
+		const budget = options.budget;
+		if (budget && maxBytes > budget.remaining) {
+			return refuse(
+				"content-capped",
+				this.path,
+				`the tail window of ${maxBytes} bytes exceeds the ${budget.remaining} bytes left in the shared content budget`,
+				0,
+			);
+		}
+		const limit = budget ? Math.min(maxBytes, budget.remaining) : maxBytes;
+		const start = Math.max(0, this.size - limit);
+		const wanted = this.size - start;
+		const truncated = start > 0;
+
+		const chunks: Buffer[] = [];
+		let total = 0;
+		while (total < wanted) {
+			const size = Math.min(CHUNK_BYTES, wanted - total);
+			const buffer = Buffer.allocUnsafe(size);
+			let bytesRead = 0;
+			try {
+				({ bytesRead } = await this.#handle.read(buffer, 0, size, start + total));
+			} catch (error) {
+				return refuse("unreadable", this.path, `tail read failed: ${(error as Error).message}`);
+			}
+			if (bytesRead === 0) {
+				// The file shrank below the fstat size: the window no longer names the
+				// tail this read promised, so it is a refusal rather than a short tail.
+				return refuse("changed", this.path, `${this.path} shrank while its tail was being read`, total);
+			}
+			total += bytesRead;
+			chunks.push(buffer.subarray(0, bytesRead));
+		}
+		let bytes = Buffer.concat(chunks, total);
+		if (truncated) {
+			// The cut can land inside a line (or inside a UTF-8 sequence); dropping
+			// through the first newline keeps only whole tail lines.
+			const newline = bytes.indexOf(0x0a);
+			bytes = newline === -1 ? Buffer.alloc(0) : bytes.subarray(newline + 1);
+		}
+		const text = decodeText(bytes);
+		if (text === undefined) {
+			return refuse("malformed", this.path, `${this.path} tail is not valid UTF-8 text or contains a NUL byte`);
+		}
+		if (budget && !budget.admit(total)) {
+			return refuse("content-capped", this.path, "shared content budget refused the completed tail read", total);
+		}
+		return { kind: "ok", value: { text, bytes: total, truncated } };
+	}
 }
 
 class PinnedDirectory implements SafeDirectory {
 	readonly path: string;
+	readonly size: number;
+	readonly mtimeMs: number;
 	#handle: FileHandle;
 	#base: string;
 	#closed = false;
 
-	constructor(handle: FileHandle, path: string, base: string) {
+	constructor(handle: FileHandle, path: string, base: string, size: number, mtimeMs: number) {
 		this.#handle = handle;
 		this.path = path;
 		this.#base = base;
+		this.size = size;
+		this.mtimeMs = mtimeMs;
 	}
 
 	#childPath(name: string): string {
@@ -562,7 +695,7 @@ class PinnedDirectory implements SafeDirectory {
 					`${display} has ${info.nlink} hard links; host reads refuse hard-linked files`,
 				);
 			}
-			return { kind: "ok", value: new PinnedFile(handle, display, info.size) };
+			return { kind: "ok", value: new PinnedFile(handle, display, info.size, info.mtimeMs) };
 		} catch (error) {
 			if (handle) await handle.close().catch(() => undefined);
 			return mapChildFailure<SafeFile>(error, candidate, display, "file");
@@ -584,7 +717,7 @@ class PinnedDirectory implements SafeDirectory {
 				await handle.close().catch(() => undefined);
 				return refuse("not-directory", display, `${display} is a ${kind}, not a directory`);
 			}
-			return { kind: "ok", value: new PinnedDirectory(handle, display, this.#base) };
+			return { kind: "ok", value: new PinnedDirectory(handle, display, this.#base, info.size, info.mtimeMs) };
 		} catch (error) {
 			if (handle) await handle.close().catch(() => undefined);
 			return mapChildFailure<SafeDirectory>(error, candidate, display, "directory");
@@ -685,7 +818,16 @@ async function openDirectoryAt(
 		}
 	}
 
-	return { kind: "ok", value: new PinnedDirectory(current, relativeDisplay, base) };
+	// fstat on the pinned descriptor (never a later path stat) so callers can
+	// fingerprint this directory without following a link.
+	let info: Stats;
+	try {
+		info = await current.stat();
+	} catch (error) {
+		await current.close().catch(() => undefined);
+		return refuse("unreadable", relativeDisplay, `cannot stat ${relativeDisplay || "/"}: ${(error as Error).message}`);
+	}
+	return { kind: "ok", value: new PinnedDirectory(current, relativeDisplay, base, info.size, info.mtimeMs) };
 }
 
 /** Open a pinned directory under a canonical root. Close the result. */

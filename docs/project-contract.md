@@ -358,25 +358,46 @@ empty panel). While another process owns the lock, the same commands degrade
 to side-car-only reads. The pinned SDK seam itself is documented and
 mechanically enforced per `docs/api-map.md` (M0-P02).
 
-### Host path refusal and reviewed-control identity (M1-P01 steps (c)–(d), prepared — not certified)
+### Host path refusal and reviewed-control identity (M1-P01 steps (c)–(g), prepared — not certified)
 
-When the host reads a PRD (`[paths] prd` or `--prd`), captures the reviewed
-control bundle (all `evals/**` regular files, `PROMPT.md`,
-`.orch/gate-remediations.json`, the actual PRD and the effective policy
-settings), reads the gate recipes at execution time, or serves the UI's
-config/PRD/source/artifact views, it:
+When the host reads a PRD (`[paths] prd` or `--prd`), the project config
+(`.orch/config.toml`), captures the reviewed control bundle (all `evals/**`
+regular files, `PROMPT.md`, `.orch/gate-remediations.json`, the actual PRD and
+the effective policy settings), reads the gate recipes at execution time, reads
+the private handoff inbox/pending note or the inspect/download/SSE side-cars, or
+serves the UI's config/PRD/source/artifact views, it:
 
 - canonicalizes the project root once and reads only root-relative names
   through a no-follow component walk (`src/util/safe-read.ts`);
-- refuses a symlink at any component (including the `.orch` or `evals`
-  ancestor), a hard-linked regular file (an alias could name a same-owner host
-  file), an absolute/`..`/drive/UNC escape, a non-regular leaf, malformed
-  UTF-8/NUL text, and a file past the §2 cap (32 MiB/file, 512 MiB per shared
-  read budget, 100k entries per walk);
+- refuses a symlink at any component (including the `.orch`, `evals` or
+  `.orch/handoffs/inbox` ancestor), a hard-linked regular file (an alias could
+  name a same-owner host file), an absolute/`..`/drive/UNC escape, a
+  non-regular leaf, malformed UTF-8/NUL text, and a file past the §2 cap
+  (32 MiB/file, 512 MiB per shared read budget, 100k entries per walk; the
+  config, inbox-note and legacy-handoff reads use tighter per-file caps);
 - keeps a genuine ENOENT as the defined "absent" input (an absent recipe file
-  is still empty gates; absent controls still hash as absent);
+  is still empty gates; absent controls still hash as absent; an absent handoff
+  inbox has nothing to claim; an absent config has no defaults);
 - never falls back to `realpath`-then-open, PATH, cwd or a project env selector
   when the race-safe primitive is unavailable — it refuses instead.
+
+The config read is asynchronous (`loadConfig`/`readConfig` in `src/config.ts`)
+and its three outcomes stay distinct: **absent** (`ConfigError.reason =
+"absent"`, the documented `init` message), **refused** (`reason = "refused"`
+plus the safe-read `code`, e.g. `symlink`), and **malformed** (`reason =
+"malformed"` from the pure `parseConfig`). No production caller reads it
+synchronously; a refused or absent config takes no lock (the harness reads it
+before `acquireLock`), so a hostile config cannot leave a lease behind. A
+refused config is reported by `status`/`inspect`, by the UI's `configError`/422
+preflight and by the UI entry (which refuses to start), never as absence or as
+defaults.
+
+Hostile/tampered data reads refuse rather than degrade: a symlinked
+`.orch/wave-log.jsonl`, artifact, artifact directory or handoff note throws the
+typed `SafeReadRefusalError` (inspect/handoff) and the display routes answer
+`404` for absence / `409` with the typed code for a refusal (downloads,
+wave-log tail, SSE fingerprint), with no outside bytes and no fabricated empty
+success.
 
 The reviewed identity is captured ONCE before the PRD is disclosed and is
 validated at a new grant, on resume, at each fresh wave/retry boundary and

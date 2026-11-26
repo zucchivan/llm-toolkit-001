@@ -1,11 +1,28 @@
 /**
  * Project config loader: `.orch/config.toml`, simple schema, defaults,
  * errors in plain words. No secrets live here (env provides credentials).
+ *
+ * M1-P01 step (g): the ONE production read is asynchronous and goes through the
+ * canonical project root plus the no-follow, capped host reader
+ * (`src/util/safe-read.ts`); `parseConfig` stays a pure text → settings
+ * decision. Absent, refused and malformed are three distinct outcomes:
+ *
+ *  - absent   (`readConfig().kind === "absent"`) — no file; there are no
+ *             defaults to fall back to.
+ *  - refused  (`readConfig().kind === "refused"`) — a symlink/ancestor escape,
+ *             hard link, non-regular leaf, permission, platform or cap refusal.
+ *  - malformed — `parseConfig` throws `ConfigError` (reason "malformed").
+ *
+ * `loadConfig` is the throwing wrapper every production caller awaits; it
+ * carries `ConfigError.reason`/`.code` so a caller can tell refusal from
+ * absence without parsing prose. No production caller may read the file
+ * synchronously.
  */
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as toml from "smol-toml";
+import { readSafeText, resolveSafeReadRoot } from "./util/safe-read.ts";
+import type { SafeReadRefusalCode } from "./util/safe-read.ts";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 
@@ -86,7 +103,30 @@ export const DEFAULT_CONFIG: KitConfig = {
 	paths: { prd: "docs/prd.md", specs: "specs/" },
 };
 
-export class ConfigError extends Error {}
+export class ConfigError extends Error {
+	/** `absent` and `refused` are the read boundary's outcomes; `malformed` is a parse error. */
+	readonly reason: ConfigErrorReason;
+	/** The safe-read refusal code for `reason === "refused"`; `"absent"`/`"malformed"` otherwise. */
+	readonly code: string;
+
+	constructor(message: string, details: { reason?: ConfigErrorReason; code?: string } = {}) {
+		super(message);
+		this.name = "ConfigError";
+		this.reason = details.reason ?? "malformed";
+		this.code = details.code ?? this.reason;
+	}
+}
+
+export type ConfigErrorReason = "absent" | "refused" | "malformed";
+
+/** Per-file cap for the project config; a larger file is a refusal, not a parse. */
+export const CONFIG_MAX_BYTES = 1024 * 1024;
+
+/** The read boundary's outcome, before parsing. Malformed TOML still throws. */
+export type ConfigRead =
+	| { kind: "ok"; config: KitConfig; path: string }
+	| { kind: "absent"; path: string; message: string }
+	| { kind: "refused"; path: string; code: SafeReadRefusalCode; message: string };
 
 /**
  * Effective settings bound into a reviewed plan's control identity (M1-P01
@@ -179,23 +219,41 @@ export function missingConfigMessage(file: string): string {
 }
 
 /**
+ * Read `<root>/.orch/config.toml` through the canonical-root + safe-read
+ * boundary. Absent and refused are returned as distinct outcomes; a malformed
+ * file throws `ConfigError` from the pure parser.
+ */
+export async function readConfig(root: string): Promise<ConfigRead> {
+	const resolved = await resolveSafeReadRoot(root);
+	if (resolved.kind === "refused") {
+		return { kind: "refused", path: resolved.path, code: resolved.code, message: `config refused: ${resolved.message} (${resolved.code})` };
+	}
+	const file = join(resolved.root, ".orch", "config.toml");
+	const read = await readSafeText({ root: resolved.root, path: ".orch/config.toml", maxBytes: CONFIG_MAX_BYTES });
+	if (read.kind === "absent") return { kind: "absent", path: file, message: missingConfigMessage(file) };
+	if (read.kind === "refused") {
+		return {
+			kind: "refused",
+			path: file,
+			code: read.code,
+			message: `config refused: ${file} is not a trusted project file (${read.code}): ${read.message}`,
+		};
+	}
+	return { kind: "ok", config: parseConfig(read.value, resolved.root), path: file };
+}
+
+/**
  * Parse and validate the project config at `<root>/.orch/config.toml`.
  * Missing file: throw (every project `init` scaffolds one). Unknown tables are
  * ignored (additive config), unknown fields inside known tables error.
  *
- * This synchronous entry point remains for host readers that are outside the
- * M1-P01 strict target paths (`src/engine/inspector.ts`,
- * `src/adoption/cli.ts`); `ui/server/sources.ts` and the M1 host-read boundary
- * parse the same text through `parseConfig` after a no-follow read.
+ * M1-P01 step (g): asynchronous over the canonical root + `safe-read`; there is
+ * no synchronous production read and no `readFile`/`readFileSync` fallback.
  */
-export function loadConfig(root: string, file = join(root, ".orch", "config.toml")): KitConfig {
-	let raw: string;
-	try {
-		raw = readFileSync(file, "utf8");
-	} catch {
-		throw new ConfigError(missingConfigMessage(file));
-	}
-	return parseConfig(raw, root);
+export async function loadConfig(root: string): Promise<KitConfig> {
+	const read = await readConfig(root);
+	if (read.kind === "ok") return read.config;
+	throw new ConfigError(read.message, read.kind === "absent" ? { reason: "absent", code: "absent" } : { reason: "refused", code: read.code });
 }
 
 /** Pure config parse: no filesystem read, so a trusted caller can reuse it. */

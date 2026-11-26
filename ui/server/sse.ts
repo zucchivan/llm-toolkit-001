@@ -13,12 +13,13 @@
  */
 import type { FSWatcher } from "node:fs";
 import { watch } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { readOnce, type ReadoutSnapshot } from "./readout.ts";
-import { attachedRun, jobsDir, jobsList, jobsViewList, runningJobPids, type AttachedRun } from "./jobs.ts";
+import { attachedRun, jobsList, jobsViewList, runningJobPids, type AttachedRun } from "./jobs.ts";
 import type { JobRecord, JobView } from "./jobs.ts";
 import { attachedStopView } from "./attached-stop.ts";
+import { openSafeDirectory, resolveSafeReadRoot } from "../../src/util/safe-read.ts";
+import type { SafeDirectory } from "../../src/util/safe-read.ts";
 import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 
 export interface HubOptions {
@@ -102,27 +103,11 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 	}
 
 	async function fingerprint(): Promise<string> {
-		const parts = await Promise.all([
-			statFingerprint(join(projectRoot, ".orch", "status.json")),
-			statFingerprint(join(projectRoot, ".orch", "wave-log.jsonl")),
-			statFingerprint(join(projectRoot, ".orch", "artifacts")),
-		]);
-		return parts.join("|");
+		return readoutFingerprint(projectRoot);
 	}
 
 	async function jobsFingerprint(): Promise<string> {
-		let names: string[] = [];
-		try {
-			names = await readdir(jobsDir(projectRoot));
-		} catch {
-			return "none";
-		}
-		const parts = await Promise.all(
-			names.sort().map(async (name) => {
-				const s = await stat(join(jobsDir(projectRoot), name)).catch(() => undefined);
-				return `${name}:${s ? `${s.mtimeMs}:${s.size}` : "-"}`;
-			}),
-		);
+		const parts = await jobsDirectoryFingerprint(projectRoot);
 		// The attached terminal-started run carries NO job record — without its
 		// identity in the fingerprint an attached run appearing or exiting (each
 		// leaves the last status.json flush in place) would never emit a `job`
@@ -261,8 +246,73 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 	};
 }
 
-function statFingerprint(path: string): Promise<string> {
-	return stat(path)
-		.then((s) => `${s.mtimeMs}:${s.size}`)
-		.catch(() => "-");
+/**
+ * One `.orch` entry's fingerprint token from the pinned directory handle
+ * (M1-P01 step g): fstat on the opened descriptor, never a path stat, so a
+ * symlinked `status.json`/`wave-log.jsonl`/`artifacts` can never contribute a
+ * link target's metadata. `absent` and `refused` are distinct, honest tokens
+ * (the hub only compares tokens; it never reads content here).
+ */
+async function entryToken(
+	directory: SafeDirectory,
+	name: string,
+	kind: "file" | "directory",
+): Promise<string> {
+	const opened = kind === "file" ? await directory.openFile(name) : await directory.openDirectory(name);
+	if (opened.kind === "absent") return "-";
+	if (opened.kind === "refused") return `refused:${opened.code}`;
+	try {
+		return `${opened.value.mtimeMs}:${opened.value.size}`;
+	} finally {
+		await opened.value.close();
+	}
+}
+
+/** `.orch` snapshot inputs (status.json, wave-log.jsonl, artifacts) as one token. */
+export async function readoutFingerprint(projectRoot: string): Promise<string> {
+	const resolved = await resolveSafeReadRoot(projectRoot);
+	if (resolved.kind !== "ok") return `refused:${resolved.code}`;
+	const opened = await openSafeDirectory({ root: resolved.root, path: ".orch" });
+	if (opened.kind === "absent") return "none";
+	if (opened.kind === "refused") return `refused:${opened.code}`;
+	try {
+		const parts = [
+			await entryToken(opened.value, "status.json", "file"),
+			await entryToken(opened.value, "wave-log.jsonl", "file"),
+			await entryToken(opened.value, "artifacts", "directory"),
+		];
+		return parts.join("|");
+	} finally {
+		await opened.value.close();
+	}
+}
+
+/**
+ * `.orch/ui/jobs` record files as fingerprint tokens, through the same pinned
+ * boundary. Absence is `none`; a refused directory or a symlink/special record
+ * is a refusal token (no link target metadata).
+ */
+export async function jobsDirectoryFingerprint(projectRoot: string): Promise<string[]> {
+	const resolved = await resolveSafeReadRoot(projectRoot);
+	if (resolved.kind !== "ok") return [`refused:${resolved.code}`];
+	const opened = await openSafeDirectory({ root: resolved.root, path: ".orch/ui/jobs" });
+	if (opened.kind === "absent") return ["none"];
+	if (opened.kind === "refused") return [`refused:${opened.code}`];
+	try {
+		const listed = await opened.value.list();
+		if (listed.kind === "absent") return ["none"];
+		if (listed.kind === "refused") return [`refused:${listed.code}`];
+		const parts: string[] = [];
+		for (const entry of listed.value) {
+			if (entry.kind === "directory") continue;
+			if (entry.kind !== "file") {
+				parts.push(`${entry.name}:refused:${entry.kind === "symlink" ? "symlink" : "not-regular"}`);
+				continue;
+			}
+			parts.push(`${entry.name}:${await entryToken(opened.value, entry.name, "file")}`);
+		}
+		return parts.sort();
+	} finally {
+		await opened.value.close();
+	}
 }

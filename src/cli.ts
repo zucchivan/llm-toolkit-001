@@ -390,8 +390,9 @@ async function cmdStatus(argv: string[]): Promise<void> {
 	} catch (err) {
 		if (err instanceof StoreAbsentError) {
 			// A never-run project has no storage to read — and none is created
-			// just to inspect. Render the empty/absent truth straight from config.
-			const config = loadConfig(root);
+			// just to inspect. Render the empty/absent truth straight from config
+			// (M1-P01 step (g): awaited through the canonical-root read boundary).
+			const config = await loadConfig(root);
 			we.log(
 				renderStatusPanel({
 					kit: KIT_VERSION,

@@ -735,13 +735,12 @@ config/env, `KIT_*` or argv.
   `src/engine/delivery.ts` (`git`/`gh` publication; `gh` only for
   `delivery.mode=pr` + explicit `--deliver`), `src/hygiene.ts` (init-time Git)
   and `ui/server/demo.ts` (demo bake through filter-free plumbing).
-- **Still deferred.** Step (g): async config reads (`src/config.ts`,
-  `src/engine/{harness,inspector,handoffs}.ts`, `ui/server/readout.ts`,
-  `src/adoption/cli.ts`, `src/adoption/gaps.ts`) and the remaining
-  artifact/download/SSE reads. P05: gate/probe execution
+- **Still deferred.** P05: gate/probe execution
   (`src/engine/recipe-runner.ts`) must consume this resolver, not add another.
+  (Step (g) closed the async config read and the remaining inspect/handoff/
+  download/SSE reads — see the next section.)
 
-## Host read boundary (M1-P01 steps c–d) — `src/util/safe-read.ts` + call sites
+## Host read boundary (M1-P01 steps c–g) — `src/util/safe-read.ts` + call sites
 
 - `readSafeText` / `openSafeFile` / `listSafeDirectory` / `walkSafeFiles` read
   root-relative through the Linux `/proc/self/fd` directory-FD walk
@@ -768,21 +767,66 @@ config/env, `KIT_*` or argv.
   (`cmdVerify`) and new human retry/accept decisions (`runResolution`). The
   identity `prdPath` is reserved read-only in task projection/candidate
   admission (`createTaskControls({prdPath})`, `openTask`, `resumeTask`).
-  Artifact listing (`artifactList`), `ui/server/server.ts:312–328,359–381`
-  (`?download=1`) and `ui/server/sse.ts:99–120,261` SSE fingerprints still
-  stat/read through plain fs calls (metadata only / outside P01 strict paths).
+- Wired in step (g) — the remaining read owners, root resolved once per
+  operation:
+  - **Config.** `src/config.ts` `readConfig(root)` resolves the canonical root
+    and reads `.orch/config.toml` through `readSafeText` (1 MiB per-file cap),
+    then `parseConfig` (pure) decides. Outcomes are distinct:
+    `{kind:"ok"}`, `{kind:"absent"}` (the documented no-defaults message),
+    `{kind:"refused", code}` (symlink leaf/ancestor, dangling link, hard link,
+    directory/FIFO/device, permission, cap, unsupported platform, unusable
+    root) and — for malformed bytes — `parseConfig` throws `ConfigError`.
+    `loadConfig(root)` is async and throws `ConfigError` carrying
+    `reason:"absent"|"refused"` and the refusal `code`; there is NO synchronous
+    production read. Callers: `openProjectHarness` (config read before the
+    lock, so a refused/absent config takes NO lease),
+    `src/engine/inspector.ts` (side-car delivery mode),
+    `ui/server/readout.ts` (`configError`), `ui/server/actions.ts`
+    (`configPreflight` 422), `src/adoption/cli.ts` (probe deadline fallback),
+    `src/cli.ts` (`status` on an empty store) and `ui/server/cli.ts` (the UI
+    entry's presence/refusal check).
+  - **Inspect.** `src/engine/inspector.ts` reads `.orch/status.json`, the
+    `.orch/artifacts` listing (+ per-entry fstat size/mtime from the pinned
+    descriptor), the artifact stats side-car, the PRD, `router.md` and
+    `.orch/wave-log.jsonl` through the boundary under one resolved root.
+    Absent = the defined empty/absent state; a REFUSED read throws
+    `SafeReadRefusalError` (no partial readout); the PRD/mirror health checks
+    report the refusal as an `error` row instead of "missing".
+  - **Handoffs.** `src/engine/handoffs.ts` lists `.orch/handoffs/inbox` and
+    reads each note (64 KiB per-file cap) plus the one-time legacy
+    `.orch/pending-handoff.json` (256 KiB cap). Absent inbox = nothing to
+    claim; a refused entry throws (no import, no quarantine of a hostile file);
+    content problems stay the diagnosed `invalid` list.
+  - **Hygiene.** `src/hygiene.ts` reads the existing `.gitignore` through the
+    boundary BEFORE any write; a refused file (symlink/type/permission/cap)
+    throws and nothing is appended. Git already went through `runGit`.
+  - **Adoption.** `src/adoption/gaps.ts` `inventoryGates` (now async) reads
+    recipes through `loadRecipeFileSafe` under one `SafeReadBudget`, so
+    `gates list`/`evaluate`/`refresh`/`probe` refuse a symlinked/oversized
+    recipe. `src/engine/gates.ts` `loadRecipes`/`loadRecipeFile` are marked
+    TEST-ONLY (no production importer; the driver wave gates use the immutable
+    reviewed bundle).
+  - **Downloads.** `ui/server/diff.ts` `readArtifactBytes` reads one artifact
+    from the pinned handle; `ui/server/server.ts` serves `?download=1` (both
+    the artifact and the task-patch route) from those bytes, so the old
+    `stat` + `createReadStream` pair (which could follow a project link) is
+    gone. Absent → 404; refused → 409 naming the typed code with no bytes.
+  - **Wave-log tail.** `ui/server/diff.ts` reads the last
+    `WAVE_LOG_TAIL_BYTES` (4 MiB, max 20k rows) of `.orch/wave-log.jsonl`
+    through `SafeFile.readTailText`, which drops the partial first line; a
+    refused/absent log degrades to the route's stated 409/empty.
+  - **SSE.** `ui/server/sse.ts` fingerprints `.orch/status.json`,
+    `.orch/wave-log.jsonl`, `.orch/artifacts` and `.orch/ui/jobs/*` by fstat on
+    pinned handles (no symlink-following `stat` walk). Absent is `-`/`none`; a
+    refusal is its own token (`refused:<code>`), never a link target's metadata.
+    `SafeFile`/`SafeDirectory` now expose fstat `mtimeMs` (and `size`) and
+    `SafeFile.readTailText`.
 - `parseConfig(raw, root)` is the pure project-config parser.
   `controlPolicySettings(config)` is the canonical identity projection of the
   EFFECTIVE settings (session ceiling excluded; `sandbox: null` until M1-P05).
-  The synchronous `loadConfig` keeps its raw read for callers outside P01's
-  strict paths (`src/engine/inspector.ts`, `ui/server/readout.ts`,
-  `src/adoption/cli.ts`). `loadRecipes`/`loadRecipeFile` likewise remain for
-  `src/adoption/gaps.ts` and existing tests.
-- NOT wired (deferred to P01 step (g) or P05; recorded in
-  `docs/engineering-plan/evidence/M1-P01.md`): the async config cutover, the
-  remaining `inspect`/handoff/source/artifact/download/SSE reads and
-  gate/probe recipe execution (`src/engine/recipe-runner.ts`, P05 — it must
-  consume the step (e) resolver, not add another chain). CLI/UI launch and
+- NOT wired (P05): gate/probe recipe EXECUTION
+  (`src/engine/recipe-runner.ts`, `src/util/exec.ts`'s legacy `exec`) must
+  consume the step (e) resolver, not add another chain. CLI/UI launch and
   attached-stop are wired to the trusted installation's launch identity in
   step (f).
 

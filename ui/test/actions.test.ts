@@ -6,7 +6,7 @@
  * X-Kit-Token echo, jobs/log routes, and the server-restart sweep.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -59,6 +59,24 @@ describe("model preflight (422 before a doomed job spawns)", () => {
 			expect(run!.error).toMatch(/\[roles\.planner\]/);
 		} finally {
 			await rm(noRoles, { recursive: true, force: true });
+		}
+
+		// A REFUSED config (symlink) is reported as a refusal, not as a missing
+		// config and not as a model gap (M1-P01 step (g)).
+		const refusedRoot = await mkdtemp(join(tmpdir(), "ui-preflight-"));
+		const outside = await mkdtemp(join(tmpdir(), "ui-preflight-outside-"));
+		try {
+			await mkdir(join(refusedRoot, ".orch"), { recursive: true });
+			await writeFile(join(outside, "config.toml"), goodConfig, "utf8");
+			await symlink(join(outside, "config.toml"), join(refusedRoot, ".orch", "config.toml"));
+			const refused = await configPreflight(refusedRoot, { kind: "plan" });
+			expect(refused).toMatchObject({ status: 422 });
+			expect(refused!.missing).toBeUndefined();
+			expect(refused!.configError).toMatch(/config refused: .*\(symlink\)/);
+			expect(refused!.error).toMatch(/can't be read/);
+		} finally {
+			await rm(refusedRoot, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
 		}
 
 		const broken = await rootWithConfig("[roles.planner]\nprovider = \"\n"); // invalid TOML
