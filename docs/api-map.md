@@ -32,6 +32,15 @@ SDK values, re-exported by module:
 - storage: `openNodeSqliteStorage`
   (`@earendil-works/pi-durable/storage/sqlite/node`), `MemoryStorage` (tests)
 - env: `NodeExecutionEnv` (`@earendil-works/pi-durable/env/node`)
+- M1-P02 guest environment exports, re-exported only through this seam:
+  runtime `FileError` and `ExecutionError`; types `ExecutionEnv`, `FileSystem`,
+  `Shell`, `Result`, `FileErrorCode`, `ExecutionErrorCode`, `FileKind`,
+  `FileInfo`, `FileListEntry`, `FileListing`, `ListFilesOptions`, `TextLine`,
+  `TextLineReader`, `BinaryReader`, `LineScan`, `DirReader`, `WatchTarget`,
+  `FileChange`, `FileWatcher`, `ShellExecOptions`, `ShellExecResult`,
+  `ShellOutputInfo`, `ShellOutputSkip`, `ShellOutputWindow` and
+  `ShellSpillOptions` (`@earendil-works/pi-durable/env`). `Context` continues
+  to come from chord through the seam.
 - tools: `createReadTool`, `createWriteTool`, `createEditTool`, `createBashTool`,
   `CodingTools`, `createCodingTools` (subpath /tools; the latter two
   re-exported for reference)
@@ -862,3 +871,57 @@ config/env, `KIT_*` or argv.
   It closes the harness and releases `.orch/lock` in `finally`, so every early
   return (refusal, budget stop, error) leaves no handle behind; `verify` does
   the same and never mutates task disposition.
+
+## src/sandbox/{protocol,guest-env,guest-helper,types}.ts — M1-P02
+
+The P02 adapter is prepared but not wired into `src/engine/harness.ts`; the
+current harness factory still constructs `NodeExecutionEnv`. M1-P04 owns the
+role resolver and P03 supplies a real guest launcher. There is no production
+fake selector or host execution fallback. `GuestEnv` implements the exact
+`ExecutionEnv` contract above. `startGuestHelper` is the fixed guest-side
+dispatcher and constructs `NodeExecutionEnv` with the lease cwd, `/bin/bash`,
+and a fixed guest shell environment (`HOME=/home/worker`, `PATH=/usr/bin:/bin`,
+`TMPDIR=/run/kit-tmp`). A future launcher must run this helper inside its guest;
+it must set the helper process's `TMPDIR` too, because pinned temp-file methods
+read `node:os.tmpdir()` directly. The helper expands `~` to `/home/worker`
+before pinned path resolution. The mutable `GuestEnv.cwd` is sent with each
+path and exec request; the helper updates its pinned environment in guest
+coordinates, and upload targets become absolute at `begin` so later cwd changes
+cannot retarget a partial upload. P02 in-memory fixtures are protocol evidence
+only, not containment evidence.
+
+- **Wire format.** One duplex stream is supplied per lease. A 4-byte unsigned
+  big-endian length prefixes each UTF-8 JSON frame; payloads are at most 1 MiB.
+  Requests are `{v:1,id,op,args}`. Responses keep the request `id` and carry
+  `{ok:true,value}` or `{ok:false,code}`; intermediate text, byte, line and
+  output chunks are response values correlated to the same in-flight ID.
+  Unknown, duplicate, unsolicited or stale IDs fail the stream closed. Fixed
+  operation dispatch uses no dynamic method/module lookup.
+- **Chunking and handles.** Binary payload chunks are at most 64 KiB (base64
+  inside the bounded JSON frame). Text and output chunks are split on UTF-8
+  character boundaries at the same byte limit. Read text/binary and reader
+  operations stream chunks; write/append use guest-local `begin`, `chunk`,
+  `commit`, and `abort` operations, so partial uploads have no target-file
+  effect before commit. Binary, line and directory readers receive helper-local
+  handles; wrong-kind, stale and cross-lease handles return typed `FileError`.
+  The SDK namespace ID is `guest-v1:<leaseId>`.
+- **Operation map.** `absolutePath`/`joinPath` map to `fs.absolute`/`fs.join`;
+  text and binary whole-file reads stream bounded chunks; `readTextLines` is
+  composed from line-reader operations; binary `info`/`read`/`scanLines` and
+  line/directory reader `next`/`close` each have fixed operations. Writes,
+  append, truncate, flush, rename, info, canonicalPath, exists, createDir,
+  remove, createTempDir and createTempFile map to explicit `fs.*` operations.
+  `listDir` composes `fs.dir.open`/`next`/`close`. `exec` is the only
+  shell/process operation. `listFiles` and
+  `watch` return the pinned `not_supported` error; they never fall through to
+  host APIs.
+- **Role and cancellation.** `planner` and `verifier` are read-only;
+  `implementer` may use registered tools and string bash; `gate` and `probe`
+  may execute literal argv only and their stdout/stderr are capped separately
+  at 1 MiB each, with omitted byte/newline counts reported. Unknown roles and
+  role/operation mismatches refuse. Caller cancellation sends a fixed `cancel`
+  op and awaits the original result; `NodeExecutionEnv` aborts and waits for
+  the command tree before it returns. Lease cleanup blocks new operations,
+  aborts and awaits in-flight work, closes handles, drops partial uploads,
+  calls pinned `NodeExecutionEnv.cleanup`, then closes the stream. Protocol
+  failures and transport loss fail typed; host exception stacks are never sent.
