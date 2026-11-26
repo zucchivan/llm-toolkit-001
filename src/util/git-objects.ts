@@ -38,6 +38,7 @@ export interface RunGitOptions {
 	overflow?: "tail" | "head" | "refuse";
 	/** Add the absolute resolved gh credential helper (PR publication only). */
 	credentialHelper?: boolean;
+	gitHubToken?: string;
 	signal?: AbortSignal;
 	hostInstallation?: TrustedInstallationDescriptor;
 }
@@ -60,6 +61,7 @@ export async function runGit(
 		...(options.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
 		...(options.overflow !== undefined ? { overflow: options.overflow } : {}),
 		...(options.credentialHelper ? { credentialHelper: true } : {}),
+		...(options.gitHubToken !== undefined ? { gitHubToken: options.gitHubToken } : {}),
 		...(options.signal ? { signal: options.signal } : {}),
 		...(options.hostInstallation ? { installation: options.hostInstallation } : {}),
 	});

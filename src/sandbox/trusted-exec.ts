@@ -552,6 +552,7 @@ export function buildGitEnvironment(overrides: Readonly<Record<string, string>> 
 	const home = hostHome();
 	return {
 		GIT_CONFIG_NOSYSTEM: "1",
+		GIT_NO_REPLACE_OBJECTS: "1",
 		GIT_CONFIG_GLOBAL: DEV_NULL,
 		GIT_CONFIG_SYSTEM: DEV_NULL,
 		GIT_ATTR_NOSYSTEM: "1",
@@ -663,7 +664,10 @@ export async function runTrustedTool(
 			const prefix = [...gitHardeningArgs()];
 			if (options.credentialHelper) {
 				const gh = await requireTrustedTool(descriptor, "gh", useOptions);
-				prefix.push("-c", `credential.helper=!${gh.path} auth git-credential`);
+				// Git invokes a bang helper through a shell. Single-quote the
+				// entire executable token, escaping embedded single quotes.
+				const literalPath = "'" + gh.path.replaceAll("'", "'\\''") + "'";
+				prefix.push("-c", `credential.helper=!${literalPath} auth git-credential`);
 			}
 			const env = buildGitEnvironment(options.env ?? {});
 			if (options.credentialHelper) {

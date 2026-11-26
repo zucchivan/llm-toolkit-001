@@ -42,7 +42,7 @@ import { startAction, stopAction, validateAction } from "./actions.ts";
 import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
 import { currentJobsEvent, startSnapshotHub, type SnapshotHub } from "./sse.ts";
-import { jobsList, jobsViewList, markStaleRecords, pruneJobs, readJobRecord, runningJobPids, tailJobLog } from "./jobs.ts";
+import { JobStateRefusal, jobsList, markStaleRecords, pruneJobs, readJobRecord, runningJobPids, tailJobLog } from "./jobs.ts";
 import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 
 export interface UiServerOptions {
@@ -95,7 +95,8 @@ export function startServer(opts: UiServerOptions): Promise<RunningUiServer> {
 	}
 	const server = createServer((req, res) => {
 		void route(req, res, opts, hub, posture).catch((err) => {
-			jsonError(res, 500, `ui server error: ${(err as Error).message}`);
+			if (err instanceof JobStateRefusal) jsonError(res, 409, err.message);
+			else jsonError(res, 500, `ui server error: ${(err as Error).message}`);
 		});
 	});
 	return new Promise((resolveRunning, rejectRunning) => {
@@ -436,7 +437,7 @@ async function serveJobRoute(
 	}
 	const requestedN = Number.parseInt(params.get("n") ?? "200", 10);
 	const n = Number.isInteger(requestedN) && requestedN > 0 ? Math.min(5_000, requestedN) : 200;
-	const lines = await tailJobLog(record.logPath, n);
+	const lines = await tailJobLog(opts.root, id, n);
 	res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
 	res.end(JSON.stringify({ at: Date.now(), job: record, lines }));
 }
@@ -505,7 +506,7 @@ async function serveActionPost(req: IncomingMessage, res: ServerResponse, opts: 
 			res.end(JSON.stringify({ kind: "stop", target: "attached", pid: attached.pid }));
 			return;
 		}
-		const result = await stopAction(opts.root);
+		const result = await stopAction(opts.root, opts.installation);
 		if (!result.ok) {
 			jsonError(res, result.fail.status, result.fail.error, {
 				...(result.fail.holderPid ? { holderPid: result.fail.holderPid } : {}),
@@ -550,7 +551,7 @@ function serveEvents(req: IncomingMessage, res: ServerResponse, opts: UiServerOp
 		.catch(() => write("event: readout\ndata: null\n\n"));
 	void currentJobsEvent(opts.root, opts.installation)
 		.then((payload) => write(`event: job\ndata: ${JSON.stringify(payload)}\n\n`))
-		.catch(() => {});
+		.catch((err) => write(`event: job-error\ndata: ${JSON.stringify({ error: (err as Error).message })}\n\n`));
 	const unsubscribe = hub.subscribe(write);
 	const heartbeatMs = opts.heartbeatMs ?? 15_000;
 	const heartbeat = setInterval(() => {

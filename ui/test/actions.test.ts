@@ -6,13 +6,13 @@
  * X-Kit-Token echo, jobs/log routes, and the server-restart sweep.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { buildArgv, resolveCli, startAction, stopAction, validateAction, configPreflight, ACTION_ROLE_NEEDS } from "../server/actions.ts";
-import { jobEnvironment, markStaleRecords, pruneJobs, spawnJob, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
+import { jobEnvironment, jobRunnerArgs, launchBinding, markStaleRecords, pruneJobs, spawnJob, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
 import { selectInstallation } from "../../src/sandbox/trusted-exec.ts";
 import { bake, cleanup, postAction, actionHeaders, trustedNodeFixture, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
 
@@ -429,7 +429,7 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 			expect(handoffJob.status).toBe("exited");
 			expect(handoffJob.argv[handoffJob.argv.length - 1]).toBe("watch the gate");
 			// the note rode the argv (the real CLI writes .orch/pending-handoff.json — see demo e2e)
-			const tail = await tailJobLog(handoffJob.logPath, 20);
+			const tail = await tailJobLog(baked.root, handoffJob.id, 20);
 			expect(tail.join("\n")).toContain("handoff note queued for the next wave: watch the gate");
 		} finally {
 			if (run.ok) await stopAction(baked.root); // SIGINT the run job
@@ -455,6 +455,63 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 		}
 	});
 
+	it("refuses job-log redirection, unsafe lock conflicts and a record-only Stop PID", async () => {
+		const sleeper = spawnSleeper(12);
+		const cookie = { headers: { cookie: baked.cookie } };
+		const dir = join(baked.root, ".orch", "ui", "jobs");
+		const recordPath = join(dir, "unsafe.json");
+		const logPath = join(dir, "unsafe.log");
+		const outside = join(baked.stubDir, "outside.txt");
+		const lockPath = join(baked.root, ".orch", "lock");
+		const record = {
+			id: "unsafe", kind: "run", cwd: baked.root, startedAt: Date.now(),
+			status: "failed", argv: [baked.node, baked.stubCli, "run"], logPath,
+		};
+		await mkdir(dir, { recursive: true });
+		await writeFile(outside, "PRIVATE-FIXTURE");
+		try {
+			await writeFile(recordPath, JSON.stringify({ ...record, logPath: outside }));
+			const redirect = await fetch(`${baked.base}/api/jobs/unsafe/log`, cookie);
+			expect(redirect.status).toBe(409);
+			expect(await redirect.text()).not.toContain("PRIVATE-FIXTURE");
+
+			await writeFile(recordPath, JSON.stringify(record));
+			for (const alias of [symlink, link]) {
+				await alias(outside, logPath);
+				for (const route of ["jobs/unsafe/log", "jobs"]) {
+					const res = await fetch(`${baked.base}/api/${route}`, cookie);
+					expect(res.status).toBe(409);
+					expect(await res.text()).not.toContain("PRIVATE-FIXTURE");
+				}
+				await rm(logPath);
+			}
+			// A valid large log yields a bounded whole-line tail.
+			await writeFile(logPath, "BEGINNING" + "a".repeat(512 * 1024) + "\nlast line\n");
+			const bounded = await fetch(`${baked.base}/api/jobs/unsafe/log`, cookie);
+			expect(bounded.status).toBe(200);
+			expect(await bounded.json()).toMatchObject({ lines: ["last line"] });
+
+			await symlink(outside, lockPath);
+			const blocked = await postAction(baked.base, baked.cookie, { kind: "plan" }, actionHeaders(baked.csrf));
+			expect(blocked.status).toBe(409);
+			expect(await blocked.text()).toMatch(/lock is a symbolic link/);
+			expect((await jobsList(baked.root)).map((job) => job.id)).toEqual(["unsafe"]);
+			await rm(lockPath);
+
+			const { identity } = await resolveCli(baked.root, baked.installation);
+			await writeFile(recordPath, JSON.stringify({ ...record, status: "running", pid: sleeper.pid, runnerPid: process.pid, identity }));
+			const stopped = await postAction(baked.base, baked.cookie, { kind: "stop" }, actionHeaders(baked.csrf));
+			expect(stopped.status).toBe(409);
+			expect(await stopped.text()).toContain("no verified live CLI child");
+			await new Promise((resolve) => setTimeout(resolve, 75));
+			expect(sleeper.child.exitCode).toBeNull();
+			expect(sleeper.child.signalCode).toBeNull();
+			expect(await readFile(outside, "utf8")).toBe("PRIVATE-FIXTURE");
+		} finally {
+			sleeper.child.kill("SIGKILL");
+		}
+	});
+
 	it("stop with nothing running at all → 409 plain", async () => {
 		const stop = await postAction(baked.base, baked.cookie, { kind: "stop" }, actionHeaders(baked.csrf));
 		expect(stop.status).toBe(409);
@@ -464,6 +521,7 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 	it("/api/jobs synthesizes the attached entry from a live status.json pid", async () => {
 		const sleeper = spawnSleeper(6);
 		try {
+			await writeFile(join(baked.root, ".orch", "lock"), `${sleeper.pid}\n`);
 			await writeFile(
 				join(baked.root, ".orch", "status.json"),
 				JSON.stringify({ lockedByPid: sleeper.pid, phase: "wave-running", task: { id: "t1", wave: 2, status: "running" }, ts: Date.now() }),
@@ -528,11 +586,9 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 });
 
 describe("trusted launch identity + runner refusal (M1-P01 step (f))", () => {
-	const RUNNER = join(import.meta.dirname, "..", "server", "job-runner.mjs");
-
 	/** Run the real detached runner against one record and wait for it to exit. */
-	async function runRunner(recordPath: string): Promise<number | null> {
-		const child = spawn(process.execPath, [RUNNER, "--record", recordPath], { stdio: "ignore" });
+	async function runRunner(node: string, root: string, id: string, binding: string): Promise<number | null> {
+		const child = spawn(node, jobRunnerArgs(root, id, binding), { cwd: root, stdio: "ignore" });
 		return await new Promise((done) => child.once("exit", (code) => done(code)));
 	}
 
@@ -567,7 +623,7 @@ describe("trusted launch identity + runner refusal (M1-P01 step (f))", () => {
 		try {
 			const marker = join(baked.root, "runner-spawned.txt");
 			const markerStub = join(baked.stubDir, "marker-cli.mjs");
-			await writeFile(markerStub, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`, "utf8");
+			await writeFile(markerStub, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "ran");\n`, { mode: 0o755 });
 			const launched = await startAction(baked.root, { kind: "plan", prd: "docs/prd.md" });
 			expect(launched.ok).toBe(true);
 			if (!launched.ok) return;
@@ -577,31 +633,54 @@ describe("trusted launch identity + runner refusal (M1-P01 step (f))", () => {
 
 			const dir = join(baked.root, ".orch", "ui", "jobs");
 			await mkdir(dir, { recursive: true });
-			const cases: { id: string; record: Record<string, unknown> }[] = [
-				{
-					id: "tampered-1",
-					record: { argv: [baked.node, markerStub, "plan"], identity },
-				},
-				{
-					id: "foreign-1",
-					record: { argv: [baked.node, baked.stubCli, "plan"], identity: { ...identity!, installationRoot: "/srv/other-kit" } },
-				},
-				{ id: "naked-1", record: { argv: [baked.node, markerStub, "plan"] } },
+			const outsideLog = join(baked.stubDir, "outside.log");
+			await writeFile(outsideLog, "untouched");
+			const badIdentity = { ...identity!, entry: markerStub, argvPrefix: [baked.node, markerStub] };
+			const cases = [
+				{ id: "matched-change", patch: { argv: [baked.node, markerStub, "plan"], identity: badIdentity } },
+				{ id: "foreign-installation", patch: { identity: { ...identity!, installationRoot: "/srv/other-kit" } } },
+				{ id: "naked", patch: { identity: undefined } },
+				{ id: "cwd-change", patch: { cwd: baked.stubDir }, malformed: true },
+				{ id: "log-change", patch: { logPath: outsideLog }, malformed: true },
+				{ id: "log-link", patch: {}, logLink: true },
+				{ id: "invalidated-installation", patch: {}, invalidated: true },
 			];
-			for (const { id, record } of cases) {
+			for (const { id, patch, malformed, logLink, invalidated } of cases) {
 				const recordPath = join(dir, `${id}.json`);
-				await writeFile(
-					recordPath,
-					JSON.stringify({ id, kind: "plan", cwd: baked.root, startedAt: Date.now(), status: "running", logPath: join(dir, `${id}.log`), ...record }),
-					"utf8",
-				);
-				expect(await runRunner(recordPath)).toBe(0);
-				const after = await readJobRecord(baked.root, id);
-				expect(after).toMatchObject({ status: "failed", exitCode: 127 });
-				expect(after?.detail).toMatch(/refused/);
-				expect(after?.pid).toBeUndefined(); // no CLI child was ever spawned
-				expect(existsSync(join(dir, `${id}.log`))).toBe(false); // refused before the log/spawn
+				const logPath = join(dir, `${id}.log`);
+				const authorized = { ...launched.job, id, logPath };
+				await writeFile(recordPath, JSON.stringify({ ...authorized, ...patch }));
+				if (logLink) await symlink(outsideLog, logPath);
+				if (invalidated) await chmod(baked.stubCli, 0o777);
+				try {
+					expect(await runRunner(baked.node, baked.root, id, launchBinding(authorized))).toBe(malformed ? 1 : 0);
+				} finally {
+					if (invalidated) await chmod(baked.stubCli, 0o755);
+				}
+				if (!malformed) {
+					const after = await readJobRecord(baked.root, id);
+					expect(after).toMatchObject({ status: "failed", exitCode: 127 });
+					expect(after?.detail).toMatch(/refused/);
+					expect(after?.pid).toBeUndefined();
+				}
+				if (!logLink) expect(existsSync(logPath)).toBe(false);
+				expect(await readFile(outsideLog, "utf8")).toBe("untouched");
 			}
+			// Simulate an ancestor redirected after the host prepared a job.
+			const id = "redirected-jobs";
+			const authorized = { ...launched.job, id, logPath: join(dir, `${id}.log`) };
+			await writeFile(join(dir, `${id}.json`), JSON.stringify(authorized));
+			const displaced = join(baked.stubDir, "displaced-jobs");
+			await rename(dir, displaced);
+			await symlink(displaced, dir);
+			try {
+				expect(await runRunner(baked.node, baked.root, id, launchBinding(authorized))).toBe(1);
+				expect(existsSync(join(displaced, `${id}.log`))).toBe(false);
+			} finally {
+				await rm(dir);
+				await rename(displaced, dir);
+			}
+
 			expect(existsSync(marker)).toBe(false); // zero recorded-argv substitutions executed
 		} finally {
 			await cleanup(baked);
@@ -644,7 +723,7 @@ describe("trusted launch identity + runner refusal (M1-P01 step (f))", () => {
 			});
 			const finished = (await waitFor(() => readJobRecord(baked.root, job.id), (j) => j !== undefined && j.status !== "running", 8_000))!;
 			expect(finished).toMatchObject({ status: "exited", exitCode: 0 });
-			const env = JSON.parse((await tailJobLog(finished.logPath, 20)).join("\n")) as Record<string, string | null>;
+			const env = JSON.parse((await tailJobLog(baked.root, finished.id, 20)).join("\n")) as Record<string, string | null>;
 			expect(env).toEqual({
 				KIT_FAUX: "1",
 				KIT_FAUX_SCRIPT: "smoke.replay",

@@ -706,10 +706,12 @@ config/env, `KIT_*` or argv.
   kit/cwd/PATH candidate search). `ui/server/cli.ts` builds the descriptor once
   and hands it to `startServer` → `startAction`/`resolveCli` → `spawnJob`, which
   records `{node, entry, (loader), form, argvPrefix, installationRoot, source,
-  descriptorSha256}` in the private job record; `job-runner.mjs` revalidates
-  the record's argv/files/installation against that identity BEFORE any spawn
-  (a tampered, foreign or identity-less record fails the record and spawns
-  nothing). `ui/server/attached-stop.ts` compares `/proc/<pid>/exe` and
+  descriptorSha256}` in the private job record. The host independently passes
+  the project, job ID and full-launch digest. `job-runner.mjs` checks the
+  binding and revalidates the selected files before opening the pinned log.
+  Ordinary Stop verifies the runner and its direct child through `/proc`.
+  Attached Stop checks agreeing lock and status PIDs, then compares
+  `/proc/<pid>/exe` and
   `/proc/<pid>/cmdline` against the same prefix (plus cwd + subcommand), with no
   independent `resolveCli` and no PATH/target fallback. `KIT_UI_CLI_BIN` is
   retired as authority and is dropped from job environments.
@@ -721,15 +723,17 @@ config/env, `KIT_*` or argv.
   `process.env`.
 - **Git/gh environment.** `buildGitEnvironment` starts from fixed host values
   (system/global config disabled, attributes off, terminal prompt off, no
-  pager) and accepts only plumbing overrides (index file + commit identity).
+  pager and replacement-object lookup disabled) and accepts only plumbing
+  overrides (index file + commit identity).
   `gitHardeningArgs` disables hooks, fsmonitor, attributes, signing, external
   diff, protocol-ext, proxies and credential-helper inheritance. Staging uses
   `hash-object --no-filters` + `update-index --index-info` plumbing
   (`writeWorktreeTree` in `src/util/git-objects.ts`) — no `git add`, clean
   filter or hook. `buildGhEnvironment` is noninteractive and pins
   `GH_HOST=github.com`; a host-resolved `GH_TOKEN` is passed only to a PR
-  delivery subprocess, which also receives the absolute resolved gh as Git's
-  credential helper.
+  delivery subprocess. Git remote reads and create-only pushes use a private
+  bare Git directory with clean config, the approved URL, and a literally
+  quoted absolute gh helper for GitHub HTTPS.
 - **Wired callers.** `src/util/git.ts` (all plumbing/baseline/diff helpers),
   `src/util/git-objects.ts`, `src/engine/verifier.ts` (`diff --name-only`),
   `src/engine/delivery.ts` (`git`/`gh` publication; `gh` only for

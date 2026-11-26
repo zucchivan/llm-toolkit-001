@@ -10,7 +10,7 @@
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -101,6 +101,7 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 
 	/** Declare the side-car truth: this pid owns the lock right now. */
 	async function declareHolder(pid: number, phase = "wave-running"): Promise<void> {
+		await writeFile(join(root, ".orch", "lock"), `${pid}\n`);
 		await writeFile(
 			join(root, ".orch", "status.json"),
 			JSON.stringify({ lockedByPid: pid, phase, ts: Date.now() }),
@@ -151,6 +152,33 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 		}
 	});
 
+	it("delivers zero signals when the status or lock is redirected, or their holders disagree", async () => {
+		const marker = join(root, "refused-signals.txt");
+		const ready = join(root, "refused-ready.txt");
+		const child = spawnRunner(["run"], root, marker, ready);
+		await waitFor(async () => existsSync(ready), Boolean, 8_000);
+		const statusPath = join(root, ".orch", "status.json");
+		const lockPath = join(root, ".orch", "lock");
+		for (const [path, file] of [[statusPath, "outside-status"], [lockPath, "outside-lock"]] as const) {
+			await declareHolder(child.pid!);
+			const outside = join(fixtureDir, file);
+			await writeFile(outside, await readFile(path));
+			await rm(path);
+			await symlink(outside, path);
+			try {
+				const result = await attachedStopAction(root, { ...stopOpts(), expectedPid: child.pid! });
+				expect(result).toMatchObject({ ok: false, fail: { code: "state-refused" } });
+			} finally {
+				await rm(path);
+			}
+		}
+		await declareHolder(child.pid!);
+		await writeFile(lockPath, `${process.pid}\n`);
+		expect(await attachedStopAction(root, stopOpts())).toMatchObject({ ok: false, fail: { code: "state-refused" } });
+		expect(await pidAlive(child.pid!)).toBe(true);
+		expect(existsSync(marker)).toBe(false);
+	});
+
 	it("a mismatched confirmed pid refuses (the holder changed) — nothing is signalled", async () => {
 		const child = spawnRunner(["run"], root);
 		await declareHolder(child.pid!);
@@ -163,7 +191,7 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 
 			const action = await attachedStopAction(root, { ...stopOpts(), expectedPid: wrongPid });
 			expect(action).toMatchObject({ ok: false, fail: { status: 409, code: "moved" } });
-			expect(pidAlive(child.pid!)).toBe(true); // survived the refused attempt
+			expect(await pidAlive(child.pid!)).toBe(true); // survived the refused attempt
 		}
 	});
 
@@ -180,7 +208,7 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 
 			const action = await attachedStopAction(root, stopOpts());
 			expect(action).toMatchObject({ ok: false, fail: { status: 409, code: "identity" } });
-			expect(pidAlive(foreign.pid!)).toBe(true); // the refusal NEVER signals
+			expect(await pidAlive(foreign.pid!)).toBe(true); // the refusal NEVER signals
 		}
 	});
 
@@ -279,7 +307,7 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 			expect(check).toMatchObject({ ok: false, status: 409, code: "identity" });
 			if (check.ok) return;
 			expect(check.error).toMatch(/trusted CLI launch identity/);
-			expect(pidAlive(child.pid!)).toBe(true); // the refusal NEVER signals
+			expect(await pidAlive(child.pid!)).toBe(true); // the refusal NEVER signals
 		} finally {
 			if (saved.KIT_UI_CLI_BIN === undefined) delete process.env["KIT_UI_CLI_BIN"];
 			else process.env["KIT_UI_CLI_BIN"] = saved.KIT_UI_CLI_BIN;
@@ -299,7 +327,7 @@ describe.skipIf(SKIP)("verified attached stop (§7.2.1)", () => {
 		expect(check).toMatchObject({ ok: false, status: 409, code: "identity" });
 		if (check.ok) return;
 		expect(check.error).toMatch(/trusted CLI launch identity/);
-		expect(pidAlive(child.pid!)).toBe(true);
+		expect(await pidAlive(child.pid!)).toBe(true);
 	});
 });
 
@@ -342,6 +370,7 @@ describe("attached stop: action-body validation + routes (target/pid shapes)", (
 			// running-record claim — post-fix even before any /proc identity work.
 			const holder = spawn(process.execPath, ["-e", "const t = Date.now() + 30000; while (Date.now() < t) {}"], { cwd: baked.root, stdio: "ignore" });
 			try {
+				await writeFile(join(baked.root, ".orch", "lock"), `${holder.pid}\n`);
 				await writeFile(join(baked.root, ".orch", "status.json"), JSON.stringify({ lockedByPid: holder.pid!, phase: "wave-running", ts: Date.now() }), "utf8");
 				const record = {
 					id: "jobclaim1",
@@ -351,7 +380,7 @@ describe("attached stop: action-body validation + routes (target/pid shapes)", (
 					pid: holder.pid!,
 					startedAt: Date.now(),
 					status: "running",
-					logPath: join(".orch", "ui", "jobs", "jobclaim1.log"),
+					logPath: join(jobsDir(baked.root), "jobclaim1.log"),
 				};
 				await mkdir(jobsDir(baked.root), { recursive: true });
 				await writeFile(join(jobsDir(baked.root), "jobclaim1.json"), JSON.stringify(record), "utf8");
@@ -362,7 +391,7 @@ describe("attached stop: action-body validation + routes (target/pid shapes)", (
 				expect(body.error).toMatch(/ordinary Stop/);
 
 				await new Promise((r) => setTimeout(r, 300)); // a stray signal would kill a bare busy loop this fast
-				expect(pidAlive(holder.pid!)).toBe(true); // survived — the refusal signalled nothing
+				expect(await pidAlive(holder.pid!)).toBe(true); // survived — the refusal signalled nothing
 			} finally {
 				holder.kill("SIGKILL");
 			}

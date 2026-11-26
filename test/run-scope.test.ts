@@ -16,6 +16,7 @@
 import { describe, expect, it, beforeEach } from "vitest";
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { demoBudgetToml2 } from "./fixtures2.ts";
@@ -538,6 +539,12 @@ describe("run-scope: resolve never broadens the stored grant (M0-P18)", () => {
 		expect(refusal).toMatch(/does not equal the stored grant \(t1\)/);
 		await expect(runWaves(kit, { tasksFilter: ["t1", "t2"] })).rejects.toThrow(/does not equal the stored grant/);
 
+		// A replacement added after review and the first wave must not change
+		// the retry's projected controls or recipe verdict.
+		const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: project.root, encoding: "utf8" }).trim();
+		await writeFile(join(project.root, "alternate-recipe.toml"), '[different-gate]\nargv = ["node", "--version"]\nmatch = "no fixture version matches this"\n');
+		git("replace", git("rev-parse", "HEAD:evals/recipes.toml"), git("hash-object", "-w", "alternate-recipe.toml"));
+
 		// The retried wave repairs the task; the plan still has work outside the grant.
 		faux.appendResponses([
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/one.ts", content: "export const one = 1;\n" })], { stopReason: "toolUse" }),
@@ -552,6 +559,7 @@ describe("run-scope: resolve never broadens the stored grant (M0-P18)", () => {
 		const final = await readSessionState(kit.loop.harness);
 		expect(readGrant(final.runStatus)).toEqual(grantBefore);
 		expect(final.router.phase).not.toBe("complete");
+		expect(final.router.tasks.find((task) => task.id === "t1")?.status).toBe("done");
 		await kit.loop.close();
 		kit.lock.release();
 	}, 120_000);

@@ -10,10 +10,7 @@
  * verification passes (ui/server/attached-stop.ts; a failed check signals
  * nothing).
  */
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { readJson } from "../../src/util/fsx.ts";
-import type { StatusPayloads } from "../../src/engine/harness.ts";
+import { verifyJobProcess } from "./attached-stop.ts";
 import { loadConfig, type RoleName } from "../../src/config.ts";
 import {
 	currentTrustedInstallation,
@@ -23,9 +20,10 @@ import {
 } from "../../src/sandbox/trusted-exec.ts";
 import type { TrustedInstallationDescriptor } from "../../src/sandbox/types.ts";
 import {
-	activeJobs,
+	JobStateRefusal,
 	jobLaunchIdentity,
-	jobPid,
+	readJobLock,
+	readJobStatus,
 	jobsList,
 	pidAlive,
 	readJobRecord,
@@ -326,35 +324,31 @@ export async function conflictFor(projectRoot: string, body: ActionBody): Promis
  */
 export async function lockProbe(projectRoot: string): Promise<ActionBlock | undefined> {
 	for (let attempt = 0; ; attempt++) {
-		const holder = await readLockHolder(projectRoot);
-		if (!holder) return undefined;
+		let holder: number | undefined;
+		try {
+			holder = await readJobLock(projectRoot);
+		} catch (err) {
+			if (!(err instanceof JobStateRefusal)) throw err;
+			// The lock's PID can be momentarily unwritten during acquisition.
+			if (attempt >= 3 || !err.message.includes("unfinished or malformed")) throw err;
+			await new Promise((r) => setTimeout(r, 150));
+			continue;
+		}
+		const payload = await readJobStatus(projectRoot);
+		if (holder === undefined || !await pidAlive(holder)) return undefined;
 		if (attempt >= 3) {
-			const payload = await readJson<StatusPayloads>(join(projectRoot, ".orch", "status.json")).catch(() => undefined);
+			const phase = payload?.lockedByPid === holder ? payload.phase : undefined;
 			return {
 				status: 409,
 				error: `.orch/lock is held by pid ${holder}` +
-					(payload?.phase ? ` (${payload.phase})` : "") +
+					(phase ? ` (${phase})` : "") +
 					" — wait for the live run to exit, or stop it if it is a UI job",
 				holderPid: holder,
-				phase: payload?.phase,
+				phase,
 			};
 		}
 		await new Promise((r) => setTimeout(r, 150));
 	}
-}
-
-async function readLockHolder(projectRoot: string): Promise<number | undefined> {
-	const lockPath = join(projectRoot, ".orch", "lock");
-	if (!existsSync(lockPath)) return undefined;
-	let pidLine: string | undefined;
-	try {
-		pidLine = readFileSync(lockPath, "utf8").split("\n")[0];
-	} catch {
-		return undefined;
-	}
-	const pid = Number.parseInt(pidLine ?? "", 10);
-	if (!Number.isInteger(pid) || !pidAlive(pid)) return undefined; // dead holder: the next CLI open recovers
-	return pid;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,72 +455,40 @@ export function startAction(
 			const message = err instanceof TrustedInstallationError
 				? `the trusted CLI entry is refused (${err.code}): ${err.message}`
 				: (err as Error).message;
-			return { ok: false as const, fail: { status: 500, error: message } };
+			return { ok: false as const, fail: { status: err instanceof JobStateRefusal ? 409 : 500, error: message } };
 		}
 	});
 }
 
-/**
- * Wait (bounded) for the record's CLI pid — a stop that lands within the
- * run-up window (record written, runner still spawning the CLI) acts instead
- * of answering 409. Returns the CLI pid or undefined when nothing appears.
- */
-async function waitForProcTarget(projectRoot: string, record: JobRecord): Promise<number | undefined> {
-	if (record.pid !== undefined || !pidAlive(jobPid(record))) return record.pid;
-	const deadline = Date.now() + 3_000;
-	for (;;) {
-		await new Promise((r) => setTimeout(r, 40));
-		const fresh = await readJobRecord(projectRoot, record.id);
-		if (fresh?.pid !== undefined || !pidAlive(jobPid(fresh ?? record))) return fresh?.pid;
-		if (Date.now() > deadline) return fresh?.pid ?? undefined;
-	}
-}
-
-/**
- * Stop (target "job", the default): SIGINT to the newest running non-handoff
- * job's CLI pid. A terminal-started run answers 409 with the terminal hint —
- * its stop lives behind the §7.2.1 verification (ui/server/attached-stop.ts,
- * target "attached"), never in this path.
- */
-export async function stopAction(projectRoot: string): Promise<{ ok: true; jobId: string; pid: number } | { ok: false; fail: StartError }> {
-	const running = (await activeJobs(projectRoot, (kind) => kind === "handoff")).sort((a, b) => b.startedAt - a.startedAt);
-	const target = running[0];
-	if (!target) {
-		// Attached-run hint: the same holder probe drives the plain message.
-		const busy = await lockProbe(projectRoot);
-		if (busy) {
-			return {
-				ok: false,
-				fail: {
-					status: 409,
-					error: `this run holds .orch/lock (pid ${busy.holderPid}) but was not launched by the UI — stop it from its terminal, or use the attached run's verified stop (target: "attached"; its identity must pass §7.2.1 first)`,
-					holderPid: busy.holderPid,
-					phase: busy.phase,
-				},
-			};
-		}
-		return { ok: false, fail: { status: 409, error: "nothing is running — there is no UI job and no live lock holder" } };
-	}
-	// `pid` is the CLI child (never signalled blindly while the runner's pid is
-	// recorded too); undefined means the CLI never spawned — nothing to stop.
-	// `pid` is always the CLI child; the runner writes it right after spawn, so a
-	// stop that lands within this tiny window waits for it instead of 409-ing.
-	const pid = await waitForProcTarget(projectRoot, target);
-	if (!pidAlive(pid)) {
-		return {
-			ok: false,
-			fail: {
-				status: 409,
-				error: `job ${target.id} claims running but the CLI process (pid ${pid ?? "?"}) is not up or is already gone — the record finalizes shortly`,
-				jobId: target.id,
-			},
-		};
-	}
+/** Stop the verified child of the newest running non-handoff UI job. */
+export async function stopAction(projectRoot: string, installation?: TrustedInstallationDescriptor): Promise<{ ok: true; jobId: string; pid: number } | { ok: false; fail: StartError }> {
 	try {
-		process.kill(pid!, "SIGINT");
+		const target = (await jobsList(projectRoot)).find((job) => job.status === "running" && job.kind !== "handoff");
+		if (!target) {
+			const busy = await lockProbe(projectRoot);
+			const error = busy
+				? `this run holds .orch/lock (pid ${busy.holderPid}) — stop it from its terminal, or use verified attached Stop`
+				: "nothing is running — there is no UI job and no live lock holder";
+			return { ok: false, fail: { ...busy, status: 409, error } };
+		}
+		let record: JobRecord | undefined = target;
+		const deadline = Math.min(Date.now() + 3_000, target.startedAt + 3_000);
+		while (record?.status === "running" && record.pid === undefined && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			record = await readJobRecord(projectRoot, target.id);
+		}
+		if (record?.pid !== undefined) {
+			const start = await verifyJobProcess(projectRoot, record, installation);
+			await readJobLock(projectRoot);
+			await readJobStatus(projectRoot);
+			const fresh = await readJobRecord(projectRoot, target.id);
+			if (start !== undefined && fresh?.pid === record.pid && await verifyJobProcess(projectRoot, fresh, installation) === start) {
+				process.kill(record.pid, "SIGINT");
+				return { ok: true, jobId: target.id, pid: record.pid };
+			}
+		}
+		return { ok: false, fail: { status: 409, jobId: target.id, error: `job ${target.id} has no verified live CLI child — nothing was signalled` } };
 	} catch (err) {
-		const code = (err as NodeJS.ErrnoException).code;
-		return { ok: false, fail: { status: 500, error: `cannot signal pid ${pid} of job ${target.id}: ${code ?? (err as Error).message}`, jobId: target.id } };
+		return { ok: false, fail: { status: 409, error: (err as Error).message } };
 	}
-	return { ok: true, jobId: target.id, pid: pid! };
 }

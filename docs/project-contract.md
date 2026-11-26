@@ -420,8 +420,8 @@ PRD is disclosed, when a committed `evals/**` file or `PROMPT.md` was edited or
 deleted without a commit: the operator must commit the reviewed control bytes
 and replan. A new UNTRACKED control file is captured in the identity but cannot
 execute from the base tree; it is reviewed-but-not-executable until committed
-and replanned. This is the chosen smallest fix: one base-tree/execution reader,
-no second persisted recipe bundle.
+and replanned. This is the same base-tree reader used by execution. Trusted Git disables replacement
+refs for planning, admission, projection and recipe loading.
 
 The UI source payload reports a refusal as `refused:{code,message}` with no
 text (never as plain absence). The M0 delivery-only host-profile view
@@ -480,10 +480,10 @@ the descriptor and starts the UI from that prefix — there is no
 entry refuses instead of trying another. The UI entry (`ui/server/cli.ts`)
 builds the descriptor once and passes it to the server; a job action records
 `{node, entry, (loader), form, argvPrefix, installationRoot, source,
-descriptorSha256}` in the private job record and the detached runner
-revalidates that record against the identity BEFORE spawning anything (a
-tampered, foreign or identity-less record fails the record and spawns
-nothing; there is no re-resolution after the record). A job inherits the UI
+descriptorSha256}` in the private job record. The server passes the project,
+job ID and full launch binding independently to the detached runner. The
+runner validates the binding and selected files before opening the job log
+or spawning. A job inherits the UI
 server's environment minus executable selectors (`KIT_UI_CLI_BIN`, other
 undocumented `KIT_*`, `NODE_OPTIONS`, `LD_*`/`DYLD_*`, `BASH_ENV`/`ENV`), so
 `KIT_FAUX`/`KIT_FAUX_SCRIPT` demo mode and provider credentials still reach
@@ -648,8 +648,10 @@ platform-equivalent) with an approved canonical HTTPS GitHub `deliveryOrigin`
 for the exact canonical project root. The operation reads that allowlisted
 field only. It never uses the repository's `origin`, a push URL, a task value,
 or a caller-selected destination. There is no default remote. Do not put a
-GitHub token in project config; credentials remain in the trusted host Git/gh
-credential path and never enter a worker.
+GitHub token in project config. Git transport uses a private bare directory
+with clean config and the exact approved URL. Push uses the source object
+store without importing its config. The HTTPS credential path uses the
+validated, literally quoted gh executable. Credentials stay in host delivery.
 
 Before any public branch is created, the pinned candidate and its integration
 parent are checked for tracked private `.orch` runtime state and §2 secret

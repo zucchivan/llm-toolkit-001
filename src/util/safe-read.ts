@@ -200,6 +200,8 @@ export interface SafeListEntriesOptions {
 
 /** An opened, pinned directory. Close it when finished. */
 export interface SafeDirectory {
+	/** Linux descriptor path, valid only while this handle stays open. */
+	readonly descriptorPath: string;
 	/** Root-relative display path (empty for the root). */
 	readonly path: string;
 	/** fstat metadata at open time (pinned inode; never a later path stat). */
@@ -638,6 +640,11 @@ class PinnedDirectory implements SafeDirectory {
 		this.#base = base;
 		this.size = size;
 		this.mtimeMs = mtimeMs;
+	}
+
+	get descriptorPath(): string {
+		if (this.#closed) throw new Error("directory handle is closed");
+		return `${this.#base}/${this.#handle.fd}`;
 	}
 
 	#childPath(name: string): string {
