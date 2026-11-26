@@ -37,6 +37,14 @@ export interface GateFile {
 	recipes: Recipe[];
 }
 
+/**
+ * TEST-ONLY (M1-P01 step g): the synchronous recipe loader. Production has no
+ * caller — `src/adoption/gaps.ts` and `src/adoption/probe.ts` read through
+ * `loadRecipesSafe`/`loadRecipeFileSafe`, and the driver's wave gates read the
+ * immutable reviewed bundle (`recipeBundleFromTree`/`recipesFromBundle`).
+ * Kept so the existing recipe-parity/adoption tests can compare the pure parse
+ * decision against the safe path; do not add a production caller.
+ */
 export function loadRecipes(paths: ProjectPaths): GateFile {
 	// Generated recipes are defaults. Reading human recipes second makes a
 	// same-named human entry the effective one without editing either file.
@@ -78,6 +86,7 @@ export async function loadRecipeFileSafe(root: string, file: string, budget?: Sa
 	}
 }
 
+/** TEST-ONLY sibling of `loadRecipeFileSafe` (see `loadRecipes`); no production caller. */
 export function loadRecipeFile(root: string, file: string): Recipe[] {
 	try {
 		return parseRecipeText(readFileSync(join(root, "evals", file), "utf8"), file);

@@ -7,7 +7,7 @@
  * docs/engineering-plan/evidence/M1-P01.md can point at it.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import {
 	appendFile,
@@ -19,6 +19,7 @@ import {
 	realpath,
 	rename,
 	rm,
+	stat,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
@@ -28,15 +29,20 @@ import { promisify } from "node:util";
 import {
 	SAFE_READ_LIMITS,
 	SafeReadBudget,
+	SafeReadRefusalError,
 	listSafeDirectory,
 	openSafeDirectory,
 	openSafeFile,
 	readSafeFile,
 	readSafeText,
+	requireSafeReadRoot,
+	resolveSafeReadRoot,
 	safeReadPrimitiveStatus,
 	walkSafeFiles,
 } from "../src/util/safe-read.ts";
 import type { SafeReadResult } from "../src/util/safe-read.ts";
+import { CONFIG_MAX_BYTES, ConfigError, KIT_VERSION, loadConfig, parseConfig, readConfig } from "../src/config.ts";
+import { openProjectHarness } from "../src/engine/harness.ts";
 import {
 	HostProfileError,
 	defaultHostProfilePath,
@@ -756,6 +762,195 @@ describe.skipIf(process.platform !== "linux")("capped no-follow host reads", () 
 		await writeAt(root, "prd.md", "prd");
 		const result = await readSafeFile({ root, path: "prd.md", procFdBase: "/nonexistent-kit/proc/self/fd" });
 		expect(refusal(result).code).toBe("unsupported-platform");
+	});
+});
+
+describe("bounded tail reads (M1-P01 step g: wave-log tail policy)", () => {
+	it("returns the whole file when it fits and only whole tail lines when cut", async () => {
+		const root = await tempRoot("kit-safe-tail-");
+		await writeAt(root, "small.log", "one\ntwo\n");
+		const small = okValue(await openSafeFile({ root, path: "small.log" }));
+		try {
+			expect(okValue(await small.readTailText({ maxBytes: 4_096 }))).toEqual({ text: "one\ntwo\n", bytes: 8, truncated: false });
+		} finally {
+			await small.close();
+		}
+
+		const lines: string[] = [];
+		for (let i = 0; i < 400; i++) lines.push(`{"n":${i}}`);
+		await writeAt(root, "big.log", `${lines.join("\n")}\n`);
+		const big = okValue(await openSafeFile({ root, path: "big.log" }));
+		try {
+			const tail = okValue(await big.readTailText({ maxBytes: 1_000 }));
+			expect(tail.truncated).toBe(true);
+			expect(tail.bytes).toBe(1_000);
+			// the cut drops its partial first line: the result starts on a line boundary
+			expect(tail.text.startsWith('{"n":')).toBe(true);
+			expect(tail.text.endsWith('{"n":399}\n')).toBe(true);
+			const rows = tail.text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as { n: number });
+			expect(rows.length).toBeLessThan(lines.length);
+			expect(rows.length).toBeGreaterThan(0);
+			expect(rows.at(-1)!.n).toBe(399);
+		} finally {
+			await big.close();
+		}
+	});
+
+	it("refuses a symlinked/ancestor-escaping log and never reads the link target", async () => {
+		const outside = await tempRoot("kit-safe-tail-outside-");
+		await writeFile(join(outside, "secret.log"), "HOST-SECRET-BYTES\n");
+		const root = await tempRoot("kit-safe-tail-");
+		await symlink(join(outside, "secret.log"), join(root, "linked.log"));
+		const linked = await openSafeFile({ root, path: "linked.log" });
+		expect(refusal(linked).code).toBe("symlink");
+		expect(JSON.stringify(linked)).not.toContain("HOST-SECRET-BYTES");
+	});
+});
+
+describe("project config read boundary (M1-P01 step g)", () => {
+	const goodConfig = `configVersion = 2
+[roles.planner]
+provider = "faux"
+modelId = "kit-planner"
+[roles.implementer]
+provider = "faux"
+modelId = "kit-implementer"
+[roles.verifier]
+provider = "faux"
+modelId = "kit-verifier"
+`;
+
+	it("reads a project config asynchronously through the canonical root", async () => {
+		const root = await tempRoot("kit-config-");
+		await writeAt(root, ".orch/config.toml", goodConfig);
+		const read = await readConfig(root);
+		expect(read.kind).toBe("ok");
+		if (read.kind !== "ok") throw new Error("expected ok");
+		expect(read.config.roles.verifier.modelId).toBe("kit-verifier");
+		expect(read.config.root).toBe(await realpath(root));
+		const loaded = await loadConfig(root);
+		expect(loaded).toEqual(parseConfig(goodConfig, loaded.root));
+		expect(KIT_VERSION).toMatch(/^\d+\.\d+\.\d+/);
+	});
+
+	it("an absent config stays ABSENT: no defaults, and loadConfig says so", async () => {
+		const root = await tempRoot("kit-config-");
+		const read = await readConfig(root);
+		expect(read).toMatchObject({ kind: "absent" });
+		expect(JSON.stringify(read)).not.toContain("anthropic");
+		await expect(loadConfig(root)).rejects.toMatchObject({ name: "ConfigError", reason: "absent", code: "absent" });
+		await expect(loadConfig(root)).rejects.toThrow(/no config at .*run "llm-toolkit-001 init \./);
+	});
+
+	it("a malformed config is a config ERROR, not absence and not a refusal", async () => {
+		const root = await tempRoot("kit-config-");
+		await writeAt(root, ".orch/config.toml", "configVersion = = 2\n");
+		const error = await loadConfig(root).catch((err: unknown) => err);
+		expect(error).toBeInstanceOf(ConfigError);
+		expect(error).toMatchObject({ reason: "malformed" });
+		expect((error as Error).message).toMatch(/not valid TOML/);
+		// A parseable file with an invalid recognized value is still a config error.
+		await writeAt(root, ".orch/config.toml", goodConfig.replace("configVersion = 2", 'configVersion = 2\ndelivery = { mode = "ship" }'));
+		await expect(loadConfig(root)).rejects.toMatchObject({ reason: "malformed" });
+		await expect(loadConfig(root)).rejects.toThrow(/delivery\.mode/);
+	});
+
+	it("refuses a symlinked leaf/ancestor, a dangling link, a directory, a FIFO, a hard link and the cap", async () => {
+		const outside = await tempRoot("kit-config-outside-");
+		await writeAt(outside, "config.toml", goodConfig.replace("kit-verifier", "OUTSIDE-SECRET-MODEL"));
+
+		// leaf symlink
+		const leafRoot = await tempRoot("kit-config-");
+		await mkdir(join(leafRoot, ".orch"), { recursive: true });
+		await symlink(join(outside, "config.toml"), join(leafRoot, ".orch", "config.toml"));
+		const leaf = await readConfig(leafRoot);
+		expect(leaf).toMatchObject({ kind: "refused", code: "symlink" });
+		expect(JSON.stringify(leaf)).not.toContain("OUTSIDE-SECRET-MODEL");
+		await expect(loadConfig(leafRoot)).rejects.toMatchObject({ reason: "refused", code: "symlink" });
+
+		// ancestor symlink (.orch is the link)
+		const ancestorRoot = await tempRoot("kit-config-");
+		await symlink(outside, join(ancestorRoot, ".orch"));
+		const ancestor = await readConfig(ancestorRoot);
+		expect(ancestor).toMatchObject({ kind: "refused", code: "symlink" });
+		expect(JSON.stringify(ancestor)).not.toContain("OUTSIDE-SECRET-MODEL");
+
+		// dangling link
+		const danglingRoot = await tempRoot("kit-config-");
+		await mkdir(join(danglingRoot, ".orch"), { recursive: true });
+		await symlink(join(danglingRoot, ".orch", "missing.toml"), join(danglingRoot, ".orch", "config.toml"));
+		expect(await readConfig(danglingRoot)).toMatchObject({ kind: "refused", code: "symlink" });
+
+		// directory where the config belongs
+		const dirRoot = await tempRoot("kit-config-");
+		await mkdir(join(dirRoot, ".orch", "config.toml"), { recursive: true });
+		expect(await readConfig(dirRoot)).toMatchObject({ kind: "refused", code: "not-regular" });
+
+		// FIFO where the config belongs (the open must not block)
+		const fifoRoot = await tempRoot("kit-config-");
+		await mkdir(join(fifoRoot, ".orch"), { recursive: true });
+		const fifoMade = await new Promise<boolean>((resolvePromise) => {
+			const child = spawn("mkfifo", [join(fifoRoot, ".orch", "config.toml")], { stdio: "ignore" });
+			child.on("error", () => resolvePromise(false));
+			child.on("close", (code) => resolvePromise(code === 0));
+		});
+		if (fifoMade) {
+			expect(await readConfig(fifoRoot)).toMatchObject({ kind: "refused", code: "not-regular" });
+		}
+
+		// hard-linked config (an alias to a same-owner host file)
+		const linkRoot = await tempRoot("kit-config-");
+		await mkdir(join(linkRoot, ".orch"), { recursive: true });
+		await link(join(outside, "config.toml"), join(linkRoot, ".orch", "config.toml"));
+		const hard = await readConfig(linkRoot);
+		expect(hard).toMatchObject({ kind: "refused", code: "hardlink" });
+		expect(JSON.stringify(hard)).not.toContain("OUTSIDE-SECRET-MODEL");
+
+		// per-file cap
+		const capRoot = await tempRoot("kit-config-");
+		await mkdir(join(capRoot, ".orch"), { recursive: true });
+		const handle = await openFileHandle(join(capRoot, ".orch", "config.toml"), "w");
+		await handle.truncate(CONFIG_MAX_BYTES + 1);
+		await handle.close();
+		expect(await readConfig(capRoot)).toMatchObject({ kind: "refused", code: "too-large" });
+	});
+
+	it("refuses an unreadable config instead of reporting it absent (non-root hosts)", async () => {
+		if (typeof process.getuid !== "function" || process.getuid() === 0) return;
+		const root = await tempRoot("kit-config-");
+		const file = await writeAt(root, ".orch/config.toml", goodConfig);
+		await chmod(file, 0o000);
+		expect(await readConfig(root)).toMatchObject({ kind: "refused", code: "unreadable" });
+	});
+
+	it("an unusable operator root is a typed refusal, never an absent config", async () => {
+		const root = await tempRoot("kit-config-");
+		const missing = await readConfig(join(root, "not-there"));
+		expect(missing).toMatchObject({ kind: "refused", code: "unsafe-root" });
+		await expect(loadConfig("relative/root")).rejects.toMatchObject({ reason: "refused", code: "unsafe-root" });
+	});
+
+	it("the harness open path awaits the config read and takes NO lock when absent or refused", async () => {
+		const absentRoot = await tempRoot("kit-config-");
+		await mkdir(join(absentRoot, ".orch"), { recursive: true });
+		await expect(openProjectHarness(absentRoot, "test")).rejects.toMatchObject({ name: "ConfigError", reason: "absent" });
+		await expect(stat(join(absentRoot, ".orch", "lock"))).rejects.toMatchObject({ code: "ENOENT" });
+
+		const outside = await tempRoot("kit-config-outside-");
+		await writeAt(outside, "config.toml", goodConfig);
+		const refusedRoot = await tempRoot("kit-config-");
+		await mkdir(join(refusedRoot, ".orch"), { recursive: true });
+		await symlink(join(outside, "config.toml"), join(refusedRoot, ".orch", "config.toml"));
+		await expect(openProjectHarness(refusedRoot, "test")).rejects.toMatchObject({ name: "ConfigError", reason: "refused", code: "symlink" });
+		await expect(stat(join(refusedRoot, ".orch", "lock"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(stat(join(refusedRoot, ".orch", "durable.sqlite"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("SafeReadRefusalError/requireSafeReadRoot keep the refusal typed for throwing callers", async () => {
+		const root = await tempRoot("kit-config-");
+		const resolved = await resolveSafeReadRoot(root);
+		expect(resolved).toEqual({ kind: "ok", root: await realpath(root) });
+		await expect(requireSafeReadRoot("relative/root")).rejects.toBeInstanceOf(SafeReadRefusalError);
 	});
 });
 

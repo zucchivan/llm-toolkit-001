@@ -22,9 +22,16 @@
  * A.5 adds `conversationEntries()`: the same gated table-scan pattern serves
  * bounded, plain-JSON transcript excerpts to the UI. The seam version stays
  * `readout.seam = 1` — A.5 is additive surface, not a new seam version.
+ *
+ * M1-P01 step (g): every host file read here (the status side-car, the
+ * `.orch/artifacts` listing and its text/stats, the PRD, `router.md` and
+ * `.orch/wave-log.jsonl`) goes through the canonical-root + no-follow, capped
+ * boundary in one resolved root per readout. A genuine ENOENT stays the defined
+ * empty/absent state; a REFUSED read (symlink at any component, hard link,
+ * non-regular leaf, permission, platform, cap, escape) throws
+ * `SafeReadRefusalError` — no partial readout, no outside bytes and no
+ * fabricated empty section. The config is awaited (no sync production read).
  */
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
 import { readSessionState } from "./state.ts";
 import { latestFrozenCheckpoint, latestReceiptStates, ReceiptsDoc } from "./receipts.ts";
 import type { FrozenCheckpointView, ReceiptEvent, ReceiptStateView } from "./receipts.ts";
@@ -52,7 +59,8 @@ import { usageUsd } from "../util/budget.ts";
 import { KIT_VERSION, loadConfig } from "../config.ts";
 import type { KitConfig } from "../config.ts";
 import { shasum } from "../util/git.ts";
-import { readJson } from "../util/fsx.ts";
+import { openSafeDirectory, readSafeText, requireSafeReadRoot, SafeReadRefusalError } from "../util/safe-read.ts";
+import type { SafeDirectory } from "../util/safe-read.ts";
 
 // ---------------------------------------------------------------------------
 // Readout shape: one type every view renders from
@@ -387,10 +395,27 @@ export const CONV_ENTRY_TEXT_CAP = 4_096;
 // Entry point
 // ---------------------------------------------------------------------------
 
-/** `paths` is the host control root; task source and task diffs are never read from it here. */
+/**
+ * `paths` is the host control root; task source and task diffs are never read
+ * from it here. M1-P01 step (g): the root is canonicalized ONCE per readout and
+ * handed to every file read below (never a path re-resolution per read).
+ */
 export async function readout(paths: ProjectPaths, opts: ReadoutOptions = {}): Promise<KitReadout> {
-	if (opts.loop) return storageReadout(paths, opts.loop);
-	return sidecarReadout(paths, opts.sidecarReason);
+	const root = await requireSafeReadRoot(paths.root);
+	if (opts.loop) return storageReadout(paths, root, opts.loop);
+	return sidecarReadout(paths, root, opts.sidecarReason);
+}
+
+/** One tolerant side-car payload read through the boundary; absent/corrupt = undefined, refused throws. */
+async function readSidecarJson<T>(root: string, path: string): Promise<T | undefined> {
+	const read = await readSafeText({ root, path });
+	if (read.kind === "absent") return undefined;
+	if (read.kind === "refused") throw new SafeReadRefusalError(read);
+	try {
+		return JSON.parse(read.value) as T;
+	} catch {
+		return undefined; // corrupt side-car reads as absent; the engine re-writes it
+	}
 }
 
 /** The Harness/Session instance openProjectHarness hands out (a pi-durable Session). */
@@ -400,7 +425,7 @@ type HarnessType = LoopAndLock["loop"]["harness"];
 // Storage mode
 // ---------------------------------------------------------------------------
 
-async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<KitReadout> {
+async function storageReadout(paths: ProjectPaths, root: string, loop: LoopAndLock): Promise<KitReadout> {
 	const at = Date.now();
 	const harness = loop.loop.harness;
 	const config = loop.loop.config;
@@ -410,14 +435,14 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 	const [state, sessionUsage, payload, receiptDoc] = await Promise.all([
 		readSessionState(harness),
 		loop.loop.sessionUsage(),
-		readJson<StatusPayloads>(paths.status),
+		readSidecarJson<StatusPayloads>(root, ".orch/status.json"),
 		harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT),
 	]);
 
 	const rates = buildRateMap(config);
 	const conversations = await collectConversations(harness, state.router.tasks, rates);
 	const timeline = buildTimeline(state.rows);
-	const artifacts = await listArtifacts(paths);
+	const artifacts = await listArtifacts(root);
 
 	const byModel: KitUsage["byModel"] = {};
 	let sessionUsd = 0;
@@ -479,8 +504,8 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
 		health: [],
 		storage: { router: state.router, runStatus: state.runStatus, conversations, reports: loop.loop.reports.slice(-20) },
 	};
-	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts, revision);
-	readout.health = await healthChecks(paths, {
+	readout.tasks = await attachDiffRefs(readout.tasks, root, artifacts, revision);
+	readout.health = await healthChecks(root, {
 		degraded: false,
 		state,
 		payload,
@@ -502,20 +527,19 @@ async function storageReadout(paths: ProjectPaths, loop: LoopAndLock): Promise<K
  * lock — unless the config itself is unreadable, in which case mode is
  * omitted and the reader says so rather than guessing.
  */
-function sidecarDeliveryMode(root: string): string | undefined {
-	try {
-		return loadConfig(root).delivery.mode;
-	} catch {
-		return undefined;
-	}
+function sidecarDeliveryMode(root: string): Promise<string | undefined> {
+	return loadConfig(root).then(
+		(config) => config.delivery.mode,
+		() => undefined,
+	);
 }
 
-async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<KitReadout> {
+async function sidecarReadout(paths: ProjectPaths, root: string, reason?: string): Promise<KitReadout> {
 	const at = Date.now();
-	const payload = await readJson<StatusPayloads>(paths.status);
-	const rows = await readWaveLogRows(paths.waveLog);
+	const payload = await readSidecarJson<StatusPayloads>(root, ".orch/status.json");
+	const rows = await readWaveLogRows(root);
 	const timeline = buildTimeline(rows);
-	const artifacts = await listArtifacts(paths);
+	const artifacts = await listArtifacts(root);
 
 	// Spend estimate in degraded mode: status.json budget is authoritative for
 	// the session number; per-row cost fields (planner/… rows carry them) give
@@ -586,12 +610,12 @@ async function sidecarReadout(paths: ProjectPaths, reason?: string): Promise<Kit
 			source: "sidecars",
 		},
 		timeline,
-		delivery: deliveryView(sidecarDeliveryMode(paths.root), rows),
+		delivery: deliveryView(await sidecarDeliveryMode(root), rows),
 		artifacts,
 		health: [],
 	};
-	readout.tasks = await attachDiffRefs(readout.tasks, paths, artifacts, payload?.planRevision);
-	readout.health = await healthChecks(paths, { degraded: true, payload, artifacts, rows, config: undefined, harness: undefined });
+	readout.tasks = await attachDiffRefs(readout.tasks, root, artifacts, payload?.planRevision);
+	readout.health = await healthChecks(root, { degraded: true, payload, artifacts, rows, config: undefined, harness: undefined });
 	return readout;
 }
 
@@ -883,8 +907,10 @@ function taskViews(tasks: RouterTask[], extra: (t: RouterTask) => Pick<KitTaskVi
 /**
  * Revision-qualified per-wave candidate patches are display only. A terminal
  * task points at its newest candidate artifact for the current plan revision.
+ * The stats side-car is read through the same boundary (absent/corrupt = no
+ * truncation flag; a refusal throws rather than reading a link target).
  */
-async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifacts: readonly ArtifactFile[], revision?: string): Promise<KitTaskView[]> {
+async function attachDiffRefs(tasks: KitTaskView[], root: string, artifacts: readonly ArtifactFile[], revision?: string): Promise<KitTaskView[]> {
 	const byName = new Map(artifacts.map((a) => [a.name, a]));
 	return Promise.all(
 		tasks.map(async (task) => {
@@ -904,7 +930,7 @@ async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifac
 			const statsName = patchName.replace(/\.patch$/, ".json");
 			let truncated = false;
 			if (byName.has(statsName)) {
-				const stats = await readJson<{ truncated?: boolean }>(join(paths.artifacts, statsName)).catch(() => undefined);
+				const stats = await readSidecarJson<{ truncated?: boolean }>(root, `.orch/artifacts/${statsName}`);
 				if (typeof stats?.truncated === "boolean") truncated = stats.truncated;
 			}
 			return {
@@ -921,20 +947,47 @@ async function attachDiffRefs(tasks: KitTaskView[], paths: ProjectPaths, artifac
 	);
 }
 
-async function listArtifacts(paths: ProjectPaths): Promise<ArtifactFile[]> {
+/**
+ * `.orch/artifacts` listing through the pinned no-follow directory handle:
+ * absence is the defined "no artifacts yet" state; a symlink/special entry or
+ * a refused directory throws instead of listing a link target's metadata.
+ * Nested directories are not artifacts and are skipped, never walked.
+ */
+async function listArtifacts(root: string): Promise<ArtifactFile[]> {
+	const opened = await openSafeDirectory({ root, path: ".orch/artifacts" });
+	if (opened.kind === "absent") return [];
+	if (opened.kind === "refused") throw new SafeReadRefusalError(opened);
+	const directory: SafeDirectory = opened.value;
 	try {
-		const names = await readdir(paths.artifacts);
-		const files = await Promise.all(
-			names.map(async (name) => {
-				const st = await stat(join(paths.artifacts, name)).catch(() => undefined);
-				if (!st || !st.isFile()) return undefined;
-				const kind: ArtifactFile["kind"] = name.startsWith("gate-") ? "gate" : name.startsWith("quarantined-") ? "quarantine" : name.startsWith("task-") || name.startsWith("candidate-") ? "diff" : "other";
-				return { name, bytes: st.size, mtimeMs: st.mtimeMs, kind } satisfies ArtifactFile;
-			}),
-		);
-		return files.filter((f): f is ArtifactFile => f !== undefined).sort((a, b) => b.mtimeMs - a.mtimeMs);
-	} catch {
-		return [];
+		const listed = await directory.list();
+		if (listed.kind === "absent") return [];
+		if (listed.kind === "refused") throw new SafeReadRefusalError(listed);
+		const files: ArtifactFile[] = [];
+		for (const entry of listed.value) {
+			if (entry.kind === "directory") continue;
+			if (entry.kind !== "file") {
+				throw new SafeReadRefusalError({
+					code: entry.kind === "symlink" ? "symlink" : "not-regular",
+					path: `.orch/artifacts/${entry.name}`,
+					message:
+						entry.kind === "symlink"
+							? `.orch/artifacts/${entry.name} is a symbolic link; host reads never follow links`
+							: `.orch/artifacts/${entry.name} is not a regular file`,
+				});
+			}
+			const file = await directory.openFile(entry.name);
+			if (file.kind === "absent") continue; // vanished between list and open
+			if (file.kind === "refused") throw new SafeReadRefusalError(file);
+			try {
+				const kind: ArtifactFile["kind"] = entry.name.startsWith("gate-") ? "gate" : entry.name.startsWith("quarantined-") ? "quarantine" : entry.name.startsWith("task-") || entry.name.startsWith("candidate-") ? "diff" : "other";
+				files.push({ name: entry.name, bytes: file.value.size, mtimeMs: file.value.mtimeMs, kind });
+			} finally {
+				await file.value.close();
+			}
+		}
+		return files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	} finally {
+		await directory.close();
 	}
 }
 
@@ -942,23 +995,22 @@ async function listArtifacts(paths: ProjectPaths): Promise<ArtifactFile[]> {
 // Side-car row reader (tolerant JSONL)
 // ---------------------------------------------------------------------------
 
-async function readWaveLogRows(file: string): Promise<WaveRow[]> {
-	try {
-		const text = await readFile(file, "utf8");
-		return text
-			.split("\n")
-			.filter((line) => line.trim())
-			.map((line) => {
-				try {
-					return JSON.parse(line) as WaveRow;
-				} catch {
-					return undefined;
-				}
-			})
-			.filter((row): row is WaveRow => row !== undefined);
-	} catch {
-		return [];
-	}
+/** Tolerant JSONL rows from `.orch/wave-log.jsonl`; absent = no rows, refused throws. */
+async function readWaveLogRows(root: string): Promise<WaveRow[]> {
+	const read = await readSafeText({ root, path: ".orch/wave-log.jsonl" });
+	if (read.kind === "absent") return [];
+	if (read.kind === "refused") throw new SafeReadRefusalError(read);
+	return read.value
+		.split("\n")
+		.filter((line) => line.trim())
+		.map((line) => {
+			try {
+				return JSON.parse(line) as WaveRow;
+			} catch {
+				return undefined;
+			}
+		})
+		.filter((row): row is WaveRow => row !== undefined);
 }
 
 function zeroUsage(): Usage {
@@ -980,7 +1032,7 @@ interface HealthInput {
 }
 
 /** Every check reports; storage-bound ones degrade to a skip line, never crash. */
-async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<HealthCheck[]> {
+async function healthChecks(root: string, input: HealthInput): Promise<HealthCheck[]> {
 	const checks: HealthCheck[] = [];
 	const { degraded, payload, state } = input;
 
@@ -998,16 +1050,20 @@ async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<He
 	}
 
 	// prd — exists? (and when durable state is readable: drifted after plan?)
+	// Read through the canonical-root boundary; a refused PRD (symlink/escape/
+	// cap) is an explicit failure, never "missing" and never the link target.
 	const prdPath = input.config?.paths.prd;
 	if (prdPath) {
-		const text = await readFile(join(paths.root, prdPath), "utf8").catch(() => undefined);
-		if (text === undefined) {
+		const read = await readSafeText({ root, path: prdPath });
+		if (read.kind === "refused") {
+			checks.push({ id: "prd", ok: false, severity: "error", detail: `PRD at ${prdPath} is refused (${read.code}): ${read.message}` });
+		} else if (read.kind === "absent") {
 			checks.push({ id: "prd", ok: false, severity: "warn", detail: `PRD missing at ${prdPath}` });
 		} else if (state) {
 			if (state.runStatus.prdSha === undefined) {
 				checks.push({ id: "prd", ok: true, severity: "info", detail: `PRD at ${prdPath} (no sha recorded yet — run plan first)` });
 			} else {
-				const drifted = shasum(text) !== state.runStatus.prdSha;
+				const drifted = shasum(read.value) !== state.runStatus.prdSha;
 				checks.push(
 					drifted
 						? { id: "prd", ok: false, severity: "warn", detail: `PRD changed since planning (sha drift vs RunStatusDoc) — the router graph may be stale; re-plan or re-approve` }
@@ -1042,16 +1098,27 @@ async function healthChecks(paths: ProjectPaths, input: HealthInput): Promise<He
 		} else {
 			const expectedRouter = renderRouterMd(state.router.tasks, state.router.phase, state.runStatus.prdPath, state.router.identity, state.router.archived);
 			const expectedLog = renderWaveLogJsonl(state.rows);
-			const diskRouter = await readFile(paths.routerMd, "utf8").catch(() => undefined);
-			const diskLog = await readFile(paths.waveLog, "utf8").catch(() => undefined);
+			// Both mirrors are read through the same boundary: absent = the stated
+			// drift line; refused = an explicit error, never the link target's bytes.
+			const readMirror = async (relPath: string): Promise<string | { refused: string } | undefined> => {
+				const read = await readSafeText({ root, path: relPath });
+				if (read.kind === "ok") return read.value;
+				if (read.kind === "absent") return undefined;
+				return { refused: `refused (${read.code}): ${read.message}` };
+			};
+			const diskRouter = await readMirror("router.md");
+			const diskLog = await readMirror(".orch/wave-log.jsonl");
 			const drifts: string[] = [];
 			if (diskRouter === undefined) drifts.push("router.md absent");
+			else if (typeof diskRouter !== "string") drifts.push(`router.md ${diskRouter.refused}`);
 			else if (diskRouter !== expectedRouter) drifts.push("router.md bytes differ from the RouterDoc render");
 			if (diskLog === undefined) drifts.push(".orch/wave-log.jsonl absent");
+			else if (typeof diskLog !== "string") drifts.push(`.orch/wave-log.jsonl ${diskLog.refused}`);
 			else if (diskLog !== expectedLog) drifts.push(".orch/wave-log.jsonl bytes differ from the WaveLogDoc render");
+			const refusedMirror = typeof diskRouter !== "string" && diskRouter !== undefined || (typeof diskLog !== "string" && diskLog !== undefined);
 			checks.push(
 				drifts.length
-					? { id: "mirrors", ok: false, severity: "warn", detail: drifts.join("; ") }
+					? { id: "mirrors", ok: false, severity: refusedMirror ? "error" : "warn", detail: drifts.join("; ") }
 					: { id: "mirrors", ok: true, severity: "info", detail: "router.md and wave-log.jsonl match the durable docs byte-for-byte" },
 			);
 		}

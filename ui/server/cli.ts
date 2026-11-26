@@ -22,7 +22,7 @@
  */
 import { parseArgs } from "node:util";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bindPostureFor, newToken } from "./auth.ts";
@@ -30,6 +30,7 @@ import { bakeDemoProject } from "./demo.ts";
 import { startServer } from "./server.ts";
 import { openBrowser } from "./browser.ts";
 import { loadTrustedInstallation, TrustedInstallationError } from "../../src/sandbox/trusted-exec.ts";
+import { readConfig } from "../../src/config.ts";
 
 const here = dirname(fileURLToPath(import.meta.url)); // ui/server
 const uiRoot = dirname(here); // ui/
@@ -87,9 +88,17 @@ async function main(): Promise<void> {
 
 	const projectArg = values["project"];
 	const root = resolve(typeof projectArg === "string" && projectArg.trim() ? projectArg : process.cwd());
-	const configPath = join(root, ".orch", "config.toml");
-	if (!existsSync(configPath)) {
-		console.error(`no ${configPath} in this project — run "llm-toolkit-001 init ." in the project root first`);
+	// M1-P01 step (g): the config is checked through the canonical-root +
+	// no-follow read boundary, not a path stat. Absent keeps the CLI's plain
+	// words; a REFUSED config (symlink/escape/type/cap/permission) refuses here
+	// with its typed reason instead of starting a server over a linked file.
+	const config = await readConfig(root);
+	if (config.kind === "absent") {
+		console.error(`no ${config.path} in this project — run "llm-toolkit-001 init ." in the project root first`);
+		process.exit(1);
+	}
+	if (config.kind === "refused") {
+		console.error(`the project config is refused (${config.code}): ${config.message}`);
 		process.exit(1);
 	}
 

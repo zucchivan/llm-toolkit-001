@@ -76,7 +76,7 @@ export async function runGatesCommand(root: string, argv: string[], io: GatesCli
 				interactive: io.interactive, prompt: io.ask ? { ask: io.ask } : undefined,
 				confirmed: values.yes === true, output: { log: io.log },
 				// M0-P07: the probe shares the wave gates' configured deadline.
-				timeoutMs: configuredProbeTimeoutMs(root),
+				timeoutMs: await configuredProbeTimeoutMs(root),
 			});
 			return result.errors?.length || (result.consented && !result.allPassed) ? 1 : 0;
 		}
@@ -89,10 +89,13 @@ export async function runGatesCommand(root: string, argv: string[], io: GatesCli
 }
 
 /** Same configured timeout as wave gates: `[gates] timeoutSec` from the project
- * config; projects without a config (probe on a bare checkout) use the default. */
-function configuredProbeTimeoutMs(root: string): number {
+ * config; projects without a config (probe on a bare checkout) use the default.
+ * M1-P01 step (g): the config is awaited through the canonical-root + safe-read
+ * boundary; an absent OR refused config degrades to the documented default
+ * deadline (the probe itself refuses through its own recipe read). */
+async function configuredProbeTimeoutMs(root: string): Promise<number> {
 	try {
-		return loadConfig(root).gates.timeoutSec * 1000;
+		return (await loadConfig(root)).gates.timeoutSec * 1000;
 	} catch {
 		return DEFAULT_CONFIG.gates.timeoutSec * 1000;
 	}

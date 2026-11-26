@@ -514,8 +514,10 @@ JSON errors: `{ error: string, detail?: string }` with the listed status codes.
 | GET | `/api/tasks/:id/diff/live` | P15: the in-flight task's latest frozen checkpoint, tree-to-tree (`frozenAt` timestamp label; never the operator checkout); `409` if not in flight or before the first checkpoint (stated reason) |
 | GET | `/api/conversations/:id/entries` | A.5 bounded transcript excerpt (≤ 2,000 entries; storage-mode lock-per-read; `404` unknown id, `409` while a run owns the lock) |
 | GET | `/api/project/sources` | M5 read-only source viewers' data — M5-a: config + PRD; M5-b: PROMPT.md (fixed root path) + `evals/recipes.toml` (the engine gate loader's verdict; absence = defined empty-gates state). Raw text + verdicts; static files, no lock, ≤ 5 MiB text, `binary` labeled; there is NO mutation route for these files (§5). M1-P01: reads are canonical-root/root-relative and no-follow — a symlinked/escaping/oversized source returns `refused:{code,message}` with no `text` (not plain absence) |
-| GET | `/api/artifacts` | artifact list (same as readout) |
+| GET | `/api/artifacts` | artifact list (same as readout); M1-P01: fstat on the pinned no-follow directory handle — a symlinked/special entry is never listed and no link-target metadata is read |
 | GET | `/api/artifacts/:name` | artifact text; allowlisted names, size cap; M1-P01: the bytes come from the no-follow host boundary (a symlinked artifact is `404`, never the link target) |
+| GET | `/api/artifacts/:name?download=1` | the same artifact as an attachment, streamed from the ONE pinned safe-read handle: `404` absent, `409` with the typed refusal code (`symlink`/`hardlink`/`not-regular`/`too-large`/`unreadable`/`unsafe-root`) and NO bytes when the read is refused |
+| GET | `/api/tasks/:id/diff?download=1` | the stored task patch as an attachment from the same pinned handle (`404` when no artifact is listed; the refusal contract above applies) |
 
 Action body shapes:
 
@@ -562,6 +564,14 @@ Rules:
   `.orch/artifacts/`; path traversal → `400`.
 - Text responses capped at 5 MiB; larger files return metadata + a download
   link. Diffs and gate logs are text; binary patches are labeled.
+- M1-P01: every artifact read is root-relative through the canonical project
+  root and the no-follow, capped host boundary (`src/util/safe-read.ts`). A
+  listing skips symlinked/special entries (it never reports a link target's
+  size/mtime); a text read returns `404` for absence/refusal; a `?download=1`
+  stream reads from the pinned handle and answers `409` with the typed refusal
+  code — never a `stat`-then-open that could follow a project link. The
+  `.orch/wave-log.jsonl` tail is bounded (4 MiB / 20k rows, whole tail lines
+  only), and the SSE fingerprint uses fstat on pinned entries.
 - The UI never executes artifact content.
 
 ## 12. Security

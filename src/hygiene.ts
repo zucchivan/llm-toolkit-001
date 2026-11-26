@@ -22,10 +22,10 @@
  * pre-existing parent-exclusion pattern or a tracked private file is REPORTED
  * as a conflict with manual remediation, never repaired silently.
  */
-import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runGit } from "./util/git-objects.ts";
+import { readSafeText, requireSafeReadRoot, SafeReadRefusalError } from "./util/safe-read.ts";
 
 export type OwnershipClass = "reviewable" | "optional-trail" | "private";
 
@@ -171,14 +171,26 @@ export interface HygieneInstall {
  * (`git rm --cached <path>` is the operator's explicit decision, after saving
  * anything they need), and pre-existing parent-exclusion patterns are
  * reported for the operator to adjust.
+ *
+ * M1-P01 step (g): the existing `.gitignore` is read through the canonical-root
+ * + no-follow, capped boundary (Git itself already goes through `runGit`). A
+ * genuine ENOENT writes a fresh block; a REFUSED file (a symlink — leaf or
+ * ancestor — a hard link, a non-regular type, a permission failure or the cap)
+ * throws `SafeReadRefusalError` BEFORE any write, so an already-hostile link is
+ * never appended through. (The write itself is init's operator-invoked path and
+ * is not part of P01's read boundary; a concurrent swap between this read and
+ * the write is not claimed as closed here.)
  */
 export async function installProjectHygiene(root: string): Promise<HygieneInstall> {
-	const gitignore = join(root, ".gitignore");
-	const current = existsSync(gitignore) ? await readFile(gitignore, "utf8") : "";
+	const canonical = await requireSafeReadRoot(root);
+	const gitignore = join(canonical, ".gitignore");
+	const read = await readSafeText({ root: canonical, path: ".gitignore" });
+	if (read.kind === "refused") throw new SafeReadRefusalError(read);
+	const current = read.kind === "ok" ? read.value : "";
 	const plan = applyHygieneBlock(current);
 	if (plan.installed) await writeFile(gitignore, plan.content, "utf8");
 	const conflicts = [...plan.conflicts];
-	for (const tracked of await trackedPrivateFiles(root)) {
+	for (const tracked of await trackedPrivateFiles(canonical)) {
 		conflicts.push(
 			`tracked private runtime file ${JSON.stringify(tracked)}: .gitignore rules do not apply to tracked files, ` +
 				`so it remains published even though its class is private. The kit never modifies the index or history; ` +

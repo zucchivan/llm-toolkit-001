@@ -4,7 +4,8 @@
  * plus the health findings on engineered states (orphan, missing patch).
  */
 import { describe, expect, it, beforeEach } from "vitest";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildFauxModels, fauxAssistantMessage, fauxToolCall } from "./fixtures.ts";
 import { openProjectHarness } from "../src/engine/harness.ts";
@@ -12,6 +13,7 @@ import { commitState } from "../src/engine/state.ts";
 import { loadPrd, runPlan } from "../src/engine/planner.ts";
 import { runWaves } from "../src/engine/waves.ts";
 import { readout, receiptLabels } from "../src/engine/inspector.ts";
+import { projectPaths } from "../src/engine/harness.ts";
 import { prepareDemoProject, writeConfig, demoConfigToml, gitInit } from "./demo-project.ts";
 import { initProject } from "../src/init.ts";
 
@@ -254,6 +256,139 @@ describe("inspector: readout seam", () => {
 			await kit.loop.close();
 			kit.lock.release();
 		}
+	});
+});
+
+describe("M1-P01 step (g): inspect reads stay inside the canonical-root + safe-read boundary", () => {
+	async function outsideFile(content: string): Promise<{ dir: string; file: string }> {
+		const dir = await mkdtemp(join(tmpdir(), "kit-inspect-outside-"));
+		const file = join(dir, "secret");
+		await writeFile(file, content, "utf8");
+		return { dir, file };
+	}
+
+	it("a symlinked wave-log in side-car mode is a typed refusal: no outside rows, never absence", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+
+		// absent log = the defined empty state
+		const empty = await readout(projectPaths(project.root), { sidecarReason: "test: never run" });
+		expect(empty.rows).toEqual([]);
+
+		const outside = await outsideFile(
+			`${JSON.stringify({ ts: 1, kind: "wave", task: "LEAKED-TASK", verb: "start" })}\n`,
+		);
+		try {
+			await symlink(outside.file, join(project.root, ".orch", "wave-log.jsonl"));
+			const error = await readout(projectPaths(project.root), { sidecarReason: "test: hostile log" }).catch((err: unknown) => err);
+			expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+			expect((error as Error).message).toMatch(/symbolic link/);
+			// No outside BYTES reached the readout: the row content is nowhere.
+			expect(JSON.stringify((error as Error).message)).not.toContain("LEAKED-TASK");
+		} finally {
+			await rm(outside.dir, { recursive: true, force: true });
+		}
+	});
+
+	it("a symlinked artifact (or the artifacts directory) refuses the storage readout; a plain artifact directory listing still works", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+		const { models } = buildFauxModels([]);
+		const kit = await openProjectHarness(project.root, "inspect", { modelsOverride: models });
+		try {
+			// A real artifact is listed with its fstat metadata.
+			await writeProject(project.root, { ".orch/artifacts/candidate-rev-t1-w1.patch": "diff --git a/x b/x\n" });
+			const listed = await readout(kit.loop.paths, { loop: kit });
+			expect(listed.artifacts.map((a) => a.name)).toEqual(["candidate-rev-t1-w1.patch"]);
+			expect(listed.artifacts[0]!.bytes).toBeGreaterThan(0);
+
+			const outside = await outsideFile("OUTSIDE-SECRET-ARTIFACT");
+			try {
+				await symlink(outside.file, join(project.root, ".orch", "artifacts", "evil.patch"));
+				const error = await readout(kit.loop.paths, { loop: kit }).catch((err: unknown) => err);
+				expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+				expect(JSON.stringify((error as Error).message)).not.toContain("OUTSIDE-SECRET-ARTIFACT");
+			} finally {
+				await rm(join(project.root, ".orch", "artifacts", "evil.patch"), { force: true });
+				await rm(outside.dir, { recursive: true, force: true });
+			}
+
+			// The artifacts DIRECTORY itself as a link is refused too.
+			const outsideDir = await mkdtemp(join(tmpdir(), "kit-inspect-outside-dir-"));
+			try {
+				await writeFile(join(outsideDir, "host.patch"), "HOST-PATCH-BYTES", "utf8");
+				await rm(join(project.root, ".orch", "artifacts"), { recursive: true, force: true });
+				await symlink(outsideDir, join(project.root, ".orch", "artifacts"));
+				const error = await readout(kit.loop.paths, { loop: kit }).catch((err: unknown) => err);
+				expect(error).toMatchObject({ name: "SafeReadRefusalError", code: "symlink" });
+				expect(JSON.stringify((error as Error).message)).not.toContain("HOST-PATCH-BYTES");
+			} finally {
+				await rm(join(project.root, ".orch", "artifacts"), { force: true });
+				await rm(outsideDir, { recursive: true, force: true });
+			}
+		} finally {
+			await kit.loop.close();
+			kit.lock.release();
+		}
+	});
+
+	it("a symlinked PRD is REFUSED in the health read (an error, never \"missing\" and never the link target)", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+
+		const { models } = buildFauxModels([]);
+		const kit = await openProjectHarness(project.root, "inspect", { modelsOverride: models });
+		try {
+			// baseline: the real PRD is present and healthy
+			const clean = await readout(kit.loop.paths, { loop: kit });
+			expect(clean.health.find((check) => check.id === "prd")?.ok).toBe(true);
+
+			const outside = await outsideFile("OUTSIDE PRD BYTES");
+			try {
+				await rm(join(project.root, "docs", "prd.md"), { force: true });
+				await symlink(outside.file, join(project.root, "docs", "prd.md"));
+				const read = await readout(kit.loop.paths, { loop: kit });
+				const prd = read.health.find((check) => check.id === "prd")!;
+				expect(prd.ok).toBe(false);
+				expect(prd.severity).toBe("error");
+				expect(prd.detail).toMatch(/refused \(symlink\)/);
+				expect(prd.detail).not.toMatch(/PRD missing/);
+				// The PRD bytes are never part of the readout, and the refusal names no content.
+				expect(JSON.stringify(read)).not.toContain("OUTSIDE PRD BYTES");
+			} finally {
+				await rm(outside.dir, { recursive: true, force: true });
+			}
+		} finally {
+			await kit.loop.close();
+			kit.lock.release();
+		}
+	});
+
+	it("observation takes no lease and writes nothing (side-car read stays inert)", async () => {
+		const project = await prepareDemoProject();
+		await writeConfig(project.root, demoConfigToml());
+		await gitInit(project.root);
+		await initProject(project.root);
+
+		const orch = join(project.root, ".orch");
+		const before = (await readdir(orch)).sort();
+		const statusBefore = await stat(join(orch, "config.toml"));
+		const read = await readout(projectPaths(project.root), { sidecarReason: "test: observer" });
+		expect(read.degraded).toBe(true);
+		expect(read.rows).toEqual([]);
+
+		// No lock, no database, no new side-car: the observer ran lock-free.
+		expect((await readdir(orch)).sort()).toEqual(before);
+		await expect(stat(join(orch, "lock"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(stat(join(orch, "durable.sqlite"))).rejects.toMatchObject({ code: "ENOENT" });
+		const statusAfter = await stat(join(orch, "config.toml"));
+		expect(statusAfter.mtimeMs).toBe(statusBefore.mtimeMs);
 	});
 });
 

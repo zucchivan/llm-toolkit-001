@@ -15,10 +15,12 @@
  * the same content-hash filenames, so it cannot duplicate a note).
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm } from "node:fs/promises";
+import { mkdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { atomicWriteJson, readJson } from "../util/fsx.ts";
+import { atomicWriteJson } from "../util/fsx.ts";
 import { shasum } from "../util/git.ts";
+import { openSafeDirectory, readSafeText, requireSafeReadRoot, SafeReadRefusalError } from "../util/safe-read.ts";
+import type { SafeDirectory } from "../util/safe-read.ts";
 import { readSessionState, commitState } from "./state.ts";
 import type { WaveRow } from "./infos.ts";
 import type { LoopAndLock, ProjectPaths } from "./harness.ts";
@@ -28,6 +30,14 @@ export const HANDOFF_NOTE_MAX_CHARS = 2_000;
 /** Per-claim budget at each wave boundary: oldest (ts,id) notes until this
  *  many chars of note text are bound; excess stays queued for later waves. */
 export const HANDOFF_CLAIM_MAX_CHARS = 3_000;
+/**
+ * Host-read cap for ONE inbox note file (JSON wrapper around the note text).
+ * M1-P01 step (g): the inbox is read through the canonical-root + no-follow,
+ * capped boundary; a note file past this cap is a refusal, not a truncated note.
+ */
+export const HANDOFF_NOTE_FILE_MAX_BYTES = 64 * 1024;
+/** Host-read cap for the one-time legacy `.orch/pending-handoff.json` import. */
+export const HANDOFF_LEGACY_MAX_BYTES = 256 * 1024;
 
 export class HandoffNoteTooLongError extends Error {
 	constructor() {
@@ -75,23 +85,59 @@ export async function publishHandoffNote(paths: ProjectPaths, text: string): Pro
  * while they fit the claim budget; already-consumed ids are duplicates (not
  * taken); unparseable/mismatched/oversized files are invalid. Pure filesystem
  * read — the binding transaction is the caller's commitState.
+ *
+ * M1-P01 step (g): the inbox directory and each note file are read through the
+ * canonical-root + no-follow, capped boundary (one resolved root per claim).
+ * A genuine ENOENT is the defined "no inbox yet"; a REFUSED entry — a symlink
+ * (leaf or ancestor), hard link, non-regular type, unreadable file or the byte
+ * cap — throws `SafeReadRefusalError` instead of importing outside bytes or
+ * quarantining a hostile file. Content problems (bad JSON, id mismatch,
+ * over-long note text) remain the diagnosed `invalid` list.
  */
 export async function readHandoffClaim(paths: ProjectPaths, opts: { excludeIds?: readonly string[] } = {}): Promise<HandoffClaim> {
 	const claim: HandoffClaim = { taken: [], queued: 0, duplicates: [], invalid: [] };
 	const excluded = new Set(opts.excludeIds ?? []);
+	const root = await requireSafeReadRoot(paths.root);
+	const opened = await openSafeDirectory({ root, path: ".orch/handoffs/inbox" });
+	if (opened.kind === "absent") return claim; // no inbox yet — nothing to claim
+	if (opened.kind === "refused") throw new SafeReadRefusalError(opened);
+	const inbox: SafeDirectory = opened.value;
 	let entries: string[];
 	try {
-		entries = (await readdir(paths.handoffInbox, { withFileTypes: true }))
-			.filter((e) => e.isFile() && e.name.endsWith(".json"))
-			.map((e) => e.name)
+		const listed = await inbox.list();
+		if (listed.kind === "absent") return claim;
+		if (listed.kind === "refused") throw new SafeReadRefusalError(listed);
+		entries = listed.value
+			.flatMap((entry) => {
+				if (entry.kind === "directory") return [];
+				if (entry.kind !== "file") {
+					throw new SafeReadRefusalError({
+						code: entry.kind === "symlink" ? "symlink" : "not-regular",
+						path: `.orch/handoffs/inbox/${entry.name}`,
+						message:
+							entry.kind === "symlink"
+								? `.orch/handoffs/inbox/${entry.name} is a symbolic link; host reads never follow links`
+								: `.orch/handoffs/inbox/${entry.name} is not a regular file`,
+					});
+				}
+				return entry.name.endsWith(".json") ? [entry.name] : [];
+			})
 			.sort();
-	} catch {
-		return claim; // no inbox yet — nothing to claim
+	} finally {
+		await inbox.close();
 	}
 	const valid: HandoffNote[] = [];
 	for (const name of entries) {
-		const file = join(paths.handoffInbox, name);
-		const parsed = await readJson<NoteFile>(file);
+		const read = await readSafeText({ root, path: `.orch/handoffs/inbox/${name}`, maxBytes: HANDOFF_NOTE_FILE_MAX_BYTES });
+		if (read.kind === "absent") continue; // vanished between list and read: not claimed
+		if (read.kind === "refused") throw new SafeReadRefusalError(read);
+		let parsed: NoteFile | undefined;
+		try {
+			const value: unknown = JSON.parse(read.value);
+			if (value && typeof value === "object") parsed = value as NoteFile;
+		} catch {
+			parsed = undefined;
+		}
 		if (!parsed || typeof parsed !== "object") {
 			claim.invalid.push({ file: name, reason: "note file is not a JSON object" });
 			continue;
@@ -210,8 +256,14 @@ export async function discardConsumedHandoffNotes(paths: ProjectPaths, boundIds:
  */
 export async function importLegacyHandoff(kit: LoopAndLock): Promise<void> {
 	const paths = kit.loop.paths;
-	const raw = await readFile(paths.pendingHandoff, "utf8").catch(() => undefined);
-	if (raw === undefined) return;
+	// M1-P01 step (g): the legacy side-car is read through the canonical-root +
+	// no-follow, capped boundary. Absent stays the defined no-op; a refused file
+	// (symlink/type/permission/cap) throws instead of importing outside bytes.
+	const root = await requireSafeReadRoot(paths.root);
+	const read = await readSafeText({ root, path: ".orch/pending-handoff.json", maxBytes: HANDOFF_LEGACY_MAX_BYTES });
+	if (read.kind === "absent") return;
+	if (read.kind === "refused") throw new SafeReadRefusalError(read);
+	const raw = read.value;
 	const hash = shasum(raw);
 	const state = await readSessionState(kit.loop.harness);
 	const imported = state.runStatus.handoffImportedSha256 ?? [];

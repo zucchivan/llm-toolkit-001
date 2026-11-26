@@ -32,13 +32,12 @@
  */
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { createReadStream } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 import { bindPostureFor, checkMutationAuth, csrfCookie, hasValidCookie, isLoopbackPeer, MutationAuthError, sessionCookie, tokenEquals, type BindPosture } from "./auth.ts";
 import { readConversationEntries, readOnce } from "./readout.ts";
 import { readProjectSources } from "./sources.ts";
-import { artifactList, artifactPath, liveTaskDiff, locateTaskDiff, readArtifact, readTaskDiff, validateName, waveTaskDiff } from "./diff.ts";
+import { artifactList, liveTaskDiff, locateTaskDiff, readArtifact, readArtifactBytes, readTaskDiff, validateName, waveTaskDiff } from "./diff.ts";
 import { startAction, stopAction, validateAction } from "./actions.ts";
 import { attachedStopAction } from "./attached-stop.ts";
 import { serveStatic } from "./static.ts";
@@ -319,21 +318,14 @@ async function serveTaskDiffRoute(
 	if (download) {
 		// Raw patch download: the stored artifact file, as an attachment (it is
 		// already ≤ 5 MiB at write time; binary-safe bytes, never previewed).
+		// M1-P01 step (g): the bytes come from ONE pinned safe-read handle — no
+		// `stat` + `createReadStream` pair that could follow a project symlink.
 		const located = await locateTaskDiff(root, taskId);
 		if (!located) {
 			jsonError(res, 404, `no diff artifacts for task ${taskId} yet (only done/quarantined tasks persist a patch)`);
 			return;
 		}
-		res.writeHead(200, {
-			"Content-Type": "application/octet-stream",
-			"Content-Disposition": `attachment; filename="${located.patch}"`,
-			"Cache-Control": "no-store",
-		});
-		void createReadStream(located.patchPath)
-			.on("error", () => {
-				if (!res.writableEnded) res.end();
-			})
-			.pipe(res);
+		await servePinnedDownload(res, root, located.patch);
 		return;
 	}
 	const result = await readTaskDiff(root, taskId);
@@ -343,6 +335,31 @@ async function serveTaskDiffRoute(
 	}
 	res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
 	res.end(JSON.stringify(result.payload));
+}
+
+/**
+ * One artifact download from a PINNED safe-read handle (M1-P01 step (g)):
+ * the opened descriptor is the only byte source, so a project symlink (leaf or
+ * ancestor) can never redirect the stream. Absent → 404 (the established
+ * "no artifact"); a REFUSED read → 409 naming the typed code, with no bytes.
+ */
+async function servePinnedDownload(res: ServerResponse, root: string, name: string): Promise<void> {
+	const bytes = await readArtifactBytes(root, name);
+	if (bytes.kind === "absent") {
+		jsonError(res, 404, `no artifact ${name}`);
+		return;
+	}
+	if (bytes.kind === "refused") {
+		jsonError(res, 409, `artifact ${name} is refused (${bytes.code}): ${bytes.message} — no bytes were served`);
+		return;
+	}
+	res.writeHead(200, {
+		"Content-Type": "application/octet-stream",
+		"Content-Disposition": `attachment; filename="${name}"`,
+		"Content-Length": bytes.value.length,
+		"Cache-Control": "no-store",
+	});
+	res.end(bytes.value);
 }
 
 async function serveArtifactRoute(req: IncomingMessage, res: ServerResponse, root: string, rawName: string | undefined, download: boolean): Promise<void> {
@@ -364,27 +381,7 @@ async function serveArtifactRoute(req: IncomingMessage, res: ServerResponse, roo
 		return;
 	}
 	if (download) {
-		const path = artifactPath(root, name);
-		if (!path) {
-			jsonError(res, 400, `bad artifact name ${JSON.stringify(name)} — expected [A-Za-z0-9._-] (no traversal)`);
-			return;
-		}
-		const meta = await import("node:fs/promises").then((fs) => fs.stat(path).catch(() => undefined));
-		if (!meta?.isFile()) {
-			jsonError(res, 404, `no artifact ${name}`);
-			return;
-		}
-		res.writeHead(200, {
-			"Content-Type": "application/octet-stream",
-			"Content-Disposition": `attachment; filename="${name}"`,
-			"Content-Length": meta.size,
-			"Cache-Control": "no-store",
-		});
-		void createReadStream(path)
-			.on("error", () => {
-				if (!res.writableEnded) res.end();
-			})
-			.pipe(res);
+		await servePinnedDownload(res, root, name);
 		return;
 	}
 	const read = await readArtifact(root, name);

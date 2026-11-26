@@ -17,11 +17,10 @@
  * all reads here are side-car/artifact filesystem reads plus pure tree-to-tree
  * git plumbing, so the lock contract of §11.1 stays intact.
  */
-import { readdir, readFile, stat } from "node:fs/promises";
-import { join, resolve as resolvePath, sep } from "node:path";
 import { diffDisplayTrees, DISPLAY_PATCH_CAP_BYTES } from "../../src/util/git.ts";
 import { resolveCanonicalProjectRoot } from "../../src/sandbox/host-profile.ts";
-import { openSafeFile, readSafeText } from "../../src/util/safe-read.ts";
+import { openSafeDirectory, openSafeFile, readSafeText, resolveSafeReadRoot } from "../../src/util/safe-read.ts";
+import type { SafeReadResult } from "../../src/util/safe-read.ts";
 import type { DiffStats, DisplayDiffStats } from "../../src/util/git.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
 import type { WaveRow } from "../../src/engine/infos.ts";
@@ -57,9 +56,8 @@ export function validateTaskId(taskId: string): Validation {
 export interface PatchLocation {
 	task: string;
 	patch: string;
-	patchPath: string;
+	/** stats side-car artifact NAME when present */
 	stats?: string;
-	statsPath?: string;
 	/** legacy artifact from a pre-revision kit run — display only, no receipt. */
 	historical?: boolean;
 }
@@ -84,7 +82,31 @@ async function currentPlanRevision(root: string): Promise<string | undefined> {
 	return typeof payload?.planRevision === "string" ? payload.planRevision : undefined;
 }
 
-export async function locateTaskDiff(root: string, taskId: string): Promise<PatchLocation | undefined> {
+/**
+ * Artifact entries under `.orch/artifacts` through the pinned no-follow
+ * directory handle (M1-P01 step g). Absence is the defined "no artifacts yet";
+ * a refused directory is `undefined`, so a display route degrades to its stated
+ * 404/409 rather than listing a link target's metadata.
+ */
+async function artifactNames(rootInput: string): Promise<string[] | undefined> {
+	const root = await canonicalRoot(rootInput);
+	if (!root) return undefined;
+	const opened = await openSafeDirectory({ root, path: ".orch/artifacts" });
+	if (opened.kind !== "ok") return undefined;
+	try {
+		const listed = await opened.value.list();
+		if (listed.kind !== "ok") return undefined;
+		return listed.value.filter((entry) => entry.kind === "file").map((entry) => entry.name).sort();
+	} finally {
+		await opened.value.close();
+	}
+}
+
+export async function locateTaskDiff(rootInput: string, taskId: string): Promise<PatchLocation | undefined> {
+	const root = await canonicalRoot(rootInput);
+	if (!root) return undefined;
+	const names = await artifactNames(root);
+	if (!names) return undefined;
 	const revision = await currentPlanRevision(root);
 	if (revision) {
 		// Revision-qualified selection — the same rule the core readout applies.
@@ -93,62 +115,46 @@ export async function locateTaskDiff(root: string, taskId: string): Promise<Patc
 		const prefix = `candidate-${revision}-${taskId}-w`;
 		let bestWave = 0;
 		let bestName: string | undefined;
-		try {
-			for (const name of await readdir(join(root, ".orch", "artifacts"))) {
-				if (!name.startsWith(prefix) || !name.endsWith(".patch")) continue;
-				const wave = Number(/-w(\d+)\.patch$/.exec(name)?.[1]);
-				if (Number.isSafeInteger(wave) && wave > bestWave) {
-					bestWave = wave;
-					bestName = name;
-				}
+		for (const name of names) {
+			if (!name.startsWith(prefix) || !name.endsWith(".patch")) continue;
+			const wave = Number(/-w(\d+)\.patch$/.exec(name)?.[1]);
+			if (Number.isSafeInteger(wave) && wave > bestWave) {
+				bestWave = wave;
+				bestName = name;
 			}
-		} catch {
-			/* no artifacts dir → no diff */
 		}
-		return bestName ? located(root, taskId, bestName, false) : undefined;
+		return bestName ? located(names, taskId, bestName, false) : undefined;
 	}
 	// No known revision (pre-P14 project): legacy names, labeled historical.
 	const candidates = [`task-${taskId}.patch`];
-	try {
-		const names = await readdir(join(root, ".orch", "artifacts"));
-		let bestWave = 0;
-		for (const name of names) {
-			if (!name.startsWith(`quarantined-${taskId}-w`) || !name.endsWith(".patch")) continue;
-			const wave = Number(/-w(\d+)\.patch$/.exec(name)?.[1]);
-			if (Number.isInteger(wave) && wave > bestWave) bestWave = wave;
-		}
-		if (bestWave > 0) candidates.push(`quarantined-${taskId}-w${bestWave}.patch`);
-	} catch {
-		/* no artifacts dir → no diff */
+	let bestWave = 0;
+	for (const name of names) {
+		if (!name.startsWith(`quarantined-${taskId}-w`) || !name.endsWith(".patch")) continue;
+		const wave = Number(/-w(\d+)\.patch$/.exec(name)?.[1]);
+		if (Number.isInteger(wave) && wave > bestWave) bestWave = wave;
 	}
+	if (bestWave > 0) candidates.push(`quarantined-${taskId}-w${bestWave}.patch`);
 	for (const patch of candidates) {
-		const locatedPatch = located(root, taskId, patch, true);
+		const locatedPatch = located(names, taskId, patch, true);
 		if (locatedPatch) return locatedPatch;
 	}
 	return undefined;
 }
 
-/** Validate + stat one constructed artifact name (§11.4 even for our own names). */
-async function located(root: string, taskId: string, patch: string, historical: boolean): Promise<PatchLocation | undefined> {
-	const patchPath = join(root, ".orch", "artifacts", patch);
-	if (!validateName(patch) || livesOutsideArtifacts(root, patchPath)) return undefined;
-	const meta = await stat(patchPath).catch(() => undefined);
-	if (!meta?.isFile()) return undefined;
+/**
+ * Validate one constructed artifact name (§11.4 even for our own names). The
+ * name must be in the pinned listing — the patch and its stats side-car are
+ * never stat'ed through a path.
+ */
+function located(names: readonly string[], taskId: string, patch: string, historical: boolean): PatchLocation | undefined {
+	if (!validateName(patch) || !names.includes(patch)) return undefined;
 	const statsName = patch.replace(/\.patch$/, ".json");
-	const statsPath = join(root, ".orch", "artifacts", statsName);
-	const statsMeta = validateName(statsName) ? await stat(statsPath).catch(() => undefined) : undefined;
 	return {
 		task: taskId,
 		patch,
-		patchPath,
 		...(historical ? { historical: true } : {}),
-		...(statsMeta?.isFile() ? { stats: statsName, statsPath } : {}),
+		...(validateName(statsName) && names.includes(statsName) ? { stats: statsName } : {}),
 	};
-}
-
-function livesOutsideArtifacts(root: string, resolved: string): boolean {
-	const base = resolvePath(join(root, ".orch", "artifacts"));
-	return resolved !== base && !resolved.startsWith(base + sep);
 }
 
 export interface TaskDiffPayload {
@@ -336,20 +342,39 @@ export function validateWaveNumber(raw: unknown): { ok: true; wave: number } | {
 	return { ok: true as const, wave: Number(raw) };
 }
 
-/** The wave-log side-car, parsed tolerantly: a torn append skips its line and keeps the rest. */
-async function readWaveRows(root: string): Promise<WaveRow[]> {
-	const raw = await readFile(join(root, ".orch", "wave-log.jsonl"), "utf8").catch(() => undefined);
-	if (raw === undefined) return [];
-	const rows: WaveRow[] = [];
-	for (const line of raw.split("\n")) {
-		if (!line.trim()) continue;
-		try {
-			rows.push(JSON.parse(line) as WaveRow);
-		} catch {
-			/* torn append mid-flush: skip the line, keep the rest */
+/**
+ * Wave-log TAIL policy (M1-P01 step g): the side-car is append-only and grows
+ * for the life of a project, so the UI reads at most the last
+ * `WAVE_LOG_TAIL_BYTES` through the pinned no-follow handle (`readTailText`),
+ * which drops the possibly-partial first line of the window. Parsing stays
+ * tolerant: a torn append skips its line and keeps the rest. Absence is the
+ * defined "no log yet"; a refused file degrades to no rows so the display
+ * route keeps its stated 409 (never a link target's bytes, never a full load).
+ */
+export const WAVE_LOG_TAIL_BYTES = 4 * 1024 * 1024;
+export const WAVE_LOG_TAIL_ROWS = 20_000;
+
+async function readWaveRows(rootInput: string): Promise<WaveRow[]> {
+	const resolved = await resolveSafeReadRoot(rootInput);
+	if (resolved.kind !== "ok") return [];
+	const opened = await openSafeFile({ root: resolved.root, path: ".orch/wave-log.jsonl" });
+	if (opened.kind !== "ok") return [];
+	try {
+		const tail = await opened.value.readTailText({ maxBytes: WAVE_LOG_TAIL_BYTES });
+		if (tail.kind !== "ok") return [];
+		const rows: WaveRow[] = [];
+		for (const line of tail.value.text.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				rows.push(JSON.parse(line) as WaveRow);
+			} catch {
+				/* torn append mid-flush: skip the line, keep the rest */
+			}
 		}
+		return rows.length > WAVE_LOG_TAIL_ROWS ? rows.slice(-WAVE_LOG_TAIL_ROWS) : rows;
+	} finally {
+		await opened.value.close();
 	}
-	return rows;
 }
 
 /**
@@ -427,18 +452,35 @@ export interface ArtifactEntry {
 	mtimeMs: number;
 }
 
-export async function artifactList(root: string): Promise<ArtifactEntry[]> {
+/**
+ * `.orch/artifacts` entries through the pinned no-follow directory handle
+ * (M1-P01 step g): absence is the defined empty list, a refused directory or a
+ * symlink/special entry is an empty list (this display route states "none";
+ * the download route reports the refusal), and metadata comes from fstat on the
+ * opened pinned descriptor — never a path stat that could follow a link.
+ */
+export async function artifactList(rootInput: string): Promise<ArtifactEntry[]> {
+	const resolved = await resolveSafeReadRoot(rootInput);
+	if (resolved.kind !== "ok") return [];
+	const opened = await openSafeDirectory({ root: resolved.root, path: ".orch/artifacts" });
+	if (opened.kind !== "ok") return [];
 	try {
-		const names = await readdir(join(root, ".orch", "artifacts"));
-		const entries = await Promise.all(
-			names.map(async (name) => {
-				const meta = await stat(join(root, ".orch", "artifacts", name)).catch(() => undefined);
-				return meta?.isFile() ? { name, bytes: meta.size, mtimeMs: meta.mtimeMs } : undefined;
-			}),
-		);
-		return entries.filter((e): e is ArtifactEntry => e !== undefined).sort((a, b) => b.mtimeMs - a.mtimeMs);
-	} catch {
-		return [];
+		const listed = await opened.value.list();
+		if (listed.kind !== "ok") return [];
+		const entries: ArtifactEntry[] = [];
+		for (const entry of listed.value) {
+			if (entry.kind !== "file") continue;
+			const file = await opened.value.openFile(entry.name);
+			if (file.kind !== "ok") continue;
+			try {
+				entries.push({ name: entry.name, bytes: file.value.size, mtimeMs: file.value.mtimeMs });
+			} finally {
+				await file.value.close();
+			}
+		}
+		return entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	} finally {
+		await opened.value.close();
 	}
 }
 
@@ -448,14 +490,26 @@ export type ArtifactRead =
 	| { kind: "missing"; name: string }
 	| { kind: "binary"; name: string; bytes: number };
 
-/** validated fs path for one artifact name (§11.4 anchor + traversal guard). */
-export function artifactPath(root: string, name: string): string | undefined {
-	if (!validateName(name)) return undefined;
-	const resolved = resolvePath(join(root, ".orch", "artifacts", name));
-	if (resolved !== resolvePath(join(root, ".orch", "artifacts")) && !resolved.startsWith(resolvePath(join(root, ".orch", "artifacts")) + sep)) {
-		return undefined;
+/**
+ * Download bytes for one artifact, from the pinned safe-read handle (M1-P01
+ * step g). This replaces the old `stat` + `createReadStream` pair, which could
+ * follow a project symlink. Absent and refused stay distinct results: the route
+ * answers 404 for absence and 409 with the typed refusal code (and NO bytes)
+ * for a symlink/escape/type/cap/permission refusal.
+ */
+export async function readArtifactBytes(rootInput: string, name: string): Promise<SafeReadResult<Buffer>> {
+	if (!validateName(name)) {
+		return { kind: "refused", code: "unsafe-path", path: name, message: `bad artifact name ${JSON.stringify(name)} — expected [A-Za-z0-9._-] (no traversal)` };
 	}
-	return resolved;
+	const resolved = await resolveSafeReadRoot(rootInput);
+	if (resolved.kind !== "ok") return resolved;
+	const opened = await openSafeFile({ root: resolved.root, path: `.orch/artifacts/${name}` });
+	if (opened.kind !== "ok") return opened;
+	try {
+		return await opened.value.readBytes();
+	} finally {
+		await opened.value.close();
+	}
 }
 
 /**
@@ -465,8 +519,7 @@ export function artifactPath(root: string, name: string): string | undefined {
  * only picks the metadata branch and never discloses file content.
  */
 export async function readArtifact(root: string, name: string): Promise<ArtifactRead> {
-	const path = artifactPath(root, name);
-	if (!path) return { kind: "missing", name };
+	if (!validateName(name)) return { kind: "missing", name };
 	const canonical = await canonicalRoot(root);
 	if (!canonical) return { kind: "missing", name };
 	const opened = await openSafeFile({ root: canonical, path: `.orch/artifacts/${name}` });

@@ -305,11 +305,14 @@ export async function openProjectHarness(
 	opts: { modelsOverride?: Models; now?: () => number; setTimer?: SetTimer; retryMax?: number; readView?: boolean } = {},
 ): Promise<LoopAndLock> {
 	const paths = projectPaths(root);
-	requireConfig(paths.config);
+	// M1-P01 step (g): the config is read ONCE, asynchronously, through the
+	// canonical-root + no-follow boundary. A refused read keeps its typed reason
+	// (symlink/hardlink/type/cap/permission/platform) instead of looking like an
+	// absent file, and nothing is opened (or locked) on that basis.
+	const config = await loadConfig(root);
 	const lock = await acquireLock(paths.lock, cmdHint);
 
 	try {
-		const config = loadConfig(root, paths.config);
 		assertPinnedPiDurable(config.engine.piDurable);
 
 		// Read-only views must not create storage just to look: a never-run project
@@ -494,12 +497,6 @@ export function roleRatesFor(config: KitConfig, modelKey: string): CostRates | u
 		}
 	}
 	return undefined;
-}
-
-function requireConfig(configPath: string): void {
-	if (!fileExists(configPath)) {
-		throw new Error(`no ${configPath} in this project — run "llm-toolkit-001 init ." at the repo root first`);
-	}
 }
 
 // ---------------------------------------------------------------------------
