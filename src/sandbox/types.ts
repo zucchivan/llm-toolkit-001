@@ -133,3 +133,28 @@ export interface LeaseSpec {
 	publicValues: Readonly<Record<string, string>>;
 	timeoutMs: number;
 }
+
+/** Roles admitted by the fixed guest helper. Unknown strings refuse at handshake. */
+export type GuestRole = "planner" | "implementer" | "verifier" | "gate" | "probe";
+
+/** One byte stream pair is created by a future sandbox launcher for each lease. */
+export interface GuestByteStream {
+	/** Read at most `maxBytes`; undefined means orderly EOF. */
+	read(maxBytes: number): Promise<Uint8Array | undefined>;
+	/** Write all bytes or reject. Concurrent writes are serialized by protocol code. */
+	write(bytes: Uint8Array): Promise<void>;
+	/** Close the stream and wake pending reads. */
+	close(): Promise<void>;
+}
+
+export interface GuestLeaseIdentity {
+	readonly leaseId: string;
+	readonly role: GuestRole;
+	readonly cwd: string;
+}
+
+export const GUEST_ROLES: readonly GuestRole[] = ["planner", "implementer", "verifier", "gate", "probe"];
+
+export function isGuestRole(value: unknown): value is GuestRole {
+	return typeof value === "string" && (GUEST_ROLES as readonly string[]).includes(value);
+}

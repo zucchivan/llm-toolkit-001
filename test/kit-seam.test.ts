@@ -137,4 +137,16 @@ describe("pinned SDK import seam (M0-P02)", () => {
 		const unresolved = [...listed].filter((name) => !exported.has(name));
 		expect(unresolved).toEqual([]);
 	});
+
+	it("documents the pinned ExecutionEnv surface and P02 transport disposition", () => {
+		const apiMap = readFileSync(join(repoRoot, "docs", "api-map.md"), "utf8");
+		const kitSection = apiMap.split("## src/engine/kit.ts")[1]?.split(/^## /m)[0] ?? "";
+		const guestSection = apiMap.split("## src/sandbox/{protocol,guest-env,guest-helper,types}.ts — M1-P02")[1] ?? "";
+		for (const name of [
+			"ExecutionEnv", "FileSystem", "Shell", "Result", "FileError", "ExecutionError", "BinaryReader",
+			"TextLineReader", "DirReader", "LineScan", "ShellExecOptions", "ShellOutputInfo", "WatchTarget",
+		]) expect(kitSection).toContain(`\`${name}\``);
+		for (const contract of ["1 MiB", "64 KiB", "listFiles", "watch", "cancel", "not_supported", "NodeExecutionEnv"])
+			expect(guestSection).toContain(contract);
+	});
 });
