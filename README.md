@@ -25,6 +25,51 @@ not the result location; pull-request creation never merges code.
   zero-progress/duplicate-failure breakers, rate-limit durable sleep with exit
   42) are built in.
 
+## Linux local containment — approved design, implementation in progress (M1-P03)
+
+The local sandbox product direction is **Linux bubblewrap + a small kit-owned
+Rust launcher + versioned complete toolchain bundles**. This is not yet a shipped
+or certified execution backend. Current tools/gates/probes still execute on the
+host; use trusted projects/fixtures only, including the quickstart below.
+
+- **Reliable process ownership:** the Rust launcher will place sandbox children
+  into the exact journaled cgroup-v2 lease before execution using
+  `clone3(CLONE_INTO_CGROUP)`. Timeout/owner loss requires killing the whole lease
+  and observing it empty before accepting results. Rust reduces memory-safety
+  risk; syscall/FD/admission ordering still needs review and real tests. This is
+  shared-kernel Linux containment, not a VM.
+- **Repeatable setup:** a bundle will identify the host launcher/bwrap and include
+  the pinned guest Node runtime, libraries, helper/import closure and minimal
+  utilities/dependencies. Project-specific prebuilt dependency bundles remain
+  explicit; no project install hooks on the host. Optional downloads belong only
+  to explicitly approved setup; supplied offline bundles remain supported. Worker
+  runs, recovery and fixture construction stay offline, with no host HOME/PATH
+  discovery or transparent dependency installation.
+- **Predictable maintenance:** install bundle versions side-by-side, verify exact
+  inventory/provenance, and explicitly select a version. No silent updates or
+  overwriting bundles needed for recovery. Maintainers/source builders need a
+  pinned Rust/Cargo toolchain; prebuilt users should not. Rust is separate from
+  the TypeScript/npm runtime dependency footprint.
+- **Operator control:** preview exact sources, versions, hashes, build/install
+  commands, destinations and host-profile changes before approval. Neither `init`
+  nor a project run may install Rust, enroll assets, change that profile or obtain
+  setup network authority. Local setup policy is not permission to modify another
+  host or deploy to production.
+- **Private results:** after fencing, the host will scan and durably seal the full
+  validated projection, publish one private candidate Git ref with compare-and-swap,
+  and reconcile the receipt after crashes. Git publication and journal receipts
+  are not one atomic cross-store write. No partial import into your checkout;
+  integration and delivery retain their existing owners.
+
+**Available now:** offline protocol/helper, lifecycle and inventory/delta
+preparation only. **Still to implement:** Rust launcher selection/build/ABI,
+bundle tooling and actual pins, full scan/seal/publication, local launch wiring
+and real conformance. No bundle releases or setup command are available yet;
+the local adapter remains non-default until M1-P05.
+See [local setup/status](sandbox/local/README.md),
+[operator contract](docs/project-contract.md#linux-local-sandbox--approved-p03-provisioning-contract),
+and [engineering slices](docs/engineering-plan/M1.md#p03-rust-launcher-and-versioned-bundle-amendment-operator-approved-2026-11-26).
+
 ## 5-minute quickstart
 
 ```bash
@@ -215,7 +260,8 @@ Rules, each enforced BEFORE anything is written:
   guards, target-path checks, and `shell: false`-style process spawning are not
   OS containment; use trusted projects and fixtures only. Gate and probe
   recipes also inherit the CLI's environment (PATH/HOME included) until the
-  M1 sandbox boundary lands.
+  M1 sandbox boundary lands. The approved Rust-launcher/versioned-bundle design
+  above is not evidence that this cutover has happened.
 - Budget stops guard every paid submission (M0-P16): one `admitSubmission`
   gate admits the planner conversation, every implementer retry, each verifier
   pass, and one-off `verify`, refusing at `>=` of `budgets.sessionUsd` — a zero

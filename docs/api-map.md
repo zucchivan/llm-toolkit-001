@@ -872,6 +872,49 @@ config/env, `KIT_*` or argv.
   return (refusal, budget stop, error) leaves no handle behind; `verify` does
   the same and never mutates task disposition.
 
+## P03 local preparation and approved Rust/bundle extension
+
+**Not a production sandbox.** Existing `src/sandbox/lease-lifecycle.ts` owns the
+preparatory durable journal/fence/reopen interface; interrupted `fencing` retries
+kill/empty observation, and `fenced` reconciliation/import admission require a
+fresh population check and durably block uncertainty. UUID-child/schema/receipt
+checks do not yet establish complete cgroup identity/ownership or writer exclusion.
+`src/sandbox/manifest.ts` exports `validateSealedManifest`, `sealedManifestDigest`
+and `validateManifestDelta`: canonical bounded complete projected inventories and
+shared-control full additions/deletions/content/mode checks. They do not scan the
+filesystem, retain a durable seal or publish results. `guest-helper-main.ts`
+exports the fixed ABI parser and bounded stdio adapter for the P02 helper; it is
+not launched by production. The SDK seam/readout version are unchanged.
+
+**Approved target, not implemented:** optional `installation.localLauncher` in
+`types.ts`, `host-profile.ts` and `trusted-exec.ts` uses existing `INSTALL_TOOLS`,
+parser and `requireTrustedTool` selection/validation, no second resolver or new
+runtime npm dependency. No default/fallback or eager prerequisite; current parser
+still refuses this unknown key. Per-use filesystem trust and outside-target rules
+apply without a dev-in-kit exception. Descriptor digest must bind the new tool.
+This key selects the host Rust placement executable, not guest helper or bwrap.
+Bundle inventory validation additionally binds installed artifact bytes before
+admitting project execution; selection-only tests do not prove that later binding.
+
+The standalone `sandbox/local/launcher/` crate will own clone3 exact-child
+placement with reviewed unsafe/FD/owner-loss behavior. Its fixed argv/FD/status
+contract must be documented/proved before launch wiring. Rust/compiler and Cargo
+pins are build inputs, separate from npm. Planned `build-launcher.sh` is an
+explicit offline build from reviewed inputs; `provision-toolchain.sh` separates
+approved acquisition/install from offline fixture/run/recovery. `bundle-format.md`
+will define canonical versioned inventory/provenance anchored by existing
+`manifestSha256`; no exact compiler/runtime/assets are enrolled yet. Host changes
+remain subject to D1 review of exact inputs/commands/paths/profile edits.
+
+The selected P03 result seam is immutable Git objects plus the existing private
+`refs/kit/<planRevision>/tasks/<taskId>/leases/<leaseId>/candidate` create-only CAS,
+with recorded destination/result/seal bindings and receipt-loss reconciliation.
+Git ref publication and journal writes are not one atomic transaction. No change
+to accepted integration refs or delivery ownership. Complete scan, writer exclusion,
+durable sealing and CAS/receipt integration still need implementation/proof.
+See [P03 slices S1–S5](engineering-plan/M1.md#p03-rust-launcher-and-versioned-bundle-amendment-operator-approved-2026-11-26)
+and [local operator status](../sandbox/local/README.md).
+
 ## src/sandbox/{protocol,guest-env,guest-helper,types}.ts — M1-P02
 
 The P02 adapter is prepared but not wired into `src/engine/harness.ts`; the

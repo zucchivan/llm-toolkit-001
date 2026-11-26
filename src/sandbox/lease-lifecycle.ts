@@ -48,7 +48,7 @@ export class LeaseLifecycle {
 	get record(): Readonly<LeaseRecord> { return Object.freeze({ ...this.recordValue }); }
 
 	static async create(root: string, role: LeaseRole, cgroupPath: string, cgroups: CgroupOps = new LinuxCgroupOps()): Promise<LeaseLifecycle> {
-		if (!isRole(role) || !isAbsolute(cgroupPath) || cgroupPath.includes("\0") || cgroupPath.split("/").includes("..")) throw new Error("invalid lease intent");
+		if (!isRole(role) || !isCanonicalAbsolutePath(cgroupPath)) throw new Error("invalid lease intent");
 		await ensurePrivateDirectory(root);
 		const id = randomUUID();
 		const record: LeaseRecord = { version: 1, id, role, phase: "intent", sequence: 0, createdAt: Date.now(), cgroupPath: join(cgroupPath, `kit-${id}`) };
@@ -79,8 +79,11 @@ export class LeaseLifecycle {
 	}
 
 	async fence(maxWaitMs = 5_000): Promise<void> {
-		if (this.recordValue.phase !== "launching" && this.recordValue.phase !== "attached") throw new Error(`cannot fence lease in ${this.recordValue.phase}`);
-		await this.advance("fencing");
+		if (!Number.isSafeInteger(maxWaitMs) || maxWaitMs < 0) throw new Error("invalid fence timeout");
+		if (this.recordValue.phase !== "launching" && this.recordValue.phase !== "attached" && this.recordValue.phase !== "fencing") throw new Error(`cannot fence lease in ${this.recordValue.phase}`);
+		// A persisted kill intent is not a kill receipt. Repeating cgroup.kill on
+		// the same child is safe and required after an interrupted fence.
+		if (this.recordValue.phase !== "fencing") await this.advance("fencing");
 		try {
 			await this.cgroups.kill(this.recordValue.cgroupPath);
 			const deadline = Date.now() + maxWaitMs;
@@ -97,7 +100,7 @@ export class LeaseLifecycle {
 
 	async beginImport(): Promise<void> {
 		this.requirePhase("fenced");
-		if (await this.cgroups.populated(this.recordValue.cgroupPath)) throw new Error("cannot import while lease cgroup is populated");
+		await this.requireCurrentFence();
 		await this.advance("importing");
 	}
 	async recordImported(manifestDigest: string, resultDigest: string): Promise<void> {
@@ -115,6 +118,8 @@ export class LeaseLifecycle {
 			else await this.markRecoveryRequired("cgroup exists without a trusted launch acknowledgement");
 		} else if (phase === "launching" || phase === "attached" || phase === "fencing") {
 			await this.fence();
+		} else if (phase === "fenced") {
+			await this.requireCurrentFence();
 		} else if (phase === "importing") {
 			await this.markRecoveryRequired("import receipt missing after import intent; reconcile only from the same sealed bytes");
 		} else if (phase === "imported") {
@@ -132,6 +137,15 @@ export class LeaseLifecycle {
 		if (this.recordValue.phase !== "complete" && this.recordValue.phase !== "not-launched") throw new Error("cannot remove cgroup before terminal lifecycle state");
 		if (await this.cgroups.populated(this.recordValue.cgroupPath)) throw new Error("cannot remove populated lease cgroup");
 		await this.cgroups.remove(this.recordValue.cgroupPath);
+	}
+
+	private async requireCurrentFence(): Promise<void> {
+		try {
+			if (await this.cgroups.populated(this.recordValue.cgroupPath)) throw new Error("lease cgroup is populated after recorded fence");
+		} catch (error) {
+			await this.markRecoveryRequired(`fence observation failed: ${(error as Error).message}`);
+			throw error;
+		}
 	}
 
 	private requirePhase(phase: LeasePhase): void { if (this.recordValue.phase !== phase) throw new Error(`lease phase is ${this.recordValue.phase}, expected ${phase}`); }
@@ -209,7 +223,15 @@ async function writeControl(path: string, value: string): Promise<void> {
 function decodeRecord(value: unknown, id: string): LeaseRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("lease journal record is malformed");
 	const row = value as Record<string, unknown>;
-	if (row.version !== 1 || row.id !== id || !UUID_V4.test(id) || typeof row.phase !== "string" || !(row.phase in NEXT) || !isRole(row.role) || typeof row.cgroupPath !== "string" || !Number.isSafeInteger(row.sequence) || typeof row.createdAt !== "number") throw new Error("lease journal identity or schema mismatch");
+	if (row.version !== 1 || row.id !== id || !UUID_V4.test(id) || typeof row.phase !== "string" || !Object.hasOwn(NEXT, row.phase) || !isRole(row.role) || !isCanonicalAbsolutePath(row.cgroupPath) || basename(row.cgroupPath) !== `kit-${id}` || !Number.isSafeInteger(row.sequence) || (row.sequence as number) < 0 || !Number.isSafeInteger(row.createdAt) || (row.createdAt as number) < 0) throw new Error("lease journal identity or schema mismatch");
+	const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+	if ((row.manifestDigest !== undefined && !digest(row.manifestDigest)) || (row.resultDigest !== undefined && !digest(row.resultDigest)) ||
+		((row.manifestDigest === undefined) !== (row.resultDigest === undefined)) ||
+		(row.phase === "imported" && (!digest(row.manifestDigest) || !digest(row.resultDigest))) ||
+		(row.recoveryReason !== undefined && (typeof row.recoveryReason !== "string" || row.recoveryReason.length > 512))) throw new Error("lease journal receipt or recovery schema mismatch");
 	return row as unknown as LeaseRecord;
 }
-function isRole(value: unknown): value is LeaseRole { return ["planner", "implementer", "verifier", "gate", "probe"].includes(String(value)); }
+function isCanonicalAbsolutePath(value: unknown): value is string {
+	return typeof value === "string" && isAbsolute(value) && !value.includes("\0") && resolve(value) === value;
+}
+function isRole(value: unknown): value is LeaseRole { return typeof value === "string" && ["planner", "implementer", "verifier", "gate", "probe"].includes(value); }

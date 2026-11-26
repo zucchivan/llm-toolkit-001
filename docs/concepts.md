@@ -37,6 +37,32 @@ commands and gate/probe recipes execute project code on the host with the CLI's
 permissions; no shell-free spawn or target-path check makes an untrusted project
 safe to run.
 
+## Local containment and provisioning (approved design, not active)
+
+M1-P03 selects a small kit-owned Rust launcher to create the sandbox process in
+its exact journaled cgroup before execution, plus Linux bubblewrap namespaces and
+a versioned complete toolchain bundle. Rust is a maintainer/source-build tool;
+ordinary users should use verified prebuilt assets. It reduces memory-safety risk,
+not the need for syscall/FD/admission/owner-loss proof. Local remains shared-kernel
+containment, not a VM, and is not yet certified or wired as the default.
+
+**Provisioning** prepares/acquires, verifies and explicitly enrolls trusted tools
+outside the project. It is separate from **execution**, which stays offline and
+cannot install/fetch dependencies. Optional setup downloads and supplied offline
+bundles are both planned; neither `init` nor a project run grants setup authority.
+D1 means the operator reviews exact assets/provenance/hashes/paths/commands and
+profile edits before host changes. Versioned installs are side-by-side and selected
+explicitly; recovery retains its recorded bundle rather than silently upgrading.
+
+A **sealed local result** will mean retained host-validated bytes from the complete
+fenced projection, not a guest manifest claim or frozen JS object. It is privately
+constructed and exposed through the existing lease candidate-ref CAS, with a
+separately durable/reconciled receipt. This does not atomically commit Git and the
+journal together or move integration/delivery ownership. Scanner/seal/publication
+and real launch/conformance remain implementation work. See
+[local status](../sandbox/local/README.md) and the
+[operator contract](project-contract.md#linux-local-sandbox--approved-p03-provisioning-contract).
+
 ## Stages
 
 - **adopt** (optional, before/between plans) — deterministic `discoverProject`
