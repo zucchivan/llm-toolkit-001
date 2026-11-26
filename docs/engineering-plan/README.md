@@ -136,6 +136,17 @@ In the local tier use separate namespaces + drop capabilities, no-new-privileges
 
 ### P03 local helper and result contract (approved 2026-11-26)
 
+**Current decision amendment (2026-11-26):** P03 also owns a small Rust native
+placement launcher, explicitly selected as optional `installation.localLauncher`
+through P01's existing resolver, with no default/fallback or dev-in-kit exception.
+Use `clone3(CLONE_INTO_CGROUP)` for the exact journaled child before bwrap/helper
+execution; no spawn-then-move. Compiler/target/Cargo dependencies are pinned
+maintainer/source-build inputs, separate from npm; prebuilt versioned bundles
+serve ordinary users. Minimal unsafe syscall code needs explicit review and real
+ordering/FD/owner-loss proof. No runtime compilation. The key/crate are approved
+for implementation, not yet implemented or installed. M1.md P03 defines strict
+paths and bounded slices; S1 (optional selection only) is ready now.
+
 P03 owns a standalone kit helper entrypoint, installed outside the target and
 selected explicitly through P01's existing `installation.helper` descriptor
 and per-use validator. bwrap uses `installation.bwrap` through the same resolver.
@@ -168,7 +179,13 @@ Host-only durable staging binds retained validated bytes and canonical digest
 to lease, base tree, controls and projection policy before import intent.
 `SandboxLease.seal()` is host-governed fencing, scanning and durable sealing;
 it cannot accept a guest's seal assertion. Import builds a private result and
-exposes it through one atomic result reference/receipt transition. No arbitrary
+exposes it through an atomic candidate-ref CAS followed by a durable receipt,
+with exact-byte/result reconciliation across crashes, not a fictitious atomic
+write across Git and the journal. The selected destination is the existing
+`refs/kit/<planRevision>/tasks/<taskId>/leases/<leaseId>/candidate`, created only
+from absence for this fresh lease; identical observed tree OID plus verified
+seal/bindings can reconcile receipt loss, conflicts or ambiguous post-attempt
+absence block. Integration/delivery refs retain their existing owners. No arbitrary
 tar extraction, partial visible import or operator checkout mutation. Reopen
 re-establishes exact ownership/fencing before any rescan, revalidates retained
 sealed content, and reconciles only the recorded destination/result identity.
@@ -251,10 +268,12 @@ host-owned installation descriptor names the executable and argv prefix for
 each host tool. The Node interpreter is `process.execPath`; the CLI/UI entries
 are those of the running operator-selected kit installation (the running entry
 and its sibling UI bin), not a target copy. On Linux the validated defaults for
-Git/gh are `/usr/bin/git` and `/usr/bin/gh`; `helper`/`bwrap` have no default
-before P03/P05 and must come from the host profile/toolchain. Optional absolute
-overrides live only in host policy
-`installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string}`.
+Git/gh are `/usr/bin/git` and `/usr/bin/gh`; `helper`/`bwrap` and the approved
+P03 `localLauncher` have no defaults and must be explicitly selected. Optional
+absolute overrides live only in host policy. Target schema after P03-S1:
+`installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string,localLauncher?:string}`.
+`localLauncher` is currently not implemented; do not enroll it before S1 lands.
+No other P01 resolver/trust policy is relaxed by this additive extension.
 
 - **Selection authority.** No PATH search, target `node_modules/.bin`,
   cwd-relative candidate, project config/env, `KIT_*` value, argv token or job
@@ -310,13 +329,41 @@ trust validation, not re-enable project-local resolution. P01 installs these
 host boundaries only; gate/probe containment and `[sandbox]` enforcement remain
 P05.
 
-**Host policy**, not repo config: path `~/.config/llm-toolkit-001/host-v1.json` (Windows `%LOCALAPPDATA%/llm-toolkit-001/host-v1.json`), user-owned, non-project, refuse insecure permissions/reparse points. Schema `{version:1,installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string},projects:[{root:absoluteCanonical, backends:("local"|"microvm"|"remote")[],toolchainId:string,publicValues:Record<string,string>,remoteProject?:string,deliveryOrigin?:string,otlpLoopback?:boolean}],toolchains:Record<string,{rootfs?:absoluteImmutablePath,manifestSha256:string,gondolinImage?:absoluteImmutablePath,daytonaSnapshot?:string,deps?:absoluteImmutablePath}>}`. Exact canonical root match, one entry, immutable image/deps validated against host manifest (manifest lists digests, platform, Node version and dependency lockfile digests); reject missing tier fields. One provisioned local default toolchain can be registered under `toolchains.default` for local, no-extra-env, no-network, no-upload projects without entries. No implicit remote use. Remote requires host allow + `--allow-remote` on **each** CLI invocation that might transfer bytes (`plan`, `run`, `verify`, executing `gates probe`, accepting `resolve`); UI does not add it. `deliveryOrigin` is operator-allowlisted HTTPS GitHub repository URL for PRs (no custom git transport or target-controlled gh host). OTLP export requires a separate foreground `telemetry export [--follow]`, local collection already enabled, and host `otlpLoopback:true`; fixed `http://127.0.0.1:4318/v1/traces`, no redirects, user-supplied headers, auth, or arbitrary network endpoint. Operators configure onward export in their collector.
+**Host policy**, not repo config: path `~/.config/llm-toolkit-001/host-v1.json` (Windows `%LOCALAPPDATA%/llm-toolkit-001/host-v1.json`), user-owned, non-project, refuse insecure permissions/reparse points. Schema `{version:1,installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string,localLauncher?:string},projects:[{root:absoluteCanonical, backends:("local"|"microvm"|"remote")[],toolchainId:string,publicValues:Record<string,string>,remoteProject?:string,deliveryOrigin?:string,otlpLoopback?:boolean}],toolchains:Record<string,{rootfs?:absoluteImmutablePath,manifestSha256:string,gondolinImage?:absoluteImmutablePath,daytonaSnapshot?:string,deps?:absoluteImmutablePath}>}`. Exact canonical root match, one entry, immutable image/deps validated against host manifest (manifest lists digests, platform, Node version and dependency lockfile digests); reject missing tier fields. One provisioned local default toolchain can be registered under `toolchains.default` for local, no-extra-env, no-network, no-upload projects without entries. No implicit remote use. Remote requires host allow + `--allow-remote` on **each** CLI invocation that might transfer bytes (`plan`, `run`, `verify`, executing `gates probe`, accepting `resolve`); UI does not add it. `deliveryOrigin` is operator-allowlisted HTTPS GitHub repository URL for PRs (no custom git transport or target-controlled gh host). OTLP export requires a separate foreground `telemetry export [--follow]`, local collection already enabled, and host `otlpLoopback:true`; fixed `http://127.0.0.1:4318/v1/traces`, no redirects, user-supplied headers, auth, or arbitrary network endpoint. Operators configure onward export in their collector.
 
-### P03 local toolchain inventory (approved 2026-11-26)
+### P03 local toolchain inventory (approved 2026-11-26; versioned bundle amendment)
+
+**Supported provisioning direction:** publish versioned complete toolchain bundles,
+not automatic harvesting of whichever tools happen to be installed on each host.
+Cover launcher/bwrap identities, rootfs, exact guest Node/libraries, helper closure,
+utilities/dependencies/locks and build/provenance inputs. Host-only tools remain
+outside the guest. Project-specific dependency bundles remain separate reviewed
+inputs; no project install hooks on the host. No concrete release/pins or artifact
+hosting/signing infrastructure are claimed to exist yet.
+
+Acquisition may be networked only in explicit, separately approved operator setup
+(`sandbox/local/provision-toolchain.sh`, planned), with reviewed sources and
+independent authenticity verification. Offline supplied bundles remain supported.
+The fixture builder and all worker execution/recovery remain offline; no implicit
+download, toolchain compiler installation, host dependency lookup, or version
+fallback. Validate archives/staging before install, including malicious paths,
+links/types/limits and interrupted installs. Versioned installations are
+side-by-side with explicit selection; never overwrite/delete referenced recovery
+assets or silently update to `latest`.
+
+D1 review-first applies before host effects: present exact compiler/assets/sources,
+provenance, versions, hashes, destinations, commands/privileges and profile changes
+for approval. Rust toolchain setup on the development host is needed but not yet
+performed/authorized at the command level. Documentation/source preparation is
+not artifact enrollment. This model applies to all local installations, while
+current session authority is limited to the operator's development machine.
 
 The existing `toolchains.*.manifestSha256` anchors an operator-reviewed exact
 inventory; it is not a guest-supplied checksum or permission to discover tools.
-No host-profile field or second executable resolver is added. P03 must define a
+The only approved installation-schema addition is optional `localLauncher`
+through the existing resolver (P03-S1); no additional toolchain-profile field or
+second resolver is introduced. The host-policy shape above is the target shape
+including this not-yet-implemented key. P03 must define a
 versioned canonical encoding (stable ordering, paths, lengths, modes and SHA256
 semantics) covering OS/architecture/ABI, exact guest Node version and executable,
 loader/libraries, fixed helper/protocol identity and all transitive installed

@@ -500,6 +500,54 @@ On a host whose installation tree is group/world writable (including the
 running node interpreter's ancestors), launch refuses by the approved mode
 rule; that is an operator filesystem action, never a fallback path.
 
+## Linux local sandbox — approved P03 provisioning contract
+
+**Planned, not active/certified.** The current loop still uses host execution for
+project tools/gates/probes; trust only known projects. M1-P03's approved direction
+is bubblewrap plus a kit-owned **Rust** placement launcher and a **versioned
+complete toolchain bundle**, not a per-project compiler/install procedure.
+P04/P05 cutover remains separately gated on real conformance and packet review.
+
+- The host selects helper, bwrap and the planned optional
+  `installation.localLauncher` through the same P01 descriptor/per-use validator.
+  The launcher key is not yet accepted by the parser; do not add it to a real
+  profile before P03-S1 lands. No launcher/helper/bwrap default or project/env/PATH
+  authority, no new dev-in-kit exception. Operator/root ownership, safe modes,
+  non-symlink ancestry and outside-target rules are preserved.
+- Rust/Cargo are pinned maintainer/source-build prerequisites (including this
+  development host), not ordinary npm/runtime dependencies. Prebuilt bundle users
+  should not need Rust. No install hook or worker run invokes a compiler/rustup.
+  A small audited unsafe syscall section may be necessary; memory safety does
+  not substitute for placement/FD/owner-loss/admission tests.
+- A bundle identifies the host launcher/bwrap and guest rootfs, exact Node/ABI,
+  loader/libs, helper/import closure, shell/utilities and dependency locks.
+  Host-only executables do not become guest tools. Project-specific prebuilt
+  dependencies are separate reviewed inputs, never host install scripts.
+  Exact inventory is anchored by existing `toolchains.*.manifestSha256`; neither
+  an observed host Node version nor a checksum establishes upstream authenticity.
+- Optional acquisition is an explicit setup operation with reviewed sources and
+  authenticity checks; an offline supplied bundle is also supported. Worker runs,
+  recovery and fixture builds have no setup network authority. Installation must
+  validate paths/types/limits/staging, reject incomplete artifacts, and avoid
+  executing unverified content or target hooks.
+- **D1 review first:** show exact provenance, versions, measured hashes/inventory,
+  compiler and build/install commands/privileges, canonical destinations and host
+  profile edits before applying those effects. Approval of the product direction
+  does not approve unspecified assets or install Rust. Session authority covers
+  only the current development machine; the model applies to every operator.
+- Install versions side-by-side, change selection explicitly, retain versions
+  referenced by recovery, and never silently update/overwrite/delete them.
+  `init` and project config cannot select, install or upgrade trusted tools.
+- Host-fenced results use a complete no-follow projection scan and retained durable
+  seal before import. Reuse the private lease candidate ref with create-only CAS
+  and crash-reconciled receipts; Git and journal are not atomically committed
+  together. No operator-checkout mutation or change of engine delivery ownership.
+
+No compiler pin, release bundle, installer, host enrollment, production local
+caller or certification is supplied by this documentation checkpoint. See
+[`sandbox/local/README.md`](../sandbox/local/README.md) for the execution sequence
+and approval checkpoint; no new setup CLI command is advertised yet.
+
 ## Upgrade & migration notes
 
 - The kit is versioned semver; `.orch/kit-version` records which pairs

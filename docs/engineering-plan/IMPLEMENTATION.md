@@ -106,3 +106,62 @@ owning packet/strict paths. Ask for amendment if outside this packet. Unsupporte
 platforms/adapters remain unavailable. No live-model, live-PR, savings, latency or
 containment claim may be inferred from mocks. Real backend measurements must be
 explicitly labeled with host, pin and method, never generalized benchmarks.
+
+### Active packet — M1-P03: design approved; S1 ready, certification still blocked
+
+As of 2026-11-26, P03's standalone helper ABI/stdio adapter has a bounded
+implementation in `src/sandbox/guest-helper-main.ts`, but no production launcher
+uses it. A disposable Linux `clone3(CLONE_INTO_CGROUP)` canary proved kernel
+placement into the exact UUID-named delegated child before the child ran; the
+same child was killed through `cgroup.kill` and the child reported `populated 0`.
+Production wiring is still blocked: Node has no syscall interface in this
+implementation, and there is no reviewed native launcher asset or P01 selection
+for one. `LinuxCgroupOps.writePid()` remains an unsuitable post-spawn move. The
+transient user-systemd scope canary also remains unsuitable because its scope
+was outside the delegated subtree. Fixture creation remains blocked until
+operator-provisioned offline runtime assets and reviewed exact inventory values
+are available. Import wiring remains blocked until the complete fenced scan,
+host-only durable seal, destination identity, and atomic result
+visibility/recovery mechanism are proved. Existing Git object/ref primitives
+are reusable candidates, but no P03 importer/receipt currently binds them to
+the lease journal. See
+`docs/engineering-plan/evidence/M1-P03.md` for the obligation map and effect
+ordering. These are blockers, not permission to substitute timing, guessed
+pins, or a different destination contract.
+
+Bounded follow-up (2026-11-26): interrupted `fencing` is now retryable;
+reopened `fenced` state/import admission require fresh cgroup observation and
+persist recovery-required on uncertainty. Journal decoding checks UUID-child
+binding and imported receipt shape. Complete manifest validation now uses one
+canonical ordering, rejects implicit-directory/name collisions and enforces
+non-raiseable bounds. Pure full-delta validation reuses the existing scope
+matcher for additions/deletions/content/mode changes. These close offline
+preparation gaps only: complete filesystem scan, writer exclusion, durable seal
+and result publication remain unimplemented. Launcher selection still needs an
+implementation of the now-approved P01/strict-path extension; enrolled assets
+remain absent. P03 certification is still BLOCKED; no production cutover or real
+certification. Current verification is at the top of `evidence/M1-P03.md`.
+
+**Operator decision (2026-11-26):** use a kit-owned Rust clone3 launcher (Rust
+build-toolchain prerequisite accepted), versioned complete bundles with explicit
+setup/offline execution, existing private candidate refs plus CAS/receipt recovery,
+and D1 review-before-host-changes. M1.md P03 and README §§2–3 now record the
+approved narrow strict-path/schema extension. No further design approval is
+needed for these directions. Do not ask the next agent to rediscover the choice.
+No Rust install, bundle download/enrollment or profile change is authorized until
+exact assets/provenance/pins/paths/commands have been presented and approved.
+
+**Dispatch next: P03-S1 only.** Add optional `installation.localLauncher` via
+`src/sandbox/{types,host-profile,trusted-exec}.ts` and the existing P01 resolver,
+with failure-first tests in `test/{host-paths,trusted-exec}.test.ts`. Missing
+selection refuses on use, never by default/eager sweep; no PATH/env fallback,
+new dev-in-kit exception or weakened ownership/mode policy. Check descriptor
+identity binding. Update API/evidence status. No Rust code/build, launcher spawn,
+fixture, installer/network, host profile mutation, P04/P05, root npm dependency or
+accepted P01 hygiene-race fix. This slice is READY TO IMPLEMENT with current
+Node tooling; Rust not being installed is not a blocker to S1.
+
+Then S2 proves the Rust launcher/build/ABI; S3 implements versioned bundle
+inventory/provisioning and offline fixture; S4 proves full scan/seal/private-ref
+recovery; S5 wires/certifies local. Each remains bounded by M1.md P03; packet
+closure still needs real conformance and reviewer acceptance.
