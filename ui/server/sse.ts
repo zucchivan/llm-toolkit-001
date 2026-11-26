@@ -114,7 +114,7 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 		// event and a connected client would keep a stale attached badge until
 		// reload. Mirror currentJobsEvent's exact computation so the fingerprint
 		// can only change when the payload does.
-		const jobs = await jobsList(projectRoot).catch(() => []);
+		const jobs = await jobsList(projectRoot);
 		const attached = await attachedRun(projectRoot, jobs);
 		return `${parts.join("|")}|${attached ? `attached:${attached.pid}:${attached.phase}:${attached.task ?? "-"}` : "none"}`;
 	}
@@ -122,14 +122,17 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 	/** Diff the jobs dir; a change emits one `job` event with the fresh list. */
 	async function broadcastJobsIfChanged(force = false): Promise<void> {
 		if (!watchJobs || stopped) return;
-		const fp = await jobsFingerprint();
-		if (!force && fp === lastJobsFingerprint) return;
-		lastJobsFingerprint = fp;
 		try {
+			const fp = await jobsFingerprint();
+			if (!force && fp === lastJobsFingerprint) return;
+			lastJobsFingerprint = fp;
 			const payload = await currentJobsEvent(projectRoot, installation);
 			submit(`event: job\ndata: ${JSON.stringify(payload)}\n\n`);
 		} catch (err) {
-			console.error(`[llm-toolkit-ui] job event build failed: ${(err as Error).message}`);
+			const data = JSON.stringify({ error: (err as Error).message });
+			const fp = `error:${data}`;
+			if (force || fp !== lastJobsFingerprint) submit(`event: job-error\ndata: ${data}\n\n`);
+			lastJobsFingerprint = fp;
 		}
 	}
 

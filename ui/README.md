@@ -417,13 +417,14 @@ kept out of default `npm test` (it is gated on `KIT_FAUX=1` and runs as
   CLI job (`.orch/ui/jobs/<id>.json` + `.log`). plan/run/verify/export need a
   free lock (the server probes it with the same brief retry, then answers 409
   with the holder pid/phase); handoff spawns the CLI's one-note-per-file
-  atomic writer (M0-P17) and is safe during a run; stop signals a UI job's
-  CLI pid — or, `target: "attached"`,
-  a terminal-started run after the §7.2.1 identity verification (one
-  re-verified SIGINT; every failed check is a reason, never a signal). On
-  server start, dead-pid
-  records are marked stale (history: newest 50 / 14 days). Job env is inherited
-  from the server (KIT_FAUX*, provider keys) and no secrets land in records.
+  atomic writer (M0-P17) and is safe during a run. The server passes a
+  full-launch binding independently of the job record. The runner validates
+  it before opening the job's log or spawning. The log route and reason tails
+  use 256 KiB no-follow reads, returning 409 or an SSE `job-error` on refusal.
+  Ordinary Stop verifies the runner and its CLI child through Linux `/proc`.
+  Attached Stop also requires the lock and status to agree on the holder
+  (§7.2.1). Each verified Stop sends one SIGINT. The startup sweep retains
+  stale job history. Job env carries KIT_FAUX* and provider credentials.
 - The SSE hub watches `.orch/status.json`, `.orch/wave-log.jsonl` and
   `.orch/artifacts/` (fs.watch + 1s fallback poll, debounced): one full snapshot
   per change, at least one every 2s while a wave runs, heartbeats every 15s.

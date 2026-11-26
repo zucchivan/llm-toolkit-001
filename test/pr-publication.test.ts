@@ -298,6 +298,27 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect(await transport.readRemoteRef(data.bare, headRef)).toBe(commit);
 	});
 
+	it.each(["include", "worktree"])("keeps publication pinned with %s config present", async (configuration) => {
+		const data = await fixture();
+		const other = await realpath(await mkdtemp(join(tmpdir(), "kit-pr-alternate-")));
+		roots.push(other);
+		await run(["git", "init", "--bare", other], data.root);
+		const key = `url.${other}.insteadOf`;
+		if (configuration === "include") {
+			await run(["git", "config", "--file", join(other, "rewrite"), key, data.bare], data.root);
+			await run(["git", "config", "--local", "include.path", join(other, "rewrite")], data.root);
+		} else {
+			await run(["git", "config", "--local", "extensions.worktreeConfig", "true"], data.root);
+			await run(["git", "config", "--worktree", key, data.bare], data.root);
+		}
+		const transport = new TrustedGitRemoteTransport(data.root);
+		const ref = "refs/heads/kit/pinned-fixture";
+		expect(await transport.readRemoteRef(data.bare, `refs/heads/${data.baseBranch}`)).toBe(data.baseCommit);
+		await transport.createRemoteRef(data.bare, ref, data.baseCommit);
+		expect(await run(["git", "--git-dir", data.bare, "rev-parse", ref], data.root)).toBe(data.baseCommit);
+		expect(await run(["git", "--git-dir", other, "for-each-ref", ref], data.root)).toBe("");
+	});
+
 	it("observes an exact pre-existing remote head without pushing it again", async () => {
 		const data = await fixture();
 		const commit = await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);

@@ -1,25 +1,10 @@
-/**
- * Detached job runner + job records (ui/PRD.md Appendix B):
- *
- *   .orch/ui/jobs/<id>.json   { id, kind, argv, cwd, pid, startedAt, endedAt?,
- *                              exitCode?, signal?, status, logPath }
- *   .orch/ui/jobs/<id>.log    CLI stdout+stderr (child streams; runner keeps the fd)
- *
- * The server spawns a small plain-Node runner (`job-runner.mjs`) DETACHED
- * (argv-only, no shell) which spawns the CLI, pipes its output to the log,
- * writes the exit code atomically, then exits. The UI server is NOT in the
- * job's process group and can restart independently; the runner survives UI
- * server/browser death so a run keeps going.
- *
- * `pid` on a record is the CLI child's pid — the same pid that owns `.orch/lock`,
- * so `/api/jobs` (and stop) correlate a running job with the live status.json
- * holder. Liveness is a best-effort signal-0 probe; records whose pid is dead
- * are marked `stale` on server start (history is kept, bounded to ~50/14 days).
- */
-import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+/** Detached job state, bounded reads and launch binding (Appendix B). */
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
+import { validateTrustedExecutableFile } from "../../src/sandbox/host-profile.ts";
+import { openSafeDirectory, openSafeFile, readSafeText, type SafeDirectory, type SafeReadResult } from "../../src/util/safe-read.ts";
 import type { StatusPayloads } from "../../src/engine/harness.ts";
 import {
 	installationDescriptorDigest,
@@ -32,11 +17,8 @@ export type JobKind = "plan" | "run" | "verify" | "export" | "handoff";
 /**
  * The host-owned launch identity recorded with a job (M1-P01 step (f)).
  *
- * The UI resolves it ONCE per action from the host descriptor, records it in
- * private job state, and the detached runner revalidates the recorded argv
- * against exactly this identity before spawning. There is no re-resolution
- * (no descriptor read, no PATH, no target `.bin`, no `KIT_*` value) after the
- * record, and attached-stop compares a live process against the same prefix.
+ * The UI resolves it once from the host descriptor and binds it with the
+ * full launch before detaching. Attached Stop uses the same selected prefix.
  */
 export interface JobLaunchIdentity {
 	version: 1;
@@ -176,13 +158,11 @@ export function stripAnsi(text: string): string {
 }
 
 /**
- * The bounded reason tail for a record listing: last few non-empty log lines,
- * ANSI-stripped. Reads whole (job logs are small; the CLI is not a server),
- * capped at 6 lines so a pathological log cannot bloat a job payload.
+ * The listing reason uses the last few nonempty lines of a capped job log.
  */
-export async function reasonTail(record: JobRecord, maxLines = 6): Promise<string[] | undefined> {
+async function reasonTail(root: string, record: JobRecord, maxLines = 6): Promise<string[] | undefined> {
 	if (!wantsReasonTail(record)) return undefined;
-	const raw = await tailJobLog(record.logPath, maxLines);
+	const raw = await tailJobLog(root, record.id, maxLines);
 	const lines = raw.map((l) => stripAnsi(l).trim()).filter((l) => l.length > 0);
 	return lines.length ? lines : undefined;
 }
@@ -192,7 +172,7 @@ export async function jobsViewList(root: string): Promise<JobView[]> {
 	const records = await jobsList(root);
 	return Promise.all(
 		records.map(async (record) => {
-			const tail = await reasonTail(record);
+			const tail = await reasonTail(root, record);
 			return tail ? { ...record, tail } : record;
 		}),
 	);
@@ -245,228 +225,291 @@ export function runningJobPids(records: readonly JobRecord[]): number[] {
 		.map((j) => j.pid!);
 }
 
-/** signal-0 probe: live when it does not throw ESRCH; EPERM counts as alive. */
-export function pidAlive(pid: number | undefined): boolean {
-	if (!Number.isInteger(pid) || !pid || pid <= 0) return false;
+/** OS observation only. Untrusted PIDs never reach kill(), including signal 0. */
+export function validPid(pid: unknown): pid is number {
+	return typeof pid === "number" && Number.isInteger(pid) && pid > 0 && pid <= 0x7fffffff;
+}
+
+export interface ProcessIdentity {
+	parentPid: number;
+	startTime: string;
+}
+
+export async function processIdentity(pid: unknown): Promise<ProcessIdentity | undefined> {
+	if (!validPid(pid)) return undefined;
 	try {
-		process.kill(pid, 0);
-		return true;
+		const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/ +/);
+		if (fields[0] === "Z" || fields[0] === "X" || !/^\d+$/.test(fields[19] ?? "")) return undefined;
+		return { parentPid: Number(fields[1]), startTime: fields[19]! };
 	} catch (err) {
-		return (err as NodeJS.ErrnoException).code === "EPERM"; // exists but not ours
+		if (["ENOENT", "ESRCH"].includes((err as NodeJS.ErrnoException).code ?? "")) return undefined;
+		throw err;
 	}
 }
 
+export async function pidAlive(pid: number | undefined): Promise<boolean> {
+	return (await processIdentity(pid)) !== undefined;
+}
+
 export const JOB_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const JOBS = ".orch/ui/jobs";
+const RECORD_BYTES = 128 * 1024;
+const LOG_TAIL_BYTES = 256 * 1024;
+
+export class JobStateRefusal extends Error {
+	constructor(message: string) {
+		super(`job state refused: ${message}`);
+	}
+}
+
+function observed<T>(result: SafeReadResult<T>): T | undefined {
+	if (result.kind === "refused") throw new JobStateRefusal(`${result.code}: ${result.message}`);
+	return result.kind === "ok" ? result.value : undefined;
+}
 
 export function jobsDir(root: string): string {
-	return join(root, ".orch", "ui", "jobs");
-}
-
-/** A job id: sortable-ish (time prefix) + unique(url-safe for /api/jobs/:id). */
-function newJobId(): string {
-	return `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
-}
-
-function recordPath(root: string, id: string): string {
-	return join(jobsDir(root), `${id}.json`);
+	return join(root, JOBS);
 }
 
 export function logPathFor(root: string, id: string): string {
 	return join(jobsDir(root), `${id}.log`);
 }
 
-/**
- * Atomic JSON write: temp file NEXT TO the target (same dir/filesystem), then
- * rename. Temp names never end in `.json`, so jobsList ignores them.
- */
-async function atomicWriteJson(path: string, value: unknown): Promise<void> {
+async function jobsDirectory(root: string, create = false): Promise<SafeDirectory | undefined> {
+	if (!create) return observed(await openSafeDirectory({ root, path: JOBS }));
+	let parent = observed(await openSafeDirectory({ root }));
+	for (const name of JOBS.split("/")) {
+		if (!parent) break;
+		const pinned = parent;
+		try {
+			await mkdir(join(pinned.descriptorPath, name), { mode: 0o700 }).catch((err) => {
+				if (err.code !== "EEXIST") throw err;
+			});
+			const dir = observed(await pinned.openDirectory(name));
+			await pinned.close();
+			parent = dir;
+		} catch (err) {
+			await pinned.close();
+			throw err;
+		}
+	}
+	return parent;
+}
+
+export async function writeJobRecord(dir: SafeDirectory, record: JobRecord): Promise<void> {
+	const path = join(dir.descriptorPath, `${record.id}.json`);
 	const tmp = `${path}.tmp-${randomBytes(6).toString("hex")}`;
 	try {
-		await writeFile(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
+		await writeFile(tmp, JSON.stringify(record, null, 2) + "\n", { flag: "wx", mode: 0o600 });
 		await rename(tmp, path);
-	} catch (err) {
+	} finally {
 		await unlink(tmp).catch(() => {});
-		throw err;
 	}
 }
 
-/** Read one record; corrupt/partial JSON → undefined (records are atomic renames). */
-export async function readJobRecord(root: string, id: string): Promise<JobRecord | undefined> {
+function parseRecord(raw: string, root: string, id: string): JobRecord {
+	try {
+		const record = JSON.parse(raw) as JobRecord;
+		if (!record || record.id !== id || record.cwd !== root || record.logPath !== logPathFor(root, id)
+			|| !["plan", "run", "verify", "export", "handoff"].includes(record.kind)
+			|| !["running", "exited", "failed", "stale"].includes(record.status)
+			|| !Array.isArray(record.argv) || !record.argv.every((token) => typeof token === "string" && !token.includes("\0"))
+			|| !Number.isFinite(record.startedAt)) throw new Error();
+		return record;
+	} catch {
+		throw new JobStateRefusal(`invalid job record ${id} (including its project or log location)`);
+	}
+}
+
+export async function readJobInDirectory(dir: SafeDirectory, root: string, id: string): Promise<JobRecord | undefined> {
 	if (!JOB_ID_RE.test(id)) return undefined;
+	const file = observed(await dir.openFile(`${id}.json`));
+	if (!file) return undefined;
 	try {
-		return JSON.parse(await readFile(recordPath(root, id), "utf8")) as JobRecord;
-	} catch {
-		return undefined;
+		const raw = observed(await file.readText({ maxBytes: RECORD_BYTES }))!;
+		return parseRecord(raw, root, id);
+	} finally {
+		await file.close();
 	}
 }
 
-/** All records, newest first. Bounded by pruneJobs() (last 50, 14 days). */
-export async function jobsList(root: string): Promise<JobRecord[]> {
-	const dir = jobsDir(root);
-	let names: string[];
+export async function readJobRecord(root: string, id: string): Promise<JobRecord | undefined> {
+	const dir = await jobsDirectory(root);
+	if (!dir) return undefined;
 	try {
-		names = await readdir(dir);
-	} catch {
-		return [];
+		return await readJobInDirectory(dir, root, id);
+	} finally {
+		await dir.close();
 	}
+}
+
+async function listJobRecords(root: string, dir: SafeDirectory): Promise<JobRecord[]> {
+	const entries = observed(await dir.list({ maxEntries: 1024 })) ?? [];
 	const records: JobRecord[] = [];
-	for (const name of names.sort().reverse()) {
-		if (!name.endsWith(".json")) continue;
-		const record = await readJobRecord(root, name.slice(0, -5)).catch(() => undefined);
-		if (record && record.kind !== undefined && Array.isArray(record.argv)) records.push(record);
+	for (const entry of entries) {
+		if (!entry.name.endsWith(".json")) continue;
+		const record = await readJobInDirectory(dir, root, entry.name.slice(0, -5));
+		if (record) records.push(record);
 	}
-	records.sort((a, b) => b.startedAt - a.startedAt);
-	return records;
+	return records.sort((a, b) => b.startedAt - a.startedAt);
 }
 
-/** Records still reported running (drives "one mutating job at a time" + stop). */
-export async function activeJobs(root: string, except: (kind: JobKind) => boolean = () => false): Promise<JobRecord[]> {
-	return (await jobsList(root)).filter((j) => j.status === "running" && !except(j.kind));
+export async function jobsList(root: string): Promise<JobRecord[]> {
+	const dir = await jobsDirectory(root);
+	if (!dir) return [];
+	try {
+		return await listJobRecords(root, dir);
+	} finally {
+		await dir.close();
+	}
 }
 
-/**
- * Server-start sweep (Appendix B): a record still claimed `running` whose CLI
- * pid is gone → `stale` (exit code usually absent: the runner was killed before
- * it could finalize). Never runs after a record was mid-flight on START — the
- * caller does this before accepting actions.
- */
 export async function markStaleRecords(root: string): Promise<number> {
-	let marked = 0;
-	for (const record of await jobsList(root)) {
-		if (record.status !== "running") continue;
-		if (pidAlive(jobPid(record))) continue;
-		await atomicWriteJson(recordPath(root, record.id), { ...record, status: "stale" });
-		marked++;
+	const dir = await jobsDirectory(root);
+	if (!dir) return 0;
+	try {
+		let marked = 0;
+		for (const record of await listJobRecords(root, dir)) {
+			if (record.status !== "running" || await pidAlive(jobPid(record))) continue;
+			// Give a freshly prepared record a chance to attach its runner.
+			if (jobPid(record) == null && Date.now() - record.startedAt < 3_000) continue;
+			const current = await readJobInDirectory(dir, root, record.id);
+			if (!current || current.status !== "running" || await pidAlive(jobPid(current))) continue;
+			await writeJobRecord(dir, { ...current, status: "stale" });
+			marked++;
+		}
+		return marked;
+	} finally {
+		await dir.close();
 	}
-	return marked;
 }
 
-/**
- * Bounded history (Appendix B): drop records (and their logs) older than
- * `maxAgeMs` (14 days) and keep at most the newest `maxJobs`.
- */
 export async function pruneJobs(root: string, maxJobs = 50, maxAgeMs = 14 * 24 * 60 * 60_000): Promise<number> {
-	const records = await jobsList(root); // newest first
-	const drop = new Set<JobRecord>();
-	for (const [index, record] of records.entries()) {
-		if (index >= maxJobs || Date.now() - record.startedAt > maxAgeMs) drop.add(record);
+	const dir = await jobsDirectory(root);
+	if (!dir) return 0;
+	try {
+		let dropped = 0;
+		for (const [index, record] of (await listJobRecords(root, dir)).entries()) {
+			if (record.status === "running" || (index < maxJobs && Date.now() - record.startedAt <= maxAgeMs)) continue;
+			await unlink(join(dir.descriptorPath, `${record.id}.log`)).catch(() => {});
+			await unlink(join(dir.descriptorPath, `${record.id}.json`)).catch(() => {});
+			dropped++;
+		}
+		return dropped;
+	} finally {
+		await dir.close();
 	}
-	if (drop.size === 0) return 0;
-	for (const record of drop) {
-		await unlink(record.logPath).catch(() => {});
-		await unlink(recordPath(root, record.id)).catch(() => {});
-	}
-	return drop.size;
 }
 
 export interface SpawnJobInput {
 	kind: JobKind;
-	/** Full argv incl. interpreter — argv-only, never a shell string (PRD §11.2). */
 	spawnedArgv: string[];
-	/** The host-owned launch identity the argv was built from (step (f)). */
 	identity: JobLaunchIdentity;
 	cwd: string;
-	/** Extra env for the job (sanitized by jobEnvironment; never an executable selector). */
 	env?: Record<string, string>;
 }
 
-/**
- * Create the record, spawn `job-runner.mjs` detached (new process group, argv
- * only, no shell), then patch the record's pid to the runner's. The runner
- * overwrites `pid` with the CLI child's pid as soon as it spawns the CLI.
- */
+/** Digest of exactly the immutable launch fields, supplied separately by the host. */
+export function launchBinding(record: JobRecord): string {
+	return createHash("sha256").update(JSON.stringify([
+		record.id, record.kind, record.argv, record.identity, record.cwd, record.logPath, record.startedAt,
+	])).digest("hex");
+}
+
+const RUNNER_PATH = join(import.meta.dirname, "job-runner.mjs");
+
+export function jobRunnerArgs(root: string, id: string, binding: string): string[] {
+	return [RUNNER_PATH, "--root", root, "--id", id, "--launch", binding];
+}
+
 export async function spawnJob(projectRoot: string, input: SpawnJobInput): Promise<JobRecord> {
-	await mkdir(jobsDir(projectRoot), { recursive: true });
-	const id = newJobId();
-	const logPath = logPathFor(projectRoot, id);
-	// Create the log empty (truncates nothing else; ids are unique).
-	await writeFile(logPath, "", { flag: "wx" });
-
-	const record: JobRecord = {
-		id,
-		kind: input.kind,
-		argv: input.spawnedArgv,
-		identity: input.identity,
-		cwd: input.cwd,
-		startedAt: Date.now(),
-		status: "running",
-		logPath,
-	};
-	await atomicWriteJson(recordPath(projectRoot, id), record);
-
-	const runnerPath = join(import.meta.dirname, "job-runner.mjs");
-	const runnerArgv = [process.execPath, runnerPath, "--record", recordPath(projectRoot, id)];
-	const child = spawn(runnerArgv[0]!, runnerArgv.slice(1), {
-		cwd: projectRoot,
-		detached: true, // own process group: the UI server's death cannot take the run down
-		stdio: "ignore",
-		// Sanitized: the job never inherits an executable selector (the recorded
-		// absolute argv is the executable), while KIT_FAUX*/provider keys/are kept.
-		env: jobEnvironment({ ...process.env, ...(input.env ?? {}) }),
-	});
-	child.unref?.();
-	// Record the runner's own pid for the liveness fallback ONLY — `pid` stays
-	// destined for the CLI child (the lock holder the runner patches next).
-	await patchRecordIfAbsent(projectRoot, id, { runnerPid: child.pid });
-	return { ...record, runnerPid: child.pid };
-}
-
-/** Patch fields into a record read-modify-write (runner writes stay authoritative). */
-export async function patchRecord(projectRoot: string, id: string, patch: Partial<JobRecord>): Promise<void> {
-	const current = await readJobRecord(projectRoot, id);
-	if (!current) return;
-	await atomicWriteJson(recordPath(projectRoot, id), { ...current, ...patch });
-}
-
-/** Same, but only when none of the patch fields is already set on the record. */
-export async function patchRecordIfAbsent(projectRoot: string, id: string, patch: Partial<JobRecord>): Promise<void> {
-	const current = await readJobRecord(projectRoot, id);
-	if (!current) return;
-	const occupied = Object.keys(patch).some((k) => (current as unknown as Record<string, unknown>)[k] !== undefined);
-	if (occupied) return;
-	await atomicWriteJson(recordPath(projectRoot, id), { ...current, ...patch });
-}
-
-/**
- * Tail a job log: last `maxLines` lines (1..5000). No file yet → [].
- */
-export async function tailJobLog(logPath: string, maxLines: number): Promise<string[]> {
-	const capped = Math.max(1, Math.min(5_000, maxLines));
-	let data: string;
+	if (input.cwd !== projectRoot) throw new JobStateRefusal("launch working directory differs from the project");
+	await validateTrustedExecutableFile(input.identity.node, "job runner interpreter", { targetRoot: projectRoot });
+	const cwd = observed(await openSafeDirectory({ root: projectRoot }));
+	if (!cwd) throw new JobStateRefusal("project directory is absent");
 	try {
-		data = await readFile(logPath, "utf8");
-	} catch {
-		return [];
+		const dir = await jobsDirectory(projectRoot, true);
+		if (!dir) throw new JobStateRefusal("job directory disappeared during launch");
+		try {
+			const id = `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}`;
+			const record: JobRecord = {
+				id, kind: input.kind, argv: input.spawnedArgv, identity: input.identity,
+				cwd: projectRoot, startedAt: Date.now(), status: "running", logPath: logPathFor(projectRoot, id),
+			};
+			await writeJobRecord(dir, record);
+			try {
+				const child = spawn(input.identity.node, jobRunnerArgs(projectRoot, id, launchBinding(record)), {
+					cwd: cwd.descriptorPath,
+					detached: true,
+					stdio: "ignore",
+					env: jobEnvironment({ ...process.env, ...(input.env ?? {}) }),
+				});
+				await new Promise<void>((resolve, reject) => {
+					child.once("spawn", resolve);
+					child.once("error", reject);
+				});
+				child.unref();
+				return { ...record, runnerPid: child.pid };
+			} catch (err) {
+				await writeJobRecord(dir, { ...record, status: "failed", exitCode: 127,
+					endedAt: Date.now(), detail: `runner spawn failed: ${(err as Error).message}` });
+				throw err;
+			}
+		} finally {
+			await dir.close();
+		}
+	} finally {
+		await cwd.close();
 	}
-	if (!data) return [];
-	let tail = (data[data.length - 1] === "\n" ? data.slice(0, -1) : data).split("\n");
-	if (tail.length > capped) tail = tail.slice(-capped);
-	return tail;
 }
 
-/**
- * Attached-run discovery (Appendix B): a live `.orch/status.json.lockedByPid`
- * that NO UI running job holds is a terminal-started run. Best-effort liveness;
- * they are not job records — stop follows §7.2.1's verification
- * (ui/server/attached-stop.ts), which names the process before anything is
- * signalled.
- */
+export async function tailJobLog(root: string, id: string, maxLines: number): Promise<string[]> {
+	if (!JOB_ID_RE.test(id)) throw new JobStateRefusal("invalid log id");
+	const file = observed(await openSafeFile({ root, path: `${JOBS}/${id}.log` }));
+	if (!file) return [];
+	try {
+		const tail = observed(await file.readTailText({ maxBytes: LOG_TAIL_BYTES }))!;
+		if (!tail.text) return [];
+		return tail.text.replace(/\n$/, "").split("\n").slice(-Math.max(1, Math.min(5000, maxLines)));
+	} finally {
+		await file.close();
+	}
+}
+
+export async function readJobStatus(root: string): Promise<StatusPayloads | undefined> {
+	const raw = observed(await readSafeText({ root, path: ".orch/status.json", maxBytes: 1024 * 1024 }));
+	if (raw === undefined) return undefined;
+	try {
+		const payload = JSON.parse(raw) as StatusPayloads;
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)
+			|| (payload.lockedByPid !== undefined && !validPid(payload.lockedByPid))) throw new Error();
+		return payload;
+	} catch {
+		throw new JobStateRefusal("malformed .orch/status.json");
+	}
+}
+
+export async function readJobLock(root: string): Promise<number | undefined> {
+	const raw = observed(await readSafeText({ root, path: ".orch/lock", maxBytes: 256 }));
+	if (raw === undefined) return undefined;
+	const pidLine = raw.split("\n")[0] ?? "";
+	const pid = Number(pidLine);
+	if (!/^\d+$/.test(pidLine) || !validPid(pid)) throw new JobStateRefusal("unfinished or malformed .orch/lock");
+	return pid;
+}
+
 export async function attachedRun(projectRoot: string, jobs: JobRecord[]): Promise<AttachedRun | undefined> {
-	let payload: StatusPayloads | undefined;
-	try {
-		payload = JSON.parse(await readFile(join(projectRoot, ".orch", "status.json"), "utf8")) as StatusPayloads;
-	} catch {
-		return undefined;
-	}
-	const holder = payload?.lockedByPid;
-	if (!pidAlive(holder)) return undefined;
-	if (jobs.some((j) => j.status === "running" && j.pid === holder)) return undefined; // a UI job owns it
+	const payload = await readJobStatus(projectRoot);
+	const holder = await readJobLock(projectRoot);
+	if (!payload || holder === undefined || payload.lockedByPid !== holder || !await pidAlive(holder)) return undefined;
+	if (jobs.some((job) => job.status === "running" && job.pid === holder)) return undefined;
 	return {
-		pid: holder!,
-		phase: payload?.phase ?? "unknown",
-		task: payload?.task?.id || undefined,
-		wave: payload?.task?.wave,
-		startedAt: payload?.task?.startedAt ?? payload?.ts,
-		ts: payload?.ts ?? Date.now(),
+		pid: holder,
+		phase: payload.phase ?? "unknown",
+		task: payload.task?.id || undefined,
+		wave: payload.task?.wave,
+		startedAt: payload.task?.startedAt ?? payload.ts,
+		ts: payload.ts ?? Date.now(),
 	};
 }

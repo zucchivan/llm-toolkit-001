@@ -34,7 +34,13 @@ class StreamWindow {
 	private total = 0;
 	capped = false;
 
-	constructor(private readonly cap: number, private readonly mode: OverflowMode) {}
+	private readonly cap: number;
+	private readonly mode: OverflowMode;
+
+	constructor(cap: number, mode: OverflowMode) {
+		this.cap = cap;
+		this.mode = mode;
+	}
 
 	push(chunk: Buffer): void {
 		if (this.mode === "head") {

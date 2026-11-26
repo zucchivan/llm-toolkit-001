@@ -15,17 +15,20 @@
  * unavailable primitive refuses the load. The gate integration asserts an
  * EFFECT count: a refused recipe file starts no command at all.
  */
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadRecipeFileSafe, loadRecipes, loadRecipesSafe, runGates } from "../src/engine/gates.ts";
-import { controlsDigest, controlsSha256, loadPlanControls, reviewBindingRefusal } from "../src/engine/plans.ts";
+import { loadRecipeFileSafe, loadRecipes, loadRecipesSafe, recipeBundleFromTree, runGates } from "../src/engine/gates.ts";
+import { controlsDigest, controlsSha256, loadPlanControls, reviewBindingRefusal, reviewedBaseTreeRefusal } from "../src/engine/plans.ts";
 import { parseConfig } from "../src/config.ts";
 import { captureBaselineTree } from "../src/util/git.ts";
 import type { ExecArgvCapability } from "../src/engine/recipe-runner.ts";
 import { bakeProject } from "./fixtures2.ts";
 import { buildFauxModels } from "./fixtures.ts";
+import { execFileSync } from "node:child_process";
+import { controlsForTree, discard, materializeRead } from "../src/engine/workspace.ts";
+import { resolveTree } from "../src/util/git-objects.ts";
 import { demoConfigToml } from "./demo-project.ts";
 
 const roots: string[] = [];
@@ -105,6 +108,37 @@ describe("review identity: every reviewed byte and effective policy setting (M1-
 		await writeFile(join(root, ".orch", "gate-remediations.json"), JSON.stringify({ version: 1, remediations: [] }), "utf8");
 		return { root, config: parseConfig(demoConfigToml(), root) };
 	}
+
+	it("uses the original reviewed objects for binding, projection and recipe loading despite replace refs", async () => {
+		const { root, config } = await reviewProject();
+		const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: root, encoding: "utf8" }).trim();
+		const recipe = '[reviewed]\nargv = ["node", "--version"]\n';
+		const recipePath = "evals/recipes.toml";
+		await writeFile(join(root, recipePath), recipe);
+		git("init", "-q");
+		git("add", "evals", "PROMPT.md", "docs");
+		git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "reviewed");
+		const baseCommit = git("rev-parse", "HEAD");
+		const tree = await resolveTree(root, baseCommit);
+		const controls = await loadPlanControls(root, { prdPath: "docs/prd.md", config });
+		const identity = {
+			planRevision: "11111111-1111-4111-8111-111111111111",
+			definitionSha256: "0".repeat(64), baseCommit, baseBranch: git("branch", "--show-current"),
+			prdPath: "docs/prd.md", prdSha256: controls.prd!.sha256, controlsSha256: controlsDigest(controls)!,
+		};
+		await writeFile(join(root, "alternate.txt"), '[different]\nargv = ["node", "--help"]\n');
+		git("replace", git("rev-parse", `HEAD:${recipePath}`), git("hash-object", "-w", "alternate.txt"));
+		expect(await reviewedBaseTreeRefusal(root, baseCommit, controls)).toBeUndefined();
+		expect(await reviewBindingRefusal(root, identity, config)).toBeUndefined();
+		const source = { root, oid: tree };
+		const projection = await materializeRead(source, await controlsForTree(source, []));
+		try {
+			expect(await readFile(join(projection.viewPath, recipePath), "utf8")).toBe(recipe);
+			expect((await recipeBundleFromTree(root, tree)).files).toContainEqual({ path: recipePath, contents: recipe });
+		} finally {
+			await discard(projection);
+		}
+	});
 
 	it("binds every evals/** regular-file byte, the actual PRD, remediations and effective settings", async () => {
 		const { root, config } = await reviewProject();

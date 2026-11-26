@@ -4,6 +4,16 @@ Manual semver discipline: keep `package.json` version and the newest section
 in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 `ui/PRD.md` Appendix A.
 
+## Unreleased — M1-P01 packet-close follow-up
+
+- Detached jobs bind the full launch through host-supplied arguments before
+  opening the log or starting the CLI.
+- Job and log routes, conflict checks and SSE use bounded no-follow reads.
+  Job-state refusals return HTTP 409 or an SSE `job-error` frame.
+- Ordinary Stop verifies the live runner and its CLI child. Attached Stop
+  requires agreement between the lock and status and rechecks the live
+  process identity before SIGINT.
+
 ## Unreleased — M1-P01 step (g): config read and the remaining read owners behind the host boundary
 
 Host-boundary change; no UI component, package or lockfile change, so no

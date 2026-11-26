@@ -572,6 +572,21 @@ describe("trusted spawn seam", () => {
 		expect(spawned).toHaveLength(before);
 	});
 
+	it("uses the resolved credential helper as a literal path with spaces and quotes", async () => {
+		const project = await tempDir("kit-te-project-");
+		const install = await tempDir("kit-te-helper-");
+		const gh = join(install, "host's gh");
+		await writeFile(gh, "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth git-credential get' ] || exit 1\nprintf 'username=fixture\\npassword=%s\\n' \"$GH_TOKEN\"\n", { mode: 0o700 });
+		const descriptor = selectInstallation({ platform: "linux", installation: { gh } });
+		const result = await runTrustedTool("git", ["credential", "fill"], {
+			targetRoot: project, timeoutMs: 5_000, installation: descriptor,
+			credentialHelper: true, gitHubToken: "fixture-token", input: "protocol=https\nhost=github.com\n\n",
+		});
+		expect(result.code).toBe(0);
+		expect(result.stdout).toContain("username=fixture\npassword=fixture-token");
+		expect(spawned).toHaveLength(1);
+	});
+
 	it("exposes the process installation only through the host-owned accessor", async () => {
 		const project = await tempDir("kit-te-project-");
 		const descriptor = selectInstallation({

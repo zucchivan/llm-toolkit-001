@@ -4,6 +4,9 @@
  * PR publication. M0-P14's serial driver calls these operations instead of
  * staging, restoring, checking out, or delivering from the operator worktree.
  */
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import type { LoopAndLock } from "./harness.ts";
 import { classifyProjectPath } from "../hygiene.ts";
 import { parseApprovedGitHubOrigin, readApprovedDeliveryOrigin } from "../sandbox/host-profile.ts";
@@ -997,18 +1000,34 @@ async function trustedGit(root: string, args: string[], timeoutMs: number): Prom
 		if (approved.origin !== origin) throw new Error("trusted Git transport requires the canonical approved GitHub origin");
 		includeCredentials = true;
 	}
-	const rewrite = await runGit(root, ["config", "--local", "--no-includes", "--get-regexp", "^url\\..*\\.(insteadOf|pushInsteadOf)$"], {
-		timeoutMs: 10_000,
-	});
-	if (rewrite.code === 0 && rewrite.stdout.trim()) throw new Error("local Git URL rewrite config is not allowed for approved-origin publication");
-	if (rewrite.signaledBy === "trusted-installation") throw new Error(rewrite.stderr.trim());
-	if (rewrite.code !== 1 && rewrite.code !== 0) throw new Error(`cannot inspect local Git URL rewrite config: ${rewrite.stderr.trim().slice(0, 300)}`);
-	const result = await runGit(root, args, {
-		timeoutMs,
-		...(includeCredentials ? { credentialHelper: true, ...(hostGitHubToken() !== undefined ? { gitHubToken: hostGitHubToken()! } : {}) } : {}),
-	});
-	if (result.timedOut || result.stdoutCapped || result.stderrCapped) throw new Error("trusted Git remote operation timed out or exceeded output limits");
-	return result;
+	// Transport must never load the source repository's local, included or
+	// worktree config. Each invocation gets a fresh bare Git directory. A push
+	// can read the source object database through an alternate, without importing
+	// its refs or configuration.
+	if (!includeCredentials && !isAbsolute(origin)) throw new Error("trusted Git transport requires an absolute fixture path or approved HTTPS origin");
+	const transport = await mkdtemp(join(tmpdir(), "kit-pr-transport-"));
+	try {
+		const init = await runGit(root, ["init", "--bare", "--template=", transport], { timeoutMs: 10_000 });
+		if (init.code !== 0) throw new Error(`cannot initialize isolated Git transport: ${init.stderr.trim()}`);
+		if (args[0] === "push") {
+			const objects = await runGit(root, ["rev-parse", "--path-format=absolute", "--git-path", "objects"], { timeoutMs: 10_000 });
+			const path = objects.stdout.replace(/\n$/, "");
+			if (objects.code !== 0 || !isAbsolute(path) || /[\r\n\0]/.test(path) || objects.stdoutCapped) {
+				throw new Error("cannot identify the source Git object store for publication");
+			}
+			await writeFile(join(transport, "objects", "info", "alternates"), path + "\n", { flag: "wx" });
+		}
+		const token = includeCredentials ? hostGitHubToken() : undefined;
+		const result = await runGit(root, [`--git-dir=${transport}`, "-c", "http.followRedirects=false", ...args], {
+			timeoutMs,
+			...(includeCredentials ? { credentialHelper: true } : {}),
+			...(token !== undefined ? { gitHubToken: token } : {}),
+		});
+		if (result.timedOut || result.stdoutCapped || result.stderrCapped) throw new Error("trusted Git remote operation timed out or exceeded output limits");
+		return result;
+	} finally {
+		await rm(transport, { recursive: true, force: true });
+	}
 }
 
 /**

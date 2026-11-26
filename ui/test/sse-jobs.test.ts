@@ -72,6 +72,7 @@ describe("sse job events", () => {
 		// a foreign live run: a real sleeper pid owning .orch/lock, no job record
 		const sleeper = spawnSleeper(9);
 		try {
+			await writeFile(join(baked.root, ".orch", "lock"), `${sleeper.pid}\n`);
 			const statusPath = join(baked.root, ".orch", "status.json");
 			try {
 				await readFile(statusPath, "utf8");
@@ -200,6 +201,46 @@ describe("M1-P01 step (g): a hostile .orch read is refused on the SSE snapshot f
 		}
 	}, 30_000);
 });
+
+it("SSE refuses a failed job's redirected log without emitting outside bytes", async () => {
+	const baked = await bake({ skipJobSweep: true, heartbeatMs: 250 });
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 5_000);
+	try {
+		const dir = join(baked.root, ".orch", "ui", "jobs");
+		await mkdir(dir, { recursive: true });
+		const logPath = join(dir, "refused.log");
+		const outside = join(baked.stubDir, "outside.log");
+		await writeFile(outside, "OUTSIDE-LOG-SENTINEL\n");
+		await writeFile(join(dir, "refused.json"), JSON.stringify({
+			id: "refused", kind: "plan", cwd: baked.root, startedAt: Date.now(), status: "failed",
+			argv: ["fixture"], exitCode: 1, logPath,
+		}));
+		await symlink(outside, logPath);
+		const events = await fetch(`${baked.base}/api/events`, {
+			headers: { cookie: baked.cookie }, signal: controller.signal,
+		});
+		const reader = events.body!.getReader();
+		const decoder = new TextDecoder();
+		let frames = "";
+		try {
+			while (!/event: job(?:-error)?\ndata: .*\n\n/.test(frames)) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				frames += decoder.decode(value, { stream: true });
+			}
+		} finally {
+			await reader.cancel();
+		}
+		expect(frames).not.toContain("OUTSIDE-LOG-SENTINEL");
+		expect(frames).toContain("event: job-error");
+		expect(frames).toContain("symbolic link");
+		expect(frames).not.toContain("event: job\n");
+	} finally {
+		clearTimeout(timer);
+		await cleanup(baked);
+	}
+}, 10_000);
 
 describe("M1-P01 step (g): a hostile status.json refuses the snapshot, never its extras", () => {
 	it("reports the typed refusal instead of the link target's sleep/prdPath fields", async () => {

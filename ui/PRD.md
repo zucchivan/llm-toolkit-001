@@ -196,14 +196,12 @@ system, with NO seam change: `.orch/status.json` already carries
 `lockedByPid`, and `/proc` carries the rest. ALL of the following must pass;
 every failure answers with its plain-words reason and sends NO signal:
 
-1. **Holder truth** — a FRESH `.orch/status.json` read names `lockedByPid`
-   pid N, and N is alive (`kill(pid, 0)`, the signal-0 probe; a
-   `/proc/<pid>` existence probe where `/proc` exists). N is neither this UI
-   server's own pid (a brief readout window can flash there) nor a pid a
-   running UI job record claims (that is the ordinary Stop).
-2. **Platform** — `/proc` exists (Linux). macOS variant B — the runner
-   recording `{pid, argv, startedAt}` into `status.json` — is deferred
-   (§18); without `/proc` the deeper checks refuse (501) and the UI says so.
+1. **Holder truth** — fresh, capped no-follow reads of `.orch/lock` and
+   `.orch/status.json` agree on pid N, and Linux `/proc` confirms N is alive.
+   A refused read, a mismatch, this server's own readout window, or a pid a
+   running UI job record claims blocks attached Stop.
+2. **Platform** — Linux `/proc` is required (501 when unavailable).
+   macOS variant B is deferred (§18).
 3. **Working directory** — `/proc/<pid>/cwd` realpath equals the project
    root. Failure text: "pid N is alive but its working directory is X, not
    this project".
@@ -218,7 +216,7 @@ every failure answers with its plain-words reason and sends NO signal:
    argv is ignored.
 5. **One re-verified signal** — immediately before signalling, the full check
    re-runs (the run may have exited, or the holder may have changed between
-   the browser's confirmation and now); then exactly one `SIGINT` is sent —
+   the browser's confirmation and now); the process start identity must still match, then exactly one `SIGINT` is sent —
    the kit's SIGINT clean-close path (exit 130, resumable). SIGTERM and
    SIGKILL are never sent. A check that fails on the second round answers
    "… nothing was signalled".
@@ -237,8 +235,9 @@ authoritative gate.
 - **Attach:** discover a live run from `.orch/status.json` (`lockedByPid`) and
   the wave log; display it identically to a UI-launched run, except for the
   "attached" badge; Stop follows the §7.2.1 verification.
-- **Reattach:** on UI server start, scan job records; a job whose PID is alive
-  is `running`, otherwise `stale` with its last exit code if recorded.
+- **Reattach:** on UI server start, scan job records for liveness and retain stale history. Ordinary Stop
+  verifies the matching detached runner and its CLI child in `/proc`, including
+  their relationship, working directory, executable, argv and start identity.
 - **Sleep:** exit code 42 is surfaced as a distinct `sleeping` state with
   `sleepUntil` countdown when available, and a "Resume" action (= bare `run`:
   it resumes the stored grant exactly; no new approval is ever sent).
@@ -1024,7 +1023,7 @@ it does not claim that hardening is already shipped.
 | Receipt-based badges | **SHIPPED (M0-P15, ui 0.13.0):** review, checks, workspace-recovery, and publication render as four separate labels from the receipt projection (core-shared `receiptLabels()` derivation; the CLI views render the same words). Each label keeps not-requested/pending/unknown/no-receipt states; quarantined does not imply discarded/rolled back; review approval does not imply delivered. |
 | Checkpoint diff, not working-copy diff | **SHIPPED (M0-P15, ui 0.13.0):** the UI's live view reads the requested revision/task/wave's frozen tree-to-tree checkpoint and returns a stated 409 before one exists; the freeze timestamp labels the view. Operator-checkout edits are not task changes. |
 | Cache metrics with uncertainty | M2-P03 establishes the usage valuation/ledger and M2-P04 activates status/inspect/UI metrics. Uncached input, reads, writes, ratios, source, freshness, and comparable estimated savings must preserve unknown/partial values; no guaranteed cache hit or cash saving is claimed. |
-| Trusted launcher resolution | **SHIPPED (M1-P01 step (f)):** the UI/CLI launch and attached-stop use ONE host-owned descriptor/argv identity (`[node, entry]`, or the documented dev-in-kit `[node, ui tsx loader, src/cli.ts]` form) selected and validated from the operator-selected installation; target-local `.bin`, cwd/PATH and `KIT_UI_CLI_BIN` can no longer select the CLI, job records persist the identity the detached runner revalidates before spawning, and attached-stop verifies `/proc` `exe`/argv against that same prefix. Explicit absolute overrides belong only to the non-project host profile. No sandbox execution, package export, v2 DTO or UI state-writing authority is added by this amendment. **M4-P04** later locates that trusted CLI through installed package metadata and must preserve the M1 trust boundary. |
+| Trusted launcher resolution | **SHIPPED (M1-P01 step (f)):** the UI/CLI launch and attached-stop use ONE host-owned descriptor/argv identity (`[node, entry]`, or the documented dev-in-kit `[node, ui tsx loader, src/cli.ts]` form) selected and validated from the operator-selected installation; target-local `.bin`, cwd/PATH and `KIT_UI_CLI_BIN` can no longer select the CLI, the server passes a binding of the full launch independently of the job record and the detached runner revalidates it before spawning, and attached-stop verifies `/proc` `exe`/argv against that same prefix. Explicit absolute overrides belong only to the non-project host profile. No sandbox execution, package export, v2 DTO or UI state-writing authority is added by this amendment. **M4-P04** later locates that trusted CLI through installed package metadata and must preserve the M1 trust boundary. |
 
 **Reserved for a separate M4 amendment:** live-plan/sequence side-car facts,
 `seam: 2` and nullable read DTOs, the packaged read-only entry point, and
@@ -1040,25 +1039,27 @@ resolution/delivery command.
 
 ## Appendix B — Detached job runner
 
-## Appendix B — Detached job runner
-
 - Job record: `.orch/ui/jobs/<id>.json`
   `{ id, kind, argv, identity, cwd, pid, startedAt, endedAt?, exitCode?,
   status: "running" | "exited" | "failed" | "stale", logPath }`. `identity` is
   the host-owned launch identity recorded at spawn (M1-P01 step (f)):
   `{version, tool, installationRoot, node, entry, loader?, form, argvPrefix,
-  source, descriptorSha256}`; the runner refuses a record whose `argv` does not
-  start with exactly that prefix, whose files changed into symlinks/
-  writable/foreign paths, or whose installation root is not its own — before
-  spawning anything.
-- Log: `.orch/ui/jobs/<id>.log` (stdout + stderr, line-buffered).
-- Spawn a small Node runner detached (no shell), which spawns the CLI, pipes
-  its output to the log, writes the exit code atomically, then exits. The UI
-  server is not in the child's process group and can restart independently.
-- On server start: mark records with dead PIDs as `stale`; keep records for
-  history (bounded, e.g. last 50 or 14 days).
-- Attached runs are discovered from `status.json.lockedByPid`; liveness is a
-  best-effort PID check. They are not job records unless launched by the UI.
+  source, descriptorSha256}`. The host supplies the project path, job ID
+  and an independent digest of the immutable record fields to the detached
+  runner. The runner pins the job directory, checks the binding and
+  revalidates the selected installation paths before opening the log or
+  spawning. It writes lifecycle updates from its verified in-memory record.
+- Log: `.orch/ui/jobs/<id>.log`. The detached runner creates it exclusively
+  and gives the CLI the opened descriptor for stdout and stderr. The runner
+  survives server shutdown and writes the exit result atomically.
+- Job observation uses capped no-follow reads. The filename fixes the job ID
+  and log location. Log tails read at most 256 KiB and return whole lines.
+  HTTP job/log reads return 409 on refusal. SSE reports a refused job-state
+  observation as a `job-error` frame.
+- On server start, records whose observed process is dead become `stale`.
+  The newest 50 records or 14 days of history are retained, excluding active
+  records from pruning. Attached runs are discovered using the agreeing
+  lock and status PID, then verified independently for Stop.
 - Env is inherited from the UI server (including `KIT_FAUX*`, provider keys)
   MINUS executable selectors: `KIT_UI_CLI_BIN`, undocumented `KIT_*` names,
   `NODE_OPTIONS`/`NODE_PATH`, `LD_*`/`DYLD_*` loader variables and
