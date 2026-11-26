@@ -134,6 +134,48 @@ No latency figures here are measured. Measure cold **and** warm, preparation/tra
 
 In the local tier use separate namespaces + drop capabilities, no-new-privileges, private tmp/home, isolated PID tree/minimal devices and guest-only proc. MicroVM/remote equivalents enforce by guest mount policy and non-root workload. Freeze only after **all** writers are fenced; host never traverses a live, mutable guest symlink. For v1 reject projected symlinks, hard-linked regular files, devices, FIFOs, gitlinks, unsafe/case-colliding names and paths leaving the root rather than trying to follow them; trusted toolchain links stay inside the image. Reject `..`, NUL, absolute/drive/UNC and reserved components at untrusted interfaces. No “realpath followed by open” security argument under concurrent writes. Host static readers use immutable Git objects or no-follow component walks on trusted/fenced directories, including UI source/artifact paths. On a platform unable to provide this guarantee, refuse the operation. Validate limits before allocation/import (100k entries, 32 MiB/file, 512 MiB admitted content; excess is a diagnostic, not a truncated success). Mount control files read-only with non-replaceable parents or enforce equivalent guest VFS; a missing/unsafe mount fails preflight.
 
+### P03 local helper and result contract (approved 2026-11-26)
+
+P03 owns a standalone kit helper entrypoint, installed outside the target and
+selected explicitly through P01's existing `installation.helper` descriptor
+and per-use validator. bwrap uses `installation.bwrap` through the same resolver.
+Neither has a fallback/default; P01's installation ownership/mode rules and
+CLI/UI-only dev-in-kit exception are unchanged. The selected helper and its
+runtime dependency closure must match the reviewed toolchain inventory.
+
+The fixed guest argv is `/opt/kit/bin/node /opt/kit/helper/main.js --protocol=1
+--lease-id=<host-UUID> --role=<host-role> --cwd=/work`, with literal tokens and
+no shell or unknown flags. Helper stdin/stdout are bounded P02 RPC only;
+workload stdio is separately piped and framed, helper stderr is bounded
+diagnostics, and control FDs are never inherited by workload children. Other
+inherited FDs are closed. Launch begins with durable intent, exact UUID cgroup
+creation/identity, durable launching, and a proven trusted placement gate before
+bwrap/helper can enable project execution. Namespace/resource checks and a
+matching host-bound handshake precede project operations. A runnable project
+process followed by PID placement is insufficient. Owner loss prevents admission
+or triggers fencing; persisted/guest claims never replace host observations.
+
+For local results the host scans only after killing the exact lease cgroup and
+observing `populated 0`, with reattachment and other workspace writers excluded.
+Use descriptor-relative no-follow traversal and enforce §2 bounds during scans
+and reads. Construct the complete final projected inventory and derive the full
+delta, including deletions and executable modes, against the known projection.
+Hidden inputs are not deletions; only explicit scratch is excluded; protected,
+out-of-scope and inadmissible ignored output changes refuse before filtering.
+Guest manifest/receipt/fence claims are data, not authority.
+
+Host-only durable staging binds retained validated bytes and canonical digest
+to lease, base tree, controls and projection policy before import intent.
+`SandboxLease.seal()` is host-governed fencing, scanning and durable sealing;
+it cannot accept a guest's seal assertion. Import builds a private result and
+exposes it through one atomic result reference/receipt transition. No arbitrary
+tar extraction, partial visible import or operator checkout mutation. Reopen
+re-establishes exact ownership/fencing before any rescan, revalidates retained
+sealed content, and reconciles only the recorded destination/result identity.
+Missing receipts never prove rollback; ambiguity/conflict blocks dependent work.
+P03 must prove its concrete placement and atomic visibility mechanisms before
+wiring them. This contract does not authorize P04/P05 cutover or certify a host.
+
 ### Environment and credential permissions
 
 | Class | Host use | In worker, gate, probe or file helper |
@@ -269,6 +311,39 @@ host boundaries only; gate/probe containment and `[sandbox]` enforcement remain
 P05.
 
 **Host policy**, not repo config: path `~/.config/llm-toolkit-001/host-v1.json` (Windows `%LOCALAPPDATA%/llm-toolkit-001/host-v1.json`), user-owned, non-project, refuse insecure permissions/reparse points. Schema `{version:1,installation?:{cli?:string,ui?:string,node?:string,git?:string,gh?:string,helper?:string,bwrap?:string},projects:[{root:absoluteCanonical, backends:("local"|"microvm"|"remote")[],toolchainId:string,publicValues:Record<string,string>,remoteProject?:string,deliveryOrigin?:string,otlpLoopback?:boolean}],toolchains:Record<string,{rootfs?:absoluteImmutablePath,manifestSha256:string,gondolinImage?:absoluteImmutablePath,daytonaSnapshot?:string,deps?:absoluteImmutablePath}>}`. Exact canonical root match, one entry, immutable image/deps validated against host manifest (manifest lists digests, platform, Node version and dependency lockfile digests); reject missing tier fields. One provisioned local default toolchain can be registered under `toolchains.default` for local, no-extra-env, no-network, no-upload projects without entries. No implicit remote use. Remote requires host allow + `--allow-remote` on **each** CLI invocation that might transfer bytes (`plan`, `run`, `verify`, executing `gates probe`, accepting `resolve`); UI does not add it. `deliveryOrigin` is operator-allowlisted HTTPS GitHub repository URL for PRs (no custom git transport or target-controlled gh host). OTLP export requires a separate foreground `telemetry export [--follow]`, local collection already enabled, and host `otlpLoopback:true`; fixed `http://127.0.0.1:4318/v1/traces`, no redirects, user-supplied headers, auth, or arbitrary network endpoint. Operators configure onward export in their collector.
+
+### P03 local toolchain inventory (approved 2026-11-26)
+
+The existing `toolchains.*.manifestSha256` anchors an operator-reviewed exact
+inventory; it is not a guest-supplied checksum or permission to discover tools.
+No host-profile field or second executable resolver is added. P03 must define a
+versioned canonical encoding (stable ordering, paths, lengths, modes and SHA256
+semantics) covering OS/architecture/ABI, exact guest Node version and executable,
+loader/libraries, fixed helper/protocol identity and all transitive installed
+imports, shell/utilities, prebuilt dependencies and their lockfile digests.
+Distinguish installed input provenance from the resulting rootfs content
+inventory/digest without a self-referential manifest hash. Define deterministic
+content metadata and verify the complete rootfs/dependency identity before use.
+
+The fixture pin record is `sandbox/local/fixture-assets.lock.json`; populate it
+with actual measured/reviewed assets only. The builder consumes an explicitly
+selected trusted installed copy plus absolute asset locations. A target copy,
+PATH/cwd lookup, project config, inherited env or `KIT_*` cannot select or alter
+assets/pins. Run offline, with fixed trusted subprocess invocations and an
+explicit environment, no project scripts or install hooks. Copy through safe
+reads into private staging, verify the staged bytes rather than hash-then-reopen
+mutable paths, and accept a fixture only after complete validation. Failed or
+interrupted builds never produce an admissible incomplete fixture. Identical
+admitted inputs must reproduce the defined rootfs content identity.
+
+Guest Node need not equal P01's selected host interpreter. `engines.node` remains
+a host compatibility range. The observed v24.18.0 is a candidate only: choose and
+review an exact version and real digest inventory before provisioning. Document
+whether provenance is operator-approved installed assets alone or additionally
+verified vendor release material; a local hash alone does not establish vendor
+authenticity. Missing/version/platform/ABI/digest/lock mismatch refuses without
+network or alternate-source fallback. Pin enrollment and required primitive
+proofs remain prerequisites, not certification supplied by this amendment.
 
 ### Host-owned types (binding shapes; split modules by packet)
 
