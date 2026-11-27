@@ -151,7 +151,8 @@ three zero bytes, and little-endian 64-bit cgroup device and inode numbers.
 The host creates, binds and durably records the gate once per lease. Both
 launch and fence use a process-associated kernel lock on the same gate inode.
 The launcher checks the cgroup identity and filesystem, consumes the gate
-durably, proves the exact lease cgroup is empty with a working kill control,
+durably, checks that the exact lease cgroup is an empty domain with a writable
+kill control,
 checks controller/status liveness, then performs
 `clone3(CLONE_INTO_CGROUP)` under the lock. A cgroup cannot be rearmed or
 substituted on recovery. Bubblewrap is the immediate child, receives a clean
@@ -182,6 +183,9 @@ launcher revokes permission under the same lock before issuing
 operation returns success only after revocation and empty observation. A
 failure with uncertain state must remain recovery-required. The future
 adapter independently verifies the fence before scanning or import.
+Keep the fresh cgroup free of kill writes before launch. On affected Linux
+kernels a pre-launch write advances its kill sequence and can kill the first
+clone. See the [upstream kernel fix](https://kernel.googlesource.com/pub/scm/linux/kernel/git/tip/tip/+/8e359920216689b3b79e0fe8961a77fe312a511f).
 
 For S2 native tests, the ordinary locked Cargo run checks ABI refusal. An
 explicit lane passes the path to a stable, already delegated cgroup-v2 parent
@@ -192,8 +196,8 @@ Bubblewrap/guest conformance lane. Use the native test executable printed by
 the successful build and supply the approved delegation explicitly.
 
 ```bash
-test_dir="$stage/build/tests/target/x86_64-unknown-linux-gnu/debug/deps"
-mapfile -d '' native_tests < <(find "$test_dir" -maxdepth 1 -type f -executable -name 'launcher-*' -print0)
+test_dir="$stage/build/tests/target/x86_64-unknown-linux-gnu/debug"
+mapfile -d '' native_tests < <(find "$test_dir" -type f -executable -name 'launcher-*' -print0)
 test "${#native_tests[@]}" -eq 1
 KIT_S2_REAL_CGROUP_PARENT='/sys/fs/cgroup/<approved-delegated-parent>' \
     "${native_tests[0]}" --ignored --test-threads=1
@@ -232,7 +236,7 @@ Authoritative strict paths/acceptance are in
 | Slice | Work | Current state |
 | --- | --- | --- |
 | S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Implemented** with Node tooling; no Rust/asset prerequisite |
-| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Native source, build script and canaries present. See P03 evidence for real-lane results. |
+| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Locked build and real native canaries passed on the development host. [Evidence](../../docs/engineering-plan/evidence/M1-P03.md#s2-native-verification-2026-11-27). |
 | S3 | Bundle format/provenance/approval/install separation and offline fixture | Approved design; exact pins/assets not enrolled |
 | S4 | Full scan/writer exclusion/durable seal/private candidate-ref recovery | Pure inventory/delta preparation only |
 | S5 | local.ts public lease wiring, in-namespace checks and real conformance | Not implemented; not certified |
