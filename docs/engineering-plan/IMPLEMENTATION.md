@@ -150,8 +150,8 @@ test lane exercised the same binary bytes. [Current S2 evidence](evidence/M1-P03
 
 S3 increment 1 defines the versioned bundle format and offline validator.
 Increment 2 prepares caller-materialized bundle observations in private staging.
-S3 still owns exact inputs, bounded archive intake, setup and enrollment, and
-the offline fixture.
+Increment 3 adds bounded offline ustar intake through the preparation script.
+S3 still owns exact inputs, installation and enrollment, and the offline fixture.
 S4 owns full scan, seal and private-ref recovery. S5 wires the production adapter
 and runs the full Bubblewrap/guest conformance lane. Each remains bounded by M1.md
 P03. Packet closure still requires real conformance and reviewer acceptance.

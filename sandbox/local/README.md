@@ -3,9 +3,9 @@
 **Approved product design; not yet a shipped/certified backend.** The current
 loop still executes project tools/gates/probes on the host. Use trusted projects
 and fixtures only. The S2 native source and offline build script are present.
-The bundle format, offline validator and private preparation of supplied file
-observations are available. Archive intake, asset setup, the fixture builder and
-the production adapter are later work.
+The bundle format, offline validator and private preparation of caller-supplied
+offline archives are available. Asset setup, the fixture builder and the
+production adapter are later work.
 The local adapter stays non-default until M1-P05.
 
 ## Approved choices (2026-11-26)
@@ -47,14 +47,21 @@ Existing `toolchains.*.manifestSha256` anchors the canonical manifest bytes.
 Exact compiler and Node versions, artifact hashes, vendor authenticity and the
 dependency closure still require independent review.
 
-Planned `provision-toolchain.sh` will separate preparation from approved host
-installation. Explicit operator setup may acquire named assets only from reviewed
-sources with independent authenticity checks, or accept an offline supplied bundle.
-Safe bounded archive/path/type/size handling and complete private staging must
-precede installation; never execute unverified content, project hooks or curl-
-pipe-shell. No inherited credential/env selection or unreviewed redirect authority.
-The preparation API accepts a bounded materialized inventory. An archive intake
-adapter and the setup script remain pending.
+From a trusted kit checkout, run the preparation script with the operator's
+explicit version and reviewed manifest digest. Pass an absolute path to a
+trusted Node.js executable meeting the kit's minimum version. Open the archive
+from an operator-selected location as standard input.
+
+```bash
+./sandbox/local/provision-toolchain.sh "$trusted_node" "$bundle_version" "$reviewed_manifest_sha256" < "$offline_archive"
+```
+
+See the [offline ustar format](bundle-format.md#offline-ustar-archive) for the
+supported archive and input descriptor contract. On success the script emits a
+single JSON record containing the private stage directory and reviewed
+selection. The caller owns disposal of that directory. Preparation uses no
+elevated privileges. Independent authenticity review and approved installation
+remain separate phases under D1.
 
 Planned `make-fixture-rootfs.sh` consumes explicitly selected trusted installed
 inputs and stays offline. Worker launch, recovery and ordinary project runs may
@@ -240,7 +247,7 @@ Authoritative strict paths/acceptance are in
 | --- | --- | --- |
 | S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Implemented** with Node tooling; no Rust/asset prerequisite |
 | S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Locked build and six real native canaries passed on the development host. [Evidence](../../docs/engineering-plan/evidence/M1-P03.md#s2-merge-review-verification-2026-11-27). |
-| S3 | Bundle format/provenance/approval/install separation and offline fixture | Schema 1 and pure validator implemented. Exact pins, setup, enrollment and fixture remain pending. |
+| S3 | Bundle format/provenance/approval/install separation and offline fixture | Schema 1, offline validator and bounded archive preparation implemented. Exact pins, installation, enrollment and fixture remain pending. |
 | S4 | Full scan/writer exclusion/durable seal/private candidate-ref recovery | Pure inventory/delta preparation only |
 | S5 | local.ts public lease wiring, in-namespace checks and real conformance | Not implemented; not certified |
 

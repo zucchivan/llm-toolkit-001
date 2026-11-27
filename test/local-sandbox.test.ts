@@ -1,11 +1,14 @@
+import { spawnSync } from "node:child_process";
+import archiveFs from "node:fs";
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, writeFile, rm, utimes } from "node:fs/promises";
 import stagingFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { LeaseLifecycle, type CgroupOps } from "../src/sandbox/lease-lifecycle.ts";
-import { prepareLocalBundle, sealedManifestDigest, validateSealedManifest, validateManifestDelta, validateLocalBundle } from "../src/sandbox/manifest.ts";
+import { prepareLocalBundle, prepareLocalBundleArchive, sealedManifestDigest, validateSealedManifest, validateManifestDelta, validateLocalBundle } from "../src/sandbox/manifest.ts";
 import { createTaskControls } from "../src/engine/controls.ts";
 import { createGuestStdioStream, parseGuestHelperArgs } from "../src/sandbox/guest-helper-main.ts";
 import { PassThrough } from "node:stream";
@@ -642,5 +645,326 @@ describe("offline local bundle preparation", () => {
 			open.mockRestore();
 			if (directory) await rm(directory, { recursive: true, force: true });
 		}
+	});
+});
+
+const TAR_BLOCK = 512;
+
+function tarHeader(path: string, size: number, mode = 0o644, type = "0") {
+	const header = Buffer.alloc(TAR_BLOCK);
+	const octal = (value: number, offset: number, width: number) =>
+		header.write(value.toString(8).padStart(width - 1, "0") + "\0", offset, width, "ascii");
+	const split = path.length > 100 ? path.lastIndexOf("/") : -1;
+	if (split !== -1) header.write(path.slice(0, split), 345, 155, "latin1");
+	header.write(path.slice(split + 1), 0, 100, "latin1");
+	octal(mode, 100, 8);
+	octal(0, 108, 8);
+	octal(0, 116, 8);
+	octal(size, 124, 12);
+	octal(0, 136, 12);
+	header.write(type, 156, 1, "ascii");
+	header.write("ustar\0" + "00", 257, 8, "ascii");
+	tarChecksum(header);
+	return header;
+}
+
+function tarChecksum(header: Buffer) {
+	header.fill(0x20, 148, 156);
+	const checksum = header.reduce((sum, byte) => sum + byte, 0);
+	header.write(checksum.toString(8).padStart(6, "0") + "\0 ", 148, 8, "ascii");
+}
+
+function tarEntry(path: string, bytes: Buffer, mode = 0o644) {
+	return Buffer.concat([tarHeader(path, bytes.length, mode), bytes,
+		Buffer.alloc((TAR_BLOCK - bytes.length % TAR_BLOCK) % TAR_BLOCK)]);
+}
+
+function archiveBundle() {
+	const { manifest, assets } = testBundle();
+	const bytes = bundleBytes(manifest);
+	const selection = { bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(bytes) };
+	const manifestEntry = tarEntry("manifest.json", bytes);
+	const payloads = assets.map(({ path, bytes, mode }) => tarEntry(path, bytes, mode));
+	return { bytes, selection, manifestEntry, assets, payloads };
+}
+
+function tarArchive(...entries: Buffer[]) {
+	return Buffer.concat([...entries, Buffer.alloc(2 * TAR_BLOCK)]);
+}
+
+async function withArchive(bytes: Buffer, run: (fd: number, directory: string) => Promise<void>) {
+	const directory = await mkdtemp(join(tmpdir(), "kit-test-archive-"));
+	try {
+		const path = join(directory, "bundle.tar");
+		await writeFile(path, bytes);
+		const archive = await open(path, "r");
+		try {
+			await run(archive.fd, directory);
+		} finally {
+			await archive.close();
+		}
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+}
+
+describe("offline local bundle archive", () => {
+	async function refuse(archive: Buffer, reason: RegExp, selection = archiveBundle().selection) {
+		await withArchive(archive, async (fd, directory) => {
+			const stage = vi.spyOn(stagingFs, "mkdtemp");
+			try {
+				await expect(prepareLocalBundleArchive(fd, selection)).rejects.toThrow(reason);
+				expect(stage).not.toHaveBeenCalled();
+				expect(await stagingFs.readdir(directory)).toEqual(["bundle.tar"]);
+				expect(await readFile(join(directory, "bundle.tar"))).toEqual(archive);
+			} finally {
+				stage.mockRestore();
+			}
+		});
+	}
+
+	it.each(["../outside", "/outside", "guest//x", "guest/./x", "guest/.Git/x", "guest/x/", "guest/\\x"])(
+		"refuses unsafe paths before staging (%s)", async (path) => {
+			await refuse(tarArchive(tarHeader(path, 0)), /unsafe path/);
+		},
+	);
+
+	it.each([
+		["guest/bin/x", "guest/bin/x"],
+		["guest/bin/x", "guest/bin/X"],
+		["guest/Bin/x", "guest/bin/y"],
+		["guest/bin", "guest/bin/x"],
+		["guest/bin/x", "guest/bin"],
+		["manifest.json", "manifest.json"],
+	])("refuses colliding or duplicate paths (%s, %s)", async (first, second) => {
+		await refuse(tarArchive(tarHeader(first, 0), tarHeader(second, 0)), /duplicate or colliding/);
+	});
+
+	it.each(["1", "2", "3", "4", "5", "6", "7", "x", "g", "L", "S"])(
+		"refuses unsupported archive entry type %s", async (kind) => {
+			await refuse(tarArchive(tarHeader("guest/file", 0, 0o644, kind)), /entry type or link/);
+		},
+	);
+
+	it("refuses hidden link data, special modes and invalid header encodings", async () => {
+		const link = tarHeader("guest/file", 0);
+		link.write("outside", 157);
+		tarChecksum(link);
+		const numeric = tarHeader("guest/file", 0);
+		numeric[124] = 0x80;
+		tarChecksum(numeric);
+		const text = tarHeader("guest/file", 0);
+		text[20] = 0xff;
+		tarChecksum(text);
+		const checksum = tarHeader("guest/file", 0);
+		checksum[0] = 0xff;
+		for (const [header, reason] of [
+			[link, /entry type or link/],
+			[tarHeader("guest/file", 0, 0o4755), /file mode/],
+			[numeric, /numeric field/],
+			[text, /text field/],
+			[checksum, /checksum/],
+			[Buffer.alloc(TAR_BLOCK, 1), /ustar header/],
+		] as const) await refuse(tarArchive(header), reason);
+	});
+
+	it("refuses truncated bodies, incomplete terminators, nonzero padding and trailing data", async () => {
+		const body = tarEntry("guest/file", Buffer.from("data"));
+		const complete = tarArchive(body);
+		const badPadding = Buffer.from(complete);
+		badPadding[TAR_BLOCK + 4] = 1;
+		for (const [archive, reason] of [
+			[complete.subarray(0, -1), /archive length/],
+			[tarArchive(tarHeader("guest/file", 1024)), /truncated/],
+			[complete.subarray(0, -TAR_BLOCK), /truncated/],
+			[badPadding, /padding/],
+			[Buffer.concat([complete, Buffer.alloc(TAR_BLOCK)]), /trailing data/],
+			[Buffer.concat([complete.subarray(0, -TAR_BLOCK), Buffer.alloc(TAR_BLOCK, 1)]), /terminator/],
+		] as const) await refuse(archive, reason);
+	});
+
+	it("checks archive, entry, manifest and file caps before materializing payloads", async () => {
+		await refuse(tarArchive(tarHeader("manifest.json", 4 * 1024 ** 2 + 1)), /manifest size limit/);
+		await refuse(tarArchive(tarHeader("guest/file", 256 * 1024 ** 2 + 1)), /file size limit/);
+		const entries = Array.from({ length: 16_385 }, (_, index) => tarHeader("guest/file-" + index, 0));
+		await refuse(tarArchive(...entries), /entry limit/);
+		const fanout = Array.from({ length: 16_384 }, (_, index) => tarHeader(`guest/a${index}/b/c/d/file`, 0));
+		await refuse(tarArchive(...fanout), /path count exceeds/);
+	}, 15_000);
+
+	it("refuses sparse archives that overflow aggregate or raw archive bytes", async () => {
+		await withArchive(Buffer.alloc(0), async (fd, directory) => {
+			const stage = vi.spyOn(stagingFs, "mkdtemp");
+			const read = vi.spyOn(archiveFs, "read");
+			const file = await open(join(directory, "bundle.tar"), "r+");
+			try {
+				const maxFile = 256 * 1024 ** 2;
+				for (let i = 0; i < 9; i++) {
+					await file.write(tarHeader("guest/file-" + i, i === 8 ? 1 : maxFile), 0, TAR_BLOCK, i * (maxFile + TAR_BLOCK));
+				}
+				await file.truncate(2 * 1024 ** 3 + 12 * TAR_BLOCK);
+				await expect(prepareLocalBundleArchive(fd, archiveBundle().selection)).rejects.toThrow(/total size limit/);
+				expect(read).toHaveBeenCalledTimes(9);
+				read.mockClear();
+				await file.truncate(3 * 1024 ** 3);
+				await expect(prepareLocalBundleArchive(fd, archiveBundle().selection)).rejects.toThrow(/archive byte limit/);
+				expect(read).not.toHaveBeenCalled();
+				expect(stage).not.toHaveBeenCalled();
+			} finally {
+				await file.close();
+				read.mockRestore();
+				stage.mockRestore();
+			}
+		});
+	});
+
+	it("requires every pinned payload and refuses substituted bytes and selection", async () => {
+		const { manifestEntry, payloads, selection, assets } = archiveBundle();
+		const good = tarArchive(manifestEntry, ...payloads);
+		await refuse(tarArchive(...payloads), /missing manifest/);
+		await refuse(tarArchive(manifestEntry, ...payloads.slice(1)), /inventory count/);
+		await refuse(tarArchive(manifestEntry, ...payloads, tarHeader("guest/extra", 0)), /inventory count/);
+		const first = assets[0]!;
+		await refuse(tarArchive(manifestEntry, tarEntry("guest/other", first.bytes, first.mode), ...payloads.slice(1)), /unexpected/);
+		await refuse(tarArchive(manifestEntry, tarEntry(first.path, first.bytes), ...payloads.slice(1)), /file mode/);
+		await refuse(tarArchive(manifestEntry, tarEntry(first.path, Buffer.alloc(0), first.mode), ...payloads.slice(1)), /file size/);
+		const substitute = tarEntry(first.path, Buffer.alloc(first.bytes.length), first.mode);
+		await refuse(tarArchive(manifestEntry, substitute, ...payloads.slice(1)), /file SHA-256/);
+		await refuse(good, /explicit selection/, { ...selection, bundleVersion: "0.0.2" });
+		await refuse(good, /manifestSha256/, { ...selection, manifestSha256: "0".repeat(64) });
+	});
+
+	it("interrupts a real archive read before preparing or writing", async () => {
+		const { manifestEntry, payloads, selection } = archiveBundle();
+		await withArchive(tarArchive(manifestEntry, ...payloads), async (fd, directory) => {
+			const cancel = new AbortController();
+			const reason = new Error("synthetic archive intake interruption");
+			const original = archiveFs.read;
+			const read = vi.spyOn(archiveFs, "read").mockImplementation((descriptor, buffer, offset, size, position, callback) =>
+				original(descriptor, buffer, offset, size, position, (error, count, bytes) => {
+					cancel.abort(reason);
+					callback(error, count, bytes);
+				}),
+			);
+			const stage = vi.spyOn(stagingFs, "mkdtemp");
+			try {
+				await expect(prepareLocalBundleArchive(fd, selection, cancel.signal)).rejects.toBe(reason);
+				expect(read).toHaveBeenCalledTimes(1);
+				expect(stage).not.toHaveBeenCalled();
+				expect(await stagingFs.readdir(directory)).toEqual(["bundle.tar"]);
+			} finally {
+				read.mockRestore();
+				stage.mockRestore();
+			}
+		});
+	});
+
+	it("refuses an archive whose metadata changes after a real read", async () => {
+		const { manifestEntry, payloads, selection } = archiveBundle();
+		await withArchive(tarArchive(manifestEntry, ...payloads), async (fd, directory) => {
+			const original = archiveFs.read;
+			const read = vi.spyOn(archiveFs, "read").mockImplementationOnce((descriptor, buffer, offset, size, position, callback) =>
+				original(descriptor, buffer, offset, size, position, (error, count, bytes) => {
+					utimes(join(directory, "bundle.tar"), 0, 0).then(
+						() => callback(error, count, bytes),
+						(failure) => callback(failure, count, bytes),
+					);
+				}),
+			);
+			const stage = vi.spyOn(stagingFs, "mkdtemp");
+			try {
+				await expect(prepareLocalBundleArchive(fd, selection)).rejects.toThrow(/changed during intake/);
+				expect(stage).not.toHaveBeenCalled();
+				expect(await stagingFs.readdir(directory)).toEqual(["bundle.tar"]);
+			} finally {
+				read.mockRestore();
+				stage.mockRestore();
+			}
+		});
+	});
+
+	it("discards a partially written stage when preparation is interrupted after intake", async () => {
+		const { manifestEntry, payloads, selection, assets } = archiveBundle();
+		await withArchive(tarArchive(manifestEntry, ...payloads), async (fd, directory) => {
+			const cancel = new AbortController();
+			const reason = new Error("synthetic archive preparation interruption");
+			const original = stagingFs.open;
+			let stage: string | undefined;
+			const handle = vi.spyOn(stagingFs, "open").mockImplementation(async (path, flags, mode) => {
+				if (typeof path === "string" && path.endsWith("/manifest.json")) {
+					stage = path.slice(0, -"/manifest.json".length);
+					expect(await readFile(join(stage, assets[0]!.path))).toEqual(assets[0]!.bytes);
+					cancel.abort(reason);
+				}
+				return original(path, flags, mode);
+			});
+			try {
+				await expect(prepareLocalBundleArchive(fd, selection, cancel.signal)).rejects.toBe(reason);
+				expect(stage).toMatch(/^\/tmp\/kit-bundle-stage-/);
+				await expect(lstat(stage!)).rejects.toMatchObject({ code: "ENOENT" });
+				expect(await stagingFs.readdir(directory)).toEqual(["bundle.tar"]);
+			} finally {
+				handle.mockRestore();
+				if (stage) await rm(stage, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it("stages the exact reviewed selection and bytes through the preparation script", async () => {
+		const { manifest, assets } = testBundle();
+		const rootfsPath = "guest/etc/" + "a".repeat(100) + "/" + "b".repeat(100);
+		const selectedManifest = {
+			...manifest, files: manifest.files.map((file, index) => index === 3 ? { ...file, path: rootfsPath } : file),
+		};
+		const namedAssets = assets.map((asset, index) => index === 3 ? { ...asset, path: rootfsPath } : asset);
+		const bytes = bundleBytes(selectedManifest);
+		const manifestEntry = tarEntry("manifest.json", bytes);
+		const payloads = namedAssets.map(({ path, bytes, mode }) => tarEntry(path, bytes, mode));
+		const selection = { bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(bytes) };
+		const script = fileURLToPath(new URL("../sandbox/local/provision-toolchain.sh", import.meta.url));
+		await withArchive(tarArchive(...payloads.reverse(), manifestEntry), async (fd, directory) => {
+			const run = (digest: string, input: number | "pipe" = fd, output: number | "pipe" = "pipe") => spawnSync(script,
+				[process.execPath, selection.bundleVersion, digest], {
+					cwd: directory, encoding: "utf8", stdio: [input, output, "pipe"], timeout: 10_000,
+					env: { ...process.env, NODE_OPTIONS: "--require=/nonexistent-node-preload" },
+				});
+			const wrong = run("0".repeat(64));
+			expect(wrong.status).toBe(1);
+			expect(wrong.stderr).toMatch(/manifestSha256/);
+			expect(wrong.stdout).toBe("");
+			const pipe = run(selection.manifestSha256, "pipe");
+			expect(pipe.status).toBe(1);
+			expect(pipe.stderr).toMatch(/regular file descriptor/);
+			expect(pipe.stdout).toBe("");
+			const listStages = async () => (await stagingFs.readdir("/tmp")).filter((name) => name.startsWith("kit-bundle-stage-")).sort();
+			const before = await listStages();
+			const full = await open("/dev/full", "w");
+			try {
+				const failedReceipt = run(selection.manifestSha256, fd, full.fd);
+				expect(failedReceipt.status).toBe(1);
+				expect(failedReceipt.stderr).toMatch(/ENOSPC/);
+				expect(await listStages()).toEqual(before);
+			} finally {
+				await full.close();
+			}
+			const good = run(selection.manifestSha256);
+			expect(good.stderr).toBe("");
+			expect(good.status).toBe(0);
+			const result = JSON.parse(good.stdout);
+			expect(result.directory).toMatch(/^\/tmp\/kit-bundle-stage-/);
+			try {
+				expect(result.selection).toEqual(selection);
+				expect((await lstat(result.directory)).mode & 0o777).toBe(0o700);
+				expect(await readFile(join(result.directory, "manifest.json"))).toEqual(bytes);
+				for (const asset of namedAssets) {
+					const path = join(result.directory, asset.path);
+					expect(await readFile(path)).toEqual(asset.bytes);
+					expect((await lstat(path)).mode & 0o7777).toBe(asset.mode);
+				}
+				expect(await stagingFs.readdir(directory)).toEqual(["bundle.tar"]);
+			} finally {
+				await rm(result.directory, { recursive: true, force: true });
+			}
+		});
 	});
 });

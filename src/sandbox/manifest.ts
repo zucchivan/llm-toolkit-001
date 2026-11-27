@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import archiveFs from "node:fs";
 import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { isArrayBuffer, isUint8Array } from "node:util/types";
@@ -246,6 +247,175 @@ export async function prepareLocalBundle(
 		}
 		throw error;
 	}
+}
+
+const TAR_BLOCK = 512;
+const TAR_MAX_BYTES = BUNDLE_MAX_MANIFEST_BYTES + BUNDLE_MAX_TOTAL_BYTES +
+	(BUNDLE_MAX_FILES + 1) * (2 * TAR_BLOCK - 1) + 2 * TAR_BLOCK;
+
+interface BundleArchiveEntry {
+	readonly size: number;
+	readonly mode: number;
+	readonly offset: number;
+}
+
+/** Consume an already-open regular file at offset zero. The caller owns the descriptor. */
+export async function prepareLocalBundleArchive(fd: number, selection: LocalBundleSelection, signal?: AbortSignal) {
+	signal?.throwIfAborted();
+	const selected = { bundleVersion: selection?.bundleVersion, manifestSha256: selection?.manifestSha256 };
+	const before = await statBundleArchive(fd);
+	const length = Number(before.size);
+	if (length > TAR_MAX_BYTES) throw new Error("local bundle archive byte limit exceeded");
+	if (length < 3 * TAR_BLOCK || length % TAR_BLOCK !== 0) {
+		throw new Error("malformed or truncated local bundle archive length");
+	}
+
+	const entries = new Map<string, BundleArchiveEntry>();
+	const names = new Map<string, string>();
+	const block = Buffer.alloc(TAR_BLOCK);
+	let offset = 0;
+	let total = 0;
+	let fileCount = 0;
+	for (;;) {
+		await readBundleArchive(fd, block, offset, length, signal);
+		offset += TAR_BLOCK;
+		if (zeroTarBytes(block)) break;
+		const { path, mode, size } = readBundleTarHeader(block);
+		if (path === "manifest.json") {
+			if (entries.has(path)) throw new Error("local bundle archive contains a duplicate or colliding path");
+			if (mode !== 0o644) throw new Error("unsupported local bundle archive manifest mode");
+			if (size > BUNDLE_MAX_MANIFEST_BYTES) throw new Error("local bundle archive manifest size limit exceeded");
+		} else {
+			if (++fileCount > BUNDLE_MAX_FILES) throw new Error("local bundle archive entry limit exceeded");
+			assertBundlePath(path);
+			if (!path.startsWith("host/") && !path.startsWith("guest/")) {
+				throw new Error("local bundle archive contains an unsafe path outside host/ and guest/");
+			}
+			checkBundlePathCollisions(path, names);
+			if (size > BUNDLE_MAX_FILE_BYTES) throw new Error("local bundle archive file size limit exceeded");
+			total += size;
+			if (total > BUNDLE_MAX_TOTAL_BYTES) throw new Error("local bundle archive total size limit exceeded");
+		}
+		const padding = (TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK;
+		if (offset + size + padding + 2 * TAR_BLOCK > length) {
+			throw new Error("truncated local bundle archive entry");
+		}
+		entries.set(path, { size, mode, offset });
+		offset += size;
+		await readBundleArchive(fd, block.subarray(0, padding), offset, length, signal);
+		if (!zeroTarBytes(block.subarray(0, padding))) throw new Error("nonzero local bundle archive padding");
+		offset += padding;
+	}
+	await readBundleArchive(fd, block, offset, length, signal);
+	if (!zeroTarBytes(block) || offset + TAR_BLOCK !== length) {
+		throw new Error("invalid local bundle archive terminator or trailing data");
+	}
+	const manifestEntry = entries.get("manifest.json");
+	if (!manifestEntry) throw new Error("local bundle archive is missing manifest.json");
+	const manifestBytes = Buffer.alloc(manifestEntry.size);
+	await readBundleArchive(fd, manifestBytes, manifestEntry.offset, length, signal);
+	const manifest = readLocalBundleManifest(manifestBytes, selected);
+	entries.delete("manifest.json");
+	if (entries.size !== manifest.files.length) throw new Error("local bundle archive inventory count mismatch");
+
+	// Check the complete archive layout against the reviewed inventory before
+	// allocating payload buffers. The preparation boundary measures the bytes.
+	const matching = manifest.files.map(({ path, mode, size }) => {
+		const entry = entries.get(path);
+		if (!entry) throw new Error("local bundle archive contains missing or unexpected paths");
+		if (entry.mode !== mode) throw new Error("local bundle archive file mode mismatch");
+		if (entry.size !== size) throw new Error("local bundle archive file size mismatch");
+		return { path, ...entry };
+	});
+	const assets: LocalBundleAsset[] = [];
+	for (const { path, mode, size, offset } of matching) {
+		const bytes = Buffer.alloc(size);
+		await readBundleArchive(fd, bytes, offset, length, signal);
+		assets.push({ path, kind: "file", mode, bytes });
+	}
+	const after = await statBundleArchive(fd);
+	if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) {
+		throw new Error("local bundle archive changed during intake");
+	}
+	return prepareLocalBundle(manifestBytes, assets, selected, signal);
+}
+
+function statBundleArchive(fd: number): Promise<archiveFs.BigIntStats> {
+	return new Promise((resolve, reject) => {
+		archiveFs.fstat(fd, { bigint: true }, (error, stat) => {
+			if (error) reject(error);
+			else if (!stat.isFile() || stat.nlink !== 1n) reject(new Error("local bundle archive requires a single-link regular file descriptor"));
+			else resolve(stat);
+		});
+	});
+}
+
+async function readBundleArchive(fd: number, bytes: Buffer, start: number, length: number, signal?: AbortSignal): Promise<void> {
+	if (start + bytes.length > length) throw new Error("truncated local bundle archive");
+	let offset = 0;
+	while (offset < bytes.length) {
+		signal?.throwIfAborted();
+		const count = await new Promise<number>((resolve, reject) => {
+			const size = Math.min(bytes.length - offset, 64 * 1024);
+			archiveFs.read(fd, bytes, offset, size, start + offset, (error, read) => {
+				if (error) reject(error);
+				else resolve(read);
+			});
+		});
+		signal?.throwIfAborted();
+		if (count === 0) throw new Error("truncated local bundle archive");
+		offset += count;
+	}
+}
+
+function zeroTarBytes(bytes: Buffer): boolean {
+	return bytes.every((byte) => byte === 0);
+}
+
+function readBundleTarHeader(block: Buffer): { path: string; mode: number; size: number } {
+	if (block.toString("latin1", 257, 265) !== "ustar\0" + "00") {
+		throw new Error("malformed or unsupported local bundle ustar header");
+	}
+	const checksum = block.toString("latin1", 148, 156);
+	const expected = block.reduce((sum, byte, index) => sum + (index >= 148 && index < 156 ? 32 : byte), 0);
+	if (!/^[0-7]{6}\0 $/.test(checksum) || Number.parseInt(checksum, 8) !== expected) {
+		throw new Error("invalid local bundle archive header checksum");
+	}
+	if (block[156] !== 0x30 || !zeroTarBytes(block.subarray(157, 257))) {
+		throw new Error("unsupported local bundle archive entry type or link");
+	}
+	const mode = readTarOctal(block.subarray(100, 108));
+	if (mode !== 0o644 && mode !== 0o755) throw new Error("unsupported local bundle archive file mode");
+	const size = readTarOctal(block.subarray(124, 136));
+	readTarOctal(block.subarray(108, 116)); // uid
+	readTarOctal(block.subarray(116, 124)); // gid
+	readTarOctal(block.subarray(136, 148)); // mtime
+	readTarText(block.subarray(265, 297)); // uname
+	readTarText(block.subarray(297, 329)); // gname
+	for (const device of [block.subarray(329, 337), block.subarray(337, 345)]) {
+		if (!zeroTarBytes(device) && readTarOctal(device) !== 0) throw new Error("unsupported local bundle archive device fields");
+	}
+	if (!zeroTarBytes(block.subarray(500))) throw new Error("invalid local bundle archive reserved bytes");
+
+	const name = readTarText(block.subarray(0, 100));
+	const prefix = readTarText(block.subarray(345, 500));
+	if (!name) throw new Error("local bundle archive contains an unsafe path");
+	return { path: prefix ? prefix + "/" + name : name, mode, size };
+}
+
+function readTarText(bytes: Buffer): string {
+	const end = bytes.indexOf(0);
+	const value = bytes.toString("latin1", 0, end === -1 ? bytes.length : end);
+	if (!/^[ -~]*$/.test(value) || (end !== -1 && !zeroTarBytes(bytes.subarray(end)))) {
+		throw new Error("malformed local bundle archive text field");
+	}
+	return value;
+}
+
+function readTarOctal(bytes: Buffer): number {
+	const digits = bytes.toString("latin1", 0, bytes.length - 1);
+	if (bytes.at(-1) !== 0 || !/^[0-7]+$/.test(digits)) throw new Error("malformed local bundle archive numeric field");
+	return Number.parseInt(digits, 8);
 }
 
 async function writeBundleStageFile(path: string, bytes: Uint8Array, mode: number): Promise<void> {

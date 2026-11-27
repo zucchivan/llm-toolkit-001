@@ -112,6 +112,54 @@ retention of verified bytes and use-time binding, including platform and
 ABI qualification. No trust in observed files survives a change to the
 bytes or their selected installation.
 
+## Offline ustar archive
+
+The preparation script accepts one **uncompressed ustar archive** with no
+record padding beyond the required two end blocks. Each entry is a 512-byte
+ustar header, the specified byte count, then zero padding to the next 512-byte
+boundary. Use magic `ustar\0`, version `00`, and regular-file type byte `0`
+(ASCII). Use zero-padded ASCII octal digits with a final NUL in the numeric
+fields. The checksum field has six octal digits, a NUL and a space. Calculate
+the unsigned byte sum of the header with that field filled with spaces. Device
+fields must be all zero bytes or octal zero, and the link name and reserved
+bytes must be zero. Text fields use printable ASCII and zero padding when
+shorter than their field width. UID, GID, timestamp, user and group fields
+carry no authority and are discarded.
+
+Include exactly one root `manifest.json` at mode `0644`, plus every declared
+`host/` and `guest/` file at its declared mode, in any order. Paths are taken
+from the ustar name (up to 100 bytes) and optional prefix (up to 155 bytes),
+joined with a single slash. The resulting names must meet the inventory path
+rules. Directories are implicit. The adapter refuses directory records, links,
+special files, sparse encodings, GNU and PAX extensions, duplicate and
+colliding paths, and trailing bytes after the two zero end blocks.
+
+Pass a descriptor for a stable single-link regular file, opened read-only by
+the operator. The script takes that descriptor as standard input. A pipe,
+terminal or device is refused. The script receives no archive filename and
+does not resolve a source pathname. Select and open the source in trusted
+operator context. Intake reads positionally from byte zero without changing
+the descriptor's offset, with requests of at most 64 KiB. The caller retains
+ownership of the descriptor and should keep the archive unchanged during the
+operation. Intake checks the opened file's size, link count and modification
+and change timestamps around the read.
+
+Intake caps the archive at the manifest and combined payload byte limits plus
+up to 1,023 bytes of header and padding per entry and 1,024 end bytes. It
+checks all headers, the path and entry limits, per-entry and aggregate byte
+limits, padding and the terminator before materializing file bytes. It checks
+the manifest against the separately supplied version and digest and matches
+the complete archive layout to the declared inventory before allocating any
+payload buffers. `prepareLocalBundle` measures the materialized payloads under
+that same selection and writes the verified bytes. Intake only reads from
+the archive descriptor.
+
+For the shell invocation and output, see the [setup contract](README.md#setupbuildrun-separation).
+On a handled error or SIGINT/SIGTERM during intake or staging, the command exits
+without a completed stage receipt and attempts to remove any stage already started.
+A hard process exit can leave private residue. Only accept the complete JSON
+record from a successful invocation.
+
 ## Private offline preparation
 
 `prepareLocalBundle(manifestBytes, assets, selection, signal?)` applies the same
