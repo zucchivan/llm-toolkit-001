@@ -120,6 +120,7 @@ export async function bakeDemoProject(repoRoot: string): Promise<BakedDemo> {
 	};
 	const commit = await git(["commit-tree", tree, "-m", "demo base"], identity);
 	await git(["update-ref", "refs/heads/main", commit]);
+	await git(["read-tree", tree]);
 	await git(["config", "user.email", "kit-ui-demo@example.invalid"]);
 	await git(["config", "user.name", "kit-ui-demo"]);
 	return { root, replay: join(root, "smoke.replay") };

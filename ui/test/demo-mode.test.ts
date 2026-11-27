@@ -7,7 +7,9 @@
  * project.
  */
 import { describe, expect, it } from "vitest";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { exec } from "../../src/util/exec.ts";
@@ -48,6 +50,9 @@ describe("bakeDemoProject", () => {
 		expect(prompt.length).toBeGreaterThan(0);
 		const head = await exec(["git", "rev-parse", "--verify", "HEAD"], { cwd: root, timeoutMs: 15_000 });
 		expect(head.code).toBe(0);
+		const status = await exec(["git", "status", "--porcelain"], { cwd: root, timeoutMs: 15_000 });
+		expect(status.code).toBe(0);
+		expect(status.stdout).toBe("");
 		expect(replay.endsWith("smoke.replay")).toBe(true);
 	});
 
@@ -131,3 +136,43 @@ describe("bakeDemoProject", () => {
 		}
 	});
 });
+
+it("the UI entry opens an aliased project for read-only diagnosis of malformed TOML", async () => {
+	const { root } = await bakeDemoProject(REPO_ROOT);
+	const aliasDir = await mkdtemp(join(tmpdir(), "ui-project-alias-"));
+	const alias = join(aliasDir, "project");
+	await symlink(root, alias);
+	await writeFile(join(root, ".orch", "config.toml"), "[broken\n");
+	const child = spawn(process.execPath, [
+		join(REPO_ROOT, "ui", "bin", "llm-toolkit-ui.js"), "--no-open", "--host", "127.0.0.1", "--project", alias,
+	], { stdio: ["ignore", "pipe", "pipe"] });
+	const closed = once(child, "close");
+	let stdout = "";
+	let stderr = "";
+	child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+	child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+	try {
+		const url = await waitFor(() => {
+			if (child.exitCode !== null) throw new Error(stderr);
+			return stdout.match(/http:\/\/127\.0\.0\.1:\d+\/\?token=\S+/)?.[0];
+		}, (value) => value !== undefined, 5_000);
+		expect(stdout).toContain(`project ${root}\n`);
+		const address = new URL(url!);
+		const token = address.searchParams.get("token");
+		const cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
+		const readout = await fetch(`${address.origin}/api/readout`, { headers: { cookie } });
+		expect(readout.status).toBe(200);
+		expect(await readout.json()).toMatchObject({ mode: "sidecars", configError: expect.any(String) });
+		const jobs = await fetch(`${address.origin}/api/jobs`, { headers: { cookie } });
+		expect(jobs.status).toBe(200);
+		expect(await jobs.json()).toMatchObject({ jobs: [] });
+		const action = await postAction(address.origin, cookie, { kind: "plan" }, { "x-kit-token": token! });
+		expect(action.status).toBe(422);
+		expect(await action.json()).toMatchObject({ configError: expect.any(String) });
+	} finally {
+		child.kill("SIGTERM");
+		await closed;
+		await rm(root, { recursive: true, force: true });
+		await rm(aliasDir, { recursive: true, force: true });
+	}
+}, 12_000);

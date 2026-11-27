@@ -44,6 +44,37 @@ describe("sse job events", () => {
 		if (baked) await cleanup(baked);
 	});
 
+	it("reports a malformed job record to two connected clients", async () => {
+		const project = await bake({ skipJobSweep: true, heartbeatMs: 100 });
+		const sessions = new AbortController();
+		try {
+			const dir = join(project.root, ".orch", "ui", "jobs");
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, "incomplete.json"), "{}");
+			for (let client = 0; client < 2; client++) {
+				const res = await fetch(`${project.base}/api/events`, {
+					headers: { cookie: project.cookie },
+					signal: AbortSignal.any([sessions.signal, AbortSignal.timeout(5_000)]),
+				});
+				expect(res.status).toBe(200);
+				const reader = res.body!.getReader();
+				const decoder = new TextDecoder();
+				let frames = "";
+				while (!/event: job-error\ndata: .*\n\n/.test(frames)) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					frames += decoder.decode(value, { stream: true });
+				}
+				expect(frames).toContain("invalid job record incomplete");
+			}
+			await rm(join(dir, "incomplete.json"));
+			expect((await firstJobEvent(project.base, project.cookie)).jobs).toEqual([]);
+		} finally {
+			sessions.abort();
+			await cleanup(project);
+		}
+	}, 12_000);
+
 	it("subscribe receives the current job list; a spawned job is announced", async () => {
 		baked = await bake({ skipJobSweep: false });
 		const first = await firstJobEvent(baked.base, baked.cookie); // immediate snapshot on connect

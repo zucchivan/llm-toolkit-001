@@ -190,6 +190,28 @@ impl Drop for Cgroup {
 
 #[test]
 #[ignore = "run explicitly with an approved delegated cgroup-v2 parent"]
+fn real_gate_requires_non_append_read_write_mode() {
+    let cgroup = Cgroup::new();
+    let workspace = Workspace::new();
+    let directory = File::open(&cgroup.0).unwrap();
+    workspace.gate(&directory);
+    let path = workspace.0.join("gate");
+    let expected = fs::read(&path).unwrap();
+    for gate in [
+        OpenOptions::new().read(true).open(&path).unwrap(),
+        OpenOptions::new().read(true).append(true).open(&path).unwrap(),
+    ] {
+        let mut session = Session::start(&directory, &gate, &["/bin/true"], true);
+        assert_eq!(session.record(), (3, 0, libc::EINVAL));
+        session.eof();
+        assert_eq!(session.child.wait().unwrap().code(), Some(2));
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert!(cgroup.empty());
+    }
+}
+
+#[test]
+#[ignore = "run explicitly with an approved delegated cgroup-v2 parent"]
 fn real_placement_and_descriptor_closure() {
     for _ in 0..16 {
         let cgroup = Cgroup::new();

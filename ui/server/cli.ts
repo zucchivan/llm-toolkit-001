@@ -30,7 +30,8 @@ import { bakeDemoProject } from "./demo.ts";
 import { startServer } from "./server.ts";
 import { openBrowser } from "./browser.ts";
 import { loadTrustedInstallation, TrustedInstallationError } from "../../src/sandbox/trusted-exec.ts";
-import { readConfig } from "../../src/config.ts";
+import { CONFIG_MAX_BYTES } from "../../src/config.ts";
+import { readSafeFile, requireSafeReadRoot } from "../../src/util/safe-read.ts";
 
 const here = dirname(fileURLToPath(import.meta.url)); // ui/server
 const uiRoot = dirname(here); // ui/
@@ -87,14 +88,13 @@ async function main(): Promise<void> {
 	}
 
 	const projectArg = values["project"];
-	const root = resolve(typeof projectArg === "string" && projectArg.trim() ? projectArg : process.cwd());
-	// M1-P01 step (g): the config is checked through the canonical-root +
-	// no-follow read boundary, not a path stat. Absent keeps the CLI's plain
-	// words; a REFUSED config (symlink/escape/type/cap/permission) refuses here
-	// with its typed reason instead of starting a server over a linked file.
-	const config = await readConfig(root);
+	const root = await requireSafeReadRoot(resolve(typeof projectArg === "string" && projectArg.trim() ? projectArg : process.cwd()));
+	// The readout diagnoses malformed config and action preflight refuses it.
+	// Startup checks that a bounded regular config is readable.
+	const configPath = ".orch/config.toml";
+	const config = await readSafeFile({ root, path: configPath, maxBytes: CONFIG_MAX_BYTES });
 	if (config.kind === "absent") {
-		console.error(`no ${config.path} in this project — run "llm-toolkit-001 init ." in the project root first`);
+		console.error(`no ${join(root, configPath)} in this project — run "llm-toolkit-001 init ." in the project root first`);
 		process.exit(1);
 	}
 	if (config.kind === "refused") {

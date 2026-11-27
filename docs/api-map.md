@@ -903,15 +903,12 @@ This key selects the host Rust placement executable, not guest helper or bwrap.
 S1 tests prove selection and filesystem trust only; bundle inventory validation
 must additionally bind installed artifact bytes before project execution.
 
-The standalone `sandbox/local/launcher/` crate will own clone3 exact-child
-placement with reviewed unsafe/FD/owner-loss behavior. Its fixed argv/FD/status
-contract must be documented/proved before launch wiring. Rust/compiler and Cargo
-pins are build inputs, separate from npm. Planned `build-launcher.sh` is an
-explicit offline build from reviewed inputs; `provision-toolchain.sh` separates
-approved acquisition/install from offline fixture/run/recovery. `bundle-format.md`
-will define canonical versioned inventory/provenance anchored by existing
-`manifestSha256`; no exact compiler/runtime/assets are enrolled yet. Host changes
-remain subject to D1 review of exact inputs/commands/paths/profile edits.
+The standalone `sandbox/local/launcher/` crate implements clone3 placement into
+the exact cgroup. S2 verified the argv/FD/status contract and fencing with
+synthetic Linux probes. `build-launcher.sh` uses pinned Rust/Cargo and locked
+offline inputs, separate from npm. S3 starts with the versioned bundle format
+and offline validator, anchored by `manifestSha256`. Bundle enrollment stays
+subject to D1 review of exact inputs, commands, paths and profile edits.
 
 The selected P03 result seam is immutable Git objects plus the existing private
 `refs/kit/<planRevision>/tasks/<taskId>/leases/<leaseId>/candidate` create-only CAS,

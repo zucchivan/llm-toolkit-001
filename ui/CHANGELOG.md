@@ -13,6 +13,11 @@ in sync. The UI follows `ui/PRD.md` milestones; the kit's seam it consumes is
 - Ordinary Stop verifies the live runner and its CLI child. Attached Stop
   requires agreement between the lock and status and rechecks the live
   process identity before SIGINT.
+- The entry uses one canonical project root and keeps malformed TOML
+  diagnosable in read-only views. Each SSE client receives job state from the
+  server's selected installation context, including typed read refusals.
+- The demo bake initializes its Git index from the committed base tree, leaving
+  a clean checkout.
 
 ## Unreleased — M1-P01 step (g): config read and the remaining read owners behind the host boundary
 

@@ -508,12 +508,10 @@ is bubblewrap plus a kit-owned **Rust** placement launcher and a **versioned
 complete toolchain bundle**, not a per-project compiler/install procedure.
 P04/P05 cutover remains separately gated on real conformance and packet review.
 
-- The host selects helper, bwrap and the planned optional
-  `installation.localLauncher` through the same P01 descriptor/per-use validator.
-  The launcher key is not yet accepted by the parser; do not add it to a real
-  profile before P03-S1 lands. No launcher/helper/bwrap default or project/env/PATH
-  authority, no new dev-in-kit exception. Operator/root ownership, safe modes,
-  non-symlink ancestry and outside-target rules are preserved.
+- The same P01 descriptor and per-use validator cover helper, bwrap and the
+  optional `installation.localLauncher` key added in S1. These tools require
+  explicit operator selection and retain the ownership, safe-mode, no-symlink
+  and outside-target rules. Launcher enrollment remains S3 work.
 - Rust/Cargo are pinned maintainer/source-build prerequisites (including this
   development host), not ordinary npm/runtime dependencies. Prebuilt bundle users
   should not need Rust. No install hook or worker run invokes a compiler/rustup.
@@ -543,10 +541,10 @@ P04/P05 cutover remains separately gated on real conformance and packet review.
   and crash-reconciled receipts; Git and journal are not atomically committed
   together. No operator-checkout mutation or change of engine delivery ownership.
 
-No compiler pin, release bundle, installer, host enrollment, production local
-caller or certification is supplied by this documentation checkpoint. See
-[`sandbox/local/README.md`](../sandbox/local/README.md) for the execution sequence
-and approval checkpoint; no new setup CLI command is advertised yet.
+S2 adds the standalone pinned build and verifies the launcher with synthetic
+probes on a Linux development host. The release bundle, installer and
+enrollment are pending. The launcher has no production caller and P03
+certification remains open. See [local setup and launcher ABI](../sandbox/local/README.md).
 
 ## Upgrade & migration notes
 

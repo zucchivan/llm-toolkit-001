@@ -173,8 +173,7 @@ export class GuestEnv implements ExecutionEnv {
 			this.writeTail = write.catch((error: unknown) => {
 				this.fail(error instanceof Error ? error : new GuestProtocolError("guest transport write failed"));
 			});
-			await write;
-			const response = await result;
+			const [, response] = await Promise.all([write, result]);
 			const eventError = pendingRecord?.eventError;
 			if (eventError instanceof GuestProtocolError) {
 				this.fail(eventError);

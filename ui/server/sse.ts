@@ -228,15 +228,6 @@ export function startSnapshotHub(projectRoot: string, options: HubOptions = {}):
 					pollTimer = setInterval(tick, pollMs);
 					pollTimer.unref?.();
 				}
-			} else {
-				const jobsNow = currentJobsEvent(projectRoot);
-				void jobsNow.then((payload) => {
-					try {
-						write(`event: job\ndata: ${JSON.stringify(payload)}\n\n`);
-					} catch {
-						sub.alive = false;
-					}
-				});
 			}
 			return () => {
 				sub.alive = false;

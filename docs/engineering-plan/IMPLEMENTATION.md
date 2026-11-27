@@ -109,25 +109,13 @@ explicitly labeled with host, pin and method, never generalized benchmarks.
 
 ### Active packet — M1-P03: S2 native verification passed; certification still blocked
 
-As of 2026-11-26, P03's standalone helper ABI/stdio adapter has a bounded
-implementation in `src/sandbox/guest-helper-main.ts`, but no production launcher
-uses it. A disposable Linux `clone3(CLONE_INTO_CGROUP)` canary proved kernel
-placement into the exact UUID-named delegated child before the child ran; the
-same child was killed through `cgroup.kill` and the child reported `populated 0`.
-Production wiring is still blocked: Node has no syscall interface in this
-implementation, and there is no reviewed native launcher asset or P01 selection
-for one. `LinuxCgroupOps.writePid()` remains an unsuitable post-spawn move. The
-transient user-systemd scope canary also remains unsuitable because its scope
-was outside the delegated subtree. Fixture creation remains blocked until
-operator-provisioned offline runtime assets and reviewed exact inventory values
-are available. Import wiring remains blocked until the complete fenced scan,
-host-only durable seal, destination identity, and atomic result
-visibility/recovery mechanism are proved. Existing Git object/ref primitives
-are reusable candidates, but no P03 importer/receipt currently binds them to
-the lease journal. See
-`docs/engineering-plan/evidence/M1-P03.md` for the obligation map and effect
-ordering. These are blockers, not permission to substitute timing, guessed
-pins, or a different destination contract.
+P03 has a bounded helper ABI/stdio adapter, an optional trusted launcher
+selection, and a standalone native launcher verified on the development host.
+The launcher has no production caller. Fixture creation requires enrolled
+offline runtime assets and a reviewed inventory. Import wiring requires a
+complete fenced scan, host-only durable seal, and recovery using the exact
+private candidate ref. The P03 evidence records the obligation map and effect
+ordering. [P03 evidence](evidence/M1-P03.md)
 
 Bounded follow-up (2026-11-26): interrupted `fencing` is now retryable;
 reopened `fenced` state/import admission require fresh cgroup observation and
@@ -156,12 +144,12 @@ No Rust install, bundle download/enrollment or profile change is authorized unti
 exact assets/provenance/pins/paths/commands have been presented and approved.
 
 **P03-S2 verification.** The pinned offline build produced identical launcher
-binaries in two clean build directories. All five real native canaries passed
-on the development host, and the optimized test lane exercised the same binary
-bytes. The S2 compiler setup was isolated, with no bundle enrollment or live
-profile edit. See [P03 evidence](evidence/M1-P03.md#s2-native-verification-2026-11-27).
+binaries in two clean build directories. Six real native canaries passed on the
+development host after the merge-review gate correction, and the optimized
+test lane exercised the same binary bytes. [Current S2 evidence](evidence/M1-P03.md#s2-merge-review-verification-2026-11-27)
 
-S3 owns versioned bundle inventory, enrollment and the offline fixture. S4 owns
+S3 starts with the versioned bundle format and offline validator and owns
+enrollment and the offline fixture. S4 owns
 full scan, seal and private-ref recovery. S5 wires the production adapter and
 runs the full Bubblewrap/guest conformance lane. Each remains bounded by M1.md
 P03. Packet closure still requires real conformance and reviewer acceptance.
