@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import stagingFs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { LeaseLifecycle, type CgroupOps } from "../src/sandbox/lease-lifecycle.ts";
-import { sealedManifestDigest, validateSealedManifest, validateManifestDelta, validateLocalBundle } from "../src/sandbox/manifest.ts";
+import { prepareLocalBundle, sealedManifestDigest, validateSealedManifest, validateManifestDelta, validateLocalBundle } from "../src/sandbox/manifest.ts";
 import { createTaskControls } from "../src/engine/controls.ts";
 import { createGuestStdioStream, parseGuestHelperArgs } from "../src/sandbox/guest-helper-main.ts";
 import { PassThrough } from "node:stream";
@@ -503,5 +504,143 @@ describe("local bundle materialized bytes", () => {
 		expect(bundleSha256(wrongBytes)).toBe(wrongDigest);
 		expect(bundleSha256(canonical)).toBe(snapshot);
 		expect(assets.map((asset) => bundleSha256(asset.bytes))).toEqual(assetDigests);
+	});
+});
+
+describe("offline local bundle preparation", () => {
+	it("retains the exact selected manifest and payload bytes in a private stage", async () => {
+		const { manifest, assets } = testBundle();
+		const bytes = bundleBytes(manifest);
+		const selection = { bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(bytes) };
+		const expectedSelection = { ...selection };
+		const expectedManifest = Buffer.from(bytes);
+		const expectedAssets = assets.map((asset) => ({ ...asset, bytes: Buffer.from(asset.bytes) }));
+		const preparation = prepareLocalBundle(bytes, [...assets].reverse(), selection);
+		bytes.fill(0);
+		assets.forEach((asset) => asset.bytes.fill(0));
+		selection.bundleVersion = "0.0.2";
+		selection.manifestSha256 = "0".repeat(64);
+		const stage = await preparation;
+		try {
+			expect(stage.selection).toEqual(expectedSelection);
+			expect((await lstat(stage.directory)).mode & 0o777).toBe(0o700);
+			const manifestPath = join(stage.directory, "manifest.json");
+			expect((await lstat(manifestPath)).mode & 0o777).toBe(0o600);
+			expect(await readFile(manifestPath)).toEqual(expectedManifest);
+			for (const asset of expectedAssets) {
+				const path = join(stage.directory, asset.path);
+				const stat = await lstat(path);
+				expect(stat.isFile()).toBe(true);
+				expect(stat.nlink).toBe(1);
+				expect(stat.mode & 0o7777).toBe(asset.mode);
+				expect(await readFile(path)).toEqual(asset.bytes);
+			}
+		} finally {
+			await rm(stage.directory, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps independently selected versions side by side", async () => {
+		const { manifest, assets } = testBundle();
+		const firstBytes = bundleBytes(manifest);
+		const secondVersion = "0.0.2";
+		const secondBytes = bundleBytes({
+			...manifest, bundleVersion: secondVersion,
+			sources: manifest.sources.map((source) => ({ ...source, version: secondVersion })),
+		});
+		const first = await prepareLocalBundle(firstBytes, assets, {
+			bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(firstBytes),
+		});
+		try {
+			const second = await prepareLocalBundle(secondBytes, assets, {
+				bundleVersion: secondVersion, manifestSha256: bundleSha256(secondBytes),
+			});
+			try {
+				expect(second.directory).not.toBe(first.directory);
+				expect(await readFile(join(first.directory, "manifest.json"))).toEqual(firstBytes);
+				expect(await readFile(join(second.directory, "manifest.json"))).toEqual(secondBytes);
+			} finally {
+				await rm(second.directory, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(first.directory, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses invalid selection and material before allocating staging", async () => {
+		const { manifest, assets } = testBundle();
+		const bytes = bundleBytes(manifest);
+		const selection = { bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(bytes) };
+		const [first, ...rest] = assets;
+		const createStage = vi.spyOn(stagingFs, "mkdtemp");
+		try {
+			await expect(prepareLocalBundle(bytes, assets, { ...selection, bundleVersion: "0.0.2" }))
+				.rejects.toThrow(/explicit selection/);
+			await expect(prepareLocalBundle(bytes, assets, { ...selection, manifestSha256: "0".repeat(64) }))
+				.rejects.toThrow(/manifestSha256/);
+			for (const [file, reason] of [
+				[{ ...manifest.files[0]!, path: "guest/../../outside" }, /unsafe path/],
+				[{ ...manifest.files[0]!, size: 256 * 1024 * 1024 + 1 }, /file size/],
+			] as const) {
+				const changed = bundleBytes({ ...manifest, files: [file, ...manifest.files.slice(1)] });
+				await expect(prepareLocalBundle(changed, assets, { ...selection, manifestSha256: bundleSha256(changed) }))
+					.rejects.toThrow(reason);
+			}
+			for (const [observed, reason] of [
+				[rest, /inventory count/],
+				[[{ ...first!, path: "../outside" }, ...rest], /unexpected/],
+				[[{ ...first!, bytes: undefined }, ...rest], /file observation/],
+				[[{ ...first!, bytes: Buffer.alloc(first!.bytes.length) }, ...rest], /file SHA-256/],
+				...["symlink", "hardlink", "fifo", "directory"].map((kind) =>
+					[[{ ...first!, kind }, ...rest], /file observation/] as const),
+			] as const) {
+				await expect(prepareLocalBundle(bytes, observed as typeof assets, selection)).rejects.toThrow(reason);
+			}
+			const longerBytes = Buffer.concat([first!.bytes, Buffer.from("x")]);
+			Object.defineProperty(longerBytes, "byteLength", { value: first!.bytes.length });
+			const wrongSize = bundleBytes({
+				...manifest, files: [
+					{ ...manifest.files[0]!, sha256: bundleSha256(longerBytes) },
+					...manifest.files.slice(1),
+				],
+			});
+			const preparation = prepareLocalBundle(wrongSize, [{ ...first!, bytes: longerBytes }, ...rest], {
+				...selection, manifestSha256: bundleSha256(wrongSize),
+			});
+			await expect(preparation.then(async (stage) => {
+				await rm(stage.directory, { recursive: true, force: true });
+			})).rejects.toThrow(/file size/);
+			expect(createStage).not.toHaveBeenCalled();
+		} finally {
+			createStage.mockRestore();
+		}
+	});
+
+	it.each(["guest/bin/sh", "manifest.json"])("discards staging when interrupted while opening %s", async (interruptedPath) => {
+		const { manifest, assets } = testBundle();
+		const bytes = bundleBytes(manifest);
+		const selection = { bundleVersion: manifest.bundleVersion, manifestSha256: bundleSha256(bytes) };
+		const interruption = new AbortController();
+		const reason = new Error("synthetic staging interruption");
+		const originalOpen = stagingFs.open;
+		let directory: string | undefined;
+		let retained: Buffer | undefined;
+		const open = vi.spyOn(stagingFs, "open").mockImplementation(async (path, flags, mode) => {
+			if (typeof path === "string" && path.endsWith("/" + interruptedPath)) {
+				directory = path.slice(0, -interruptedPath.length - 1);
+				retained = await readFile(join(directory, "guest/bin/node"));
+				interruption.abort(reason);
+			}
+			return originalOpen(path, flags, mode);
+		});
+		try {
+			await expect(prepareLocalBundle(bytes, assets, selection, interruption.signal)).rejects.toBe(reason);
+			expect(retained).toEqual(assets[0]!.bytes);
+			expect(directory).toBeDefined();
+			await expect(lstat(directory!)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			open.mockRestore();
+			if (directory) await rm(directory, { recursive: true, force: true });
+		}
 	});
 });

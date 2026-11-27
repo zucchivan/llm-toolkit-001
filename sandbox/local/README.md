@@ -3,8 +3,9 @@
 **Approved product design; not yet a shipped/certified backend.** The current
 loop still executes project tools/gates/probes on the host. Use trusted projects
 and fixtures only. The S2 native source and offline build script are present.
-The bundle format and offline validator are available. Asset setup, the fixture
-builder and the production adapter are later work.
+The bundle format, offline validator and private preparation of supplied file
+observations are available. Archive intake, asset setup, the fixture builder and
+the production adapter are later work.
 The local adapter stays non-default until M1-P05.
 
 ## Approved choices (2026-11-26)
@@ -40,7 +41,8 @@ not an npm/worker hook. Maintainers/source builders need Rust/Cargo; ordinary
 users should obtain the verified prebuilt launcher. Linux x86_64 is the first
 qualification target; other hosts/architectures remain unavailable until proved.
 
-[Bundle schema 1](bundle-format.md) defines canonical inventory and provenance.
+[Bundle schema 1](bundle-format.md) defines canonical inventory, provenance and
+the private offline preparation API.
 Existing `toolchains.*.manifestSha256` anchors the canonical manifest bytes.
 Exact compiler and Node versions, artifact hashes, vendor authenticity and the
 dependency closure still require independent review.
@@ -51,7 +53,8 @@ sources with independent authenticity checks, or accept an offline supplied bund
 Safe bounded archive/path/type/size handling and complete private staging must
 precede installation; never execute unverified content, project hooks or curl-
 pipe-shell. No inherited credential/env selection or unreviewed redirect authority.
-Those operations remain pending.
+The preparation API accepts a bounded materialized inventory. An archive intake
+adapter and the setup script remain pending.
 
 Planned `make-fixture-rootfs.sh` consumes explicitly selected trusted installed
 inputs and stays offline. Worker launch, recovery and ordinary project runs may

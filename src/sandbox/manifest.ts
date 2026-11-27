@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { isArrayBuffer, isUint8Array } from "node:util/types";
 import { assertAdmissiblePath, validateProjectPath, type TaskControls } from "../engine/controls.ts";
 import { GUEST_PROTOCOL_VERSION } from "./protocol.ts";
 
@@ -110,6 +113,7 @@ function isRecord(value: unknown): value is Record<string, unknown> { return typ
 
 const BUNDLE_MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 const BUNDLE_VERSION = /^(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})$/;
+const TYPED_ARRAY_PROTOTYPE: object = Object.getPrototypeOf(Uint8Array.prototype);
 
 const BUNDLE_MAX_FILES = 16_384;
 const BUNDLE_MAX_NAMES = 65_536;
@@ -187,9 +191,80 @@ export function validateLocalBundle(
 	assets: readonly LocalBundleAsset[],
 	selection: LocalBundleSelection,
 ): LocalBundleManifest {
-	if (!validBundleBytes(manifestBytes) || manifestBytes.byteLength > BUNDLE_MAX_MANIFEST_BYTES) {
+	assertBundleManifestBytes(manifestBytes);
+	const manifest = readLocalBundleManifest(manifestBytes, selection);
+	verifyBundleAssets(manifest.files, assets);
+	return manifest;
+}
+
+/**
+ * Prepare caller-materialized observations in private Linux staging. The returned
+ * path belongs to the caller. There is no on-disk completion receipt to recover.
+ */
+export async function prepareLocalBundle(
+	manifestBytes: Uint8Array,
+	assets: readonly LocalBundleAsset[],
+	selection: LocalBundleSelection,
+	signal?: AbortSignal,
+): Promise<Readonly<{ directory: string; selection: LocalBundleSelection }>> {
+	signal?.throwIfAborted();
+	assertBundleManifestBytes(manifestBytes);
+	const bytes = new Uint8Array(manifestBytes);
+	const selected = Object.freeze({
+		bundleVersion: selection?.bundleVersion, manifestSha256: selection?.manifestSha256,
+	});
+	const manifest = readLocalBundleManifest(bytes, selected);
+	const files: { file: LocalBundleFile; bytes: Uint8Array }[] = [];
+	verifyBundleAssets(manifest.files, assets, (file, snapshot) => files.push({ file, bytes: snapshot }));
+
+	if (process.platform !== "linux") throw new Error("local bundle staging requires Linux");
+	// A root-owned sticky parent protects the new directory entry from other users.
+	const stageParent = "/tmp";
+	const parent = await fs.lstat(stageParent);
+	if (!parent.isDirectory() || parent.uid !== 0 || !(parent.mode & 0o1000)) {
+		throw new Error("local bundle staging requires a root-owned sticky /tmp directory");
+	}
+	signal?.throwIfAborted();
+	const directory = await fs.mkdtemp(join(stageParent, "kit-bundle-stage-"));
+	try {
+		await fs.chmod(directory, 0o700);
+		for (const { file, bytes: payload } of files) {
+			signal?.throwIfAborted();
+			const path = join(directory, file.path);
+			await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+			await writeBundleStageFile(path, payload, file.mode);
+		}
+		signal?.throwIfAborted();
+		await writeBundleStageFile(join(directory, "manifest.json"), bytes, 0o600);
+		signal?.throwIfAborted();
+		return Object.freeze({ directory, selection: selected });
+	} catch (error) {
+		try {
+			await fs.rm(directory, { recursive: true, force: true });
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], `local bundle staging failed and could not remove ${directory}`);
+		}
+		throw error;
+	}
+}
+
+async function writeBundleStageFile(path: string, bytes: Uint8Array, mode: number): Promise<void> {
+	const handle = await fs.open(path, "wx", 0o600);
+	try {
+		await handle.writeFile(bytes);
+		await handle.chmod(mode);
+	} finally {
+		await handle.close();
+	}
+}
+
+function assertBundleManifestBytes(bytes: Uint8Array): void {
+	if (!validBundleBytes(bytes) || bundleByteLength(bytes) > BUNDLE_MAX_MANIFEST_BYTES) {
 		throw new Error("local bundle manifest exceeds its byte limit or has invalid bytes");
 	}
+}
+
+function readLocalBundleManifest(manifestBytes: Uint8Array, selection: LocalBundleSelection): LocalBundleManifest {
 	if (!selection || !isSha256(selection.manifestSha256) || sha256Bytes(manifestBytes) !== selection.manifestSha256) {
 		throw new Error("local bundle manifestSha256 mismatch");
 	}
@@ -201,7 +276,6 @@ export function validateLocalBundle(
 	}
 	assertLocalBundleManifest(manifest, selection.bundleVersion);
 	assertCanonicalBundle(manifestBytes, manifest);
-	verifyBundleAssets(manifest.files, assets);
 	return manifest;
 }
 
@@ -236,7 +310,12 @@ function assertCanonicalBundle(bytes: Uint8Array, manifest: LocalBundleManifest)
 }
 
 function validBundleBytes(value: unknown): value is Uint8Array {
-	return value instanceof Uint8Array && value.buffer instanceof ArrayBuffer;
+	return isUint8Array(value) && isArrayBuffer(Reflect.get(TYPED_ARRAY_PROTOTYPE, "buffer", value));
+}
+
+function bundleByteLength(bytes: Uint8Array): number {
+	// Ignore caller-owned properties shadowing the actual typed-array view.
+	return Reflect.get(TYPED_ARRAY_PROTOTYPE, "byteLength", bytes) as number;
 }
 
 function isSha256(value: unknown): value is string {
@@ -392,22 +471,31 @@ function checkBundlePathCollisions(path: string, names: Map<string, string>): vo
 	}
 }
 
-function verifyBundleAssets(files: readonly LocalBundleFile[], assets: readonly LocalBundleAsset[]): void {
+function verifyBundleAssets(
+	files: readonly LocalBundleFile[],
+	assets: readonly LocalBundleAsset[],
+	retain?: (file: LocalBundleFile, snapshot: Uint8Array) => void,
+): void {
 	if (!Array.isArray(assets) || assets.length !== files.length) {
 		throw new Error("local bundle asset inventory count mismatch");
 	}
 	const remaining = new Map(files.map((file) => [file.path, file]));
 	for (let index = 0; index < files.length; index++) {
 		const asset = Object.hasOwn(assets, index) ? assets[index] : undefined;
-		if (!hasBundleFields(asset, ["path", "kind", "mode", "bytes"]) ||
-			typeof asset.path !== "string" || asset.kind !== "file" || !validBundleBytes(asset.bytes)) {
+		if (!hasBundleFields(asset, ["path", "kind", "mode", "bytes"])) {
 			throw new Error("invalid local bundle file observation");
 		}
-		const file = remaining.get(asset.path);
+		const { path, kind, mode, bytes } = asset;
+		if (typeof path !== "string" || kind !== "file" || !validBundleBytes(bytes)) {
+			throw new Error("invalid local bundle file observation");
+		}
+		const file = remaining.get(path);
 		if (!file) throw new Error("unexpected or duplicate local bundle file observation");
-		if (asset.mode !== file.mode) throw new Error(`local bundle file mode mismatch: ${file.path}`);
-		if (asset.bytes.byteLength !== file.size) throw new Error(`local bundle file size mismatch: ${file.path}`);
-		if (sha256Bytes(asset.bytes) !== file.sha256) throw new Error(`local bundle file SHA-256 mismatch: ${file.path}`);
+		if (mode !== file.mode) throw new Error(`local bundle file mode mismatch: ${file.path}`);
+		if (bundleByteLength(bytes) !== file.size) throw new Error(`local bundle file size mismatch: ${file.path}`);
+		const verified = retain ? new Uint8Array(bytes) : bytes;
+		if (sha256Bytes(verified) !== file.sha256) throw new Error(`local bundle file SHA-256 mismatch: ${file.path}`);
+		retain?.(file, verified);
 		remaining.delete(file.path);
 	}
 }

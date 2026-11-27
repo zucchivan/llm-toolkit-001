@@ -149,7 +149,9 @@ development host after the merge-review gate correction, and the optimized
 test lane exercised the same binary bytes. [Current S2 evidence](evidence/M1-P03.md#s2-merge-review-verification-2026-11-27)
 
 S3 increment 1 defines the versioned bundle format and offline validator.
-S3 still owns exact inputs, safe setup and enrollment, and the offline fixture.
+Increment 2 prepares caller-materialized bundle observations in private staging.
+S3 still owns exact inputs, bounded archive intake, setup and enrollment, and
+the offline fixture.
 S4 owns full scan, seal and private-ref recovery. S5 wires the production adapter
 and runs the full Bubblewrap/guest conformance lane. Each remains bounded by M1.md
 P03. Packet closure still requires real conformance and reviewer acceptance.

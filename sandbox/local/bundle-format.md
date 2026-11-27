@@ -83,8 +83,8 @@ reserved project or platform names, trailing slashes, and case-folding
 collisions at any prefix are refused. Directories are implicit. A path
 cannot be both a file and a directory. Payloads consist only of regular
 files. Symlinks, hardlinks, special files, and special permission bits are
-outside the format. Future staging must supply a complete bounded observation
-and enforce those filesystem properties before creating the in-memory records.
+outside the format. An input adapter must enforce these properties and produce
+a complete bounded observation before it constructs the in-memory records.
 
 | Limit | Maximum |
 | --- | --- |
@@ -111,6 +111,29 @@ execution, network or profile access. The caller owns safe traversal,
 retention of verified bytes and use-time binding, including platform and
 ABI qualification. No trust in observed files survives a change to the
 bytes or their selected installation.
+
+## Private offline preparation
+
+`prepareLocalBundle(manifestBytes, assets, selection, signal?)` applies the same
+validation to materialized observations. It retains private byte copies and the
+explicit version and reviewed digest before any asynchronous filesystem
+operation. The schema limits apply to the retained inventory. Callers must
+also enforce bounds during materialization. This entrypoint accepts bytes
+and file observations, with no archive or filesystem source-path argument.
+
+On Linux it creates a fresh mode-`0700` directory under root-owned sticky
+`/tmp`. Payloads are exclusive new regular files at their declared paths and
+modes. The canonical `manifest.json` is written last at mode `0600`. The
+operation returns the private directory and its selection only after closing
+every file. Separate preparations use separate directories, including for
+different explicit versions. The receiving caller owns cleanup.
+
+On cancellation or an I/O error the operation attempts to remove its stage
+and rejects. A process killed before return may leave a private directory.
+Completion exists only in the returned result. Temporary directories and
+their manifests must never be discovered or adopted as completed stages.
+Preparation provides no durable recovery receipt. Future installation must
+bind its own admission to the reviewed selection and measured bytes.
 
 Under D1, present exact sources, authenticity evidence, pins, canonical
 destinations, commands, privileges and profile changes for review before
