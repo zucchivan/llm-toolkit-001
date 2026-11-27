@@ -18,7 +18,15 @@ Each project sets a provider and model for three jobs in `.orch/config.toml`.
 | Implementer | Edits files for one approved task. A repair attempt gets feedback from the failed check or review. |
 | Verifier | Reviews the candidate against each criterion and cites evidence. By default, a fresh second review challenges a primary approval. Both passes use the configured verifier model. |
 
-**Available today.** You can use a stronger planner and a cheaper implementer now. The shipped template uses Sonnet for both jobs and GPT-5 nano for verification. To try cheaper coding runs, change `[roles.implementer]` before planning. Each role keeps its assigned model across attempts. [Shipped configuration](template/.orch/config.toml)
+**Available today.** For example, you can ask Claude Opus 5.5 to break down the requirements, use GPT-6 Luna for routine coding, and give GPT-6 Sol the independent review. To try that combination, edit the three role tables in `.orch/config.toml` before planning. These are example assignments. Each role uses its configured model across attempts. [Shipped defaults](template/.orch/config.toml)
+
+| Role table | `provider` | `modelId` |
+| --- | --- | --- |
+| `[roles.planner]` | `anthropic` | `claude-opus-5-5` |
+| `[roles.implementer]` | `openai` | `gpt-6-luna` |
+| `[roles.verifier]` | `openai` | `gpt-6-sol` |
+
+OpenAI also offers GPT-6.2 Sol (`gpt-6.2-sol`). The kit’s pinned provider catalog (pi-ai 1.5.0) includes GPT-6 Sol and does not yet list 6.2 Sol for the providers wired into the CLI. [OpenAI model details](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
 
 **Planned for M2.** New projects will start routine coding on the cheaper implementer. The proposed policy calls on the planner’s more capable model in the following cases.
 
