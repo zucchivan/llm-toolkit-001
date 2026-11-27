@@ -27,6 +27,7 @@ import { resolveTree } from "./util/git-objects.ts";
 import { loadPrd, runPlan, PlanParseError } from "./engine/planner.ts";
 import { reviewBindingRefusal } from "./engine/plans.ts";
 import { runWaves } from "./engine/waves.ts";
+import { RecoveryRequiredError } from "./engine/delivery.ts";
 import type { ProgressEvent } from "./engine/driver-events.ts";
 import { renderInspectPanel } from "./views/inspect.ts";
 import { renderStatusPanel } from "./views/status.ts";
@@ -233,8 +234,7 @@ async function cmdRun(argv: string[]): Promise<void> {
 				tasksFilter: values["tasks"] ?? [],
 			},
 			printProgress,
-		);
-		process.off("SIGINT", onInterrupt);
+		).finally(() => { process.off("SIGINT", onInterrupt); });
 		await kit.loop.close();
 		kit.lock.release();
 		const paperTrail = " Paper trail: router.md · .orch/wave-log.jsonl";
@@ -292,7 +292,13 @@ async function cmdRun(argv: string[]): Promise<void> {
 		we.log(`\n${c.yellow}run stopped: ${summary.exit}${RESET} — rerun to resume.${paperTrail}`);
 		process.exitCode = 2;
 	} catch (err) {
+		await kit?.loop.close().catch(() => {});
 		kit?.lock.release();
+		if (err instanceof RecoveryRequiredError) {
+			we.error(`${c.yellow}recovery required${RESET} — ${err.message}`);
+			process.exitCode = 2;
+			return;
+		}
 		fail(err, "run");
 	}
 }

@@ -11,6 +11,7 @@ import type { LoopAndLock } from "./harness.ts";
 import { classifyProjectPath } from "../hygiene.ts";
 import { parseApprovedGitHubOrigin, readApprovedDeliveryOrigin } from "../sandbox/host-profile.ts";
 import type { ApprovedGitHubOrigin } from "../sandbox/host-profile.ts";
+import { reviewBindingRefusal, type PlanIdentity } from "./plans.ts";
 import { commitState, readGrant, readSessionState } from "./state.ts";
 import type { ReceiptAttempt } from "./state.ts";
 import {
@@ -375,6 +376,9 @@ export async function publishLocalResult(
 	if (mode !== "none" && mode !== "commit") throw new Error(`prepared local publication does not support mode ${String(mode)}`);
 	const { state } = await assertCurrentTask(kit, wave);
 	const plan = state.router.identity!;
+	if (plan.deliveryOrigin !== undefined) {
+		throw new RecoveryRequiredError("reviewed PR delivery cannot finish in a local delivery mode; restore the reviewed mode to recover publication");
+	}
 	const doc = await receiptSnapshot(kit);
 	const integration = latestOf(doc, wave, "integrate");
 	if (!integration || integration.value.state !== "integrated") throw new Error("local publication requires a confirmed integration receipt");
@@ -650,6 +654,7 @@ async function publicationBase(
 	baseBranch: string | null,
 	parent: string,
 	doc: ReceiptsDocValue,
+	deliveryOrigin: string,
 ): Promise<string> {
 	if (parent === baseCommit) {
 		if (!baseBranch || baseBranch.startsWith("(") || baseBranch.startsWith("refs/")) {
@@ -662,22 +667,47 @@ async function publicationBase(
 	}
 	const matches = doc.events.filter((event): event is Extract<ReceiptEvent, { kind: "delivery" }> =>
 		event.kind === "delivery" && event.value.planRevision === planRevision && event.value.mode === "pr"
-			&& event.value.state === "published" && event.value.commit === parent && !!latestDeliveryFor(doc, event)
-			&& latestDeliveryFor(doc, event)!.opId === event.opId,
+			&& event.value.state === "published" && event.value.commit === parent
+			&& latestDeliveryFor(doc, event)?.opId === event.opId,
 	);
-	const unique = [...new Map(matches.map((event) => [event.value.ref, event])).values()];
-	if (unique.length !== 1 || !unique[0]!.value.ref) {
+	const base = matches[0]?.value;
+	if (matches.length !== 1 || !base?.ref) {
 		throw new RecoveryRequiredError(`integration parent ${parent} is not the reviewed base or one uniquely published PR head; refusing to guess a stack base`);
 	}
-	const ref = assertBranchRef(unique[0]!.value.ref!);
-	return ref;
+	if (base.deliveryOrigin !== deliveryOrigin) {
+		throw new RecoveryRequiredError(`published stack base ${base.ref} lacks a matching PR destination binding; inspect its original delivery receipt`);
+	}
+	return assertBranchRef(base.ref);
 }
 
-/**
- * Publish an integrated accepted commit as a create-only remote branch and a
- * validated GitHub PR. Retries first reconcile both effects; remote branches
- * are never updated, and an uncertain PR-create attempt is never repeated.
- */
+/** Check the recorded canonical origin against current local operator authority. */
+export async function requireReviewedPrDestination(
+	root: string,
+	plan: PlanIdentity,
+	profilePath?: string,
+): Promise<ApprovedGitHubOrigin> {
+	if (plan.deliveryOrigin === undefined) {
+		throw new RecoveryRequiredError("reviewed plan has no PR destination binding; reconcile any unresolved delivery manually or replan if there is no unresolved effect");
+	}
+	let pinned: ApprovedGitHubOrigin;
+	try {
+		pinned = parseApprovedGitHubOrigin(plan.deliveryOrigin);
+		if (pinned.origin !== plan.deliveryOrigin) throw new Error("recorded origin is not canonical");
+	} catch (error) {
+		throw new RecoveryRequiredError(`invalid reviewed PR destination binding: ${(error as Error).message}`);
+	}
+	let current: ApprovedGitHubOrigin;
+	try {
+		current = await readApprovedDeliveryOrigin(root, profilePath);
+	} catch (error) {
+		throw new RecoveryRequiredError(`cannot establish current PR destination authorization: ${(error as Error).message}`);
+	}
+	if (current.origin !== pinned.origin) {
+		throw new RecoveryRequiredError(`operator-approved PR destination changed from ${pinned.origin} to ${current.origin}; restore the original authorization, or replan and re-approve if there is no unresolved effect`);
+	}
+	return pinned;
+}
+
 /** Validate consent, the host-approved destination, and reviewed base branch without network effects. */
 export async function preflightPullRequest(
 	kit: LoopAndLock,
@@ -691,12 +721,13 @@ export async function preflightPullRequest(
 	if (!plan.baseBranch || plan.baseBranch.startsWith("(") || plan.baseBranch.startsWith("refs/")) {
 		throw new Error("PR delivery requires the reviewed base branch captured by the plan; detached-base plans cannot publish");
 	}
-	await readApprovedDeliveryOrigin(kit.loop.paths.root, options.profilePath);
+	await requireReviewedPrDestination(kit.loop.paths.root, plan, options.profilePath);
 	const baseRef = assertBranchRef(`refs/heads/${plan.baseBranch}`);
 	const check = await runGit(kit.loop.paths.root, ["check-ref-format", baseRef], { timeoutMs: 10_000 });
 	if (check.code !== 0) throw new Error(`reviewed base branch ${JSON.stringify(plan.baseBranch)} is not a valid Git branch`);
 }
 
+/** Publish or reconcile a create-only branch and exact PR for the reviewed destination. */
 export async function publishPullRequest(
 	kit: LoopAndLock,
 	wave: WaveKey,
@@ -712,6 +743,10 @@ export async function publishPullRequest(
 	}
 	if (!plan.baseCommit) throw new Error("PR publication requires a reviewed base commit");
 	const doc = await receiptSnapshot(kit);
+	const prior = latestOf(doc, wave, "delivery");
+	if (prior?.value.mode === "pr" && prior.value.deliveryOrigin === undefined) {
+		throw new RecoveryRequiredError("legacy PR delivery receipt has no destination binding; preserve the journal and verify the original destination independently before manual recovery");
+	}
 	const integration = latestOf(doc, wave, "integrate");
 	const acceptance = latestOf(doc, wave, "acceptance");
 	if (!integration || integration.value.state !== "integrated" || !acceptance || acceptance.value.id !== integration.value.acceptedId) {
@@ -727,8 +762,12 @@ export async function publishPullRequest(
 	await assertPublicTree(root, commitData.tree, "accepted candidate");
 	await assertPublicTree(root, (await readCommit(root, parent)).tree, "integration parent");
 
-	const approved: ApprovedGitHubOrigin = await readApprovedDeliveryOrigin(root, options.profilePath);
-	const baseRef = await publicationBase(root, wave.planRevision, plan.baseCommit, plan.baseBranch, parent, doc);
+	const authorizeDestination = () => requireReviewedPrDestination(root, plan, options.profilePath);
+	const approved = await authorizeDestination();
+	if (prior && prior.value.deliveryOrigin !== approved.origin) {
+		throw new RecoveryRequiredError("durable PR delivery destination differs from the reviewed plan; inspect the original delivery intent");
+	}
+	const baseRef = await publicationBase(root, wave.planRevision, plan.baseCommit, plan.baseBranch, parent, doc, approved.origin);
 	const headRef = assertBranchRef(deliveryBranchRef(wave));
 	const identity: PullRequestIdentity = {
 		repository: approved.repository,
@@ -739,116 +778,125 @@ export async function publishPullRequest(
 	};
 	const git = options.gitTransport ?? new TrustedGitRemoteTransport(root);
 	const host = options.prHost ?? new GhPullRequestHost(root);
-	const prior = latestOf(doc, wave, "delivery");
-	const firstAttempt = prior === undefined;
 	if (prior && (prior.value.acceptedId !== acceptance.value.id || prior.value.commit !== commit || prior.value.mode !== "pr"
 		|| prior.value.ref !== headRef || prior.value.baseRef !== baseRef)) {
 		throw new RecoveryRequiredError("PR delivery retry differs from its durable acceptance, commit, head, or stack base");
 	}
+	async function requireCurrentControls(): Promise<void> {
+		const refusal = await reviewBindingRefusal(root, plan, kit.loop.config);
+		if (refusal) throw new RecoveryRequiredError(`cannot start a new PR publication effect: ${refusal}`);
+	}
+	if (!prior) await requireCurrentControls();
 
 	// Confirm the reviewed base still names exactly the expected parent. A base
 	// movement is never repaired by selecting a newer origin tip.
 	let observedBase: string | undefined;
+	await authorizeDestination();
 	try { observedBase = await git.readRemoteRef(approved.origin, baseRef); }
 	catch (error) { throw new RecoveryRequiredError(`cannot query approved PR base ${baseRef}: ${(error as Error).message}`); }
 	if (observedBase !== parent) throw new RecoveryRequiredError(`approved PR base ${baseRef} is ${observedBase ?? "absent"}, expected reviewed parent ${parent}`);
 
 	let deliveryIntent = prior?.value;
-	if (deliveryIntent?.state === "published") {
-		// A published receipt is an observation, not permission to overlook a
-		// later ref/PR conflict. Re-verify below before returning it.
-	} else if (!deliveryIntent) {
+	if (!deliveryIntent) {
 		const event = await appendJournal(kit, wave, "delivery", (meta) => ({
 			kind: "delivery", ...meta, value: {
 				...wave, id: meta.opId, acceptedId: acceptance.value.id, commit, mode: "pr", state: "pending",
-				ref: headRef, baseRef, checkedAt: meta.at, code: "remote-ref-pending",
+				ref: headRef, baseRef, deliveryOrigin: approved.origin, checkedAt: meta.at, code: "remote-ref-pending",
 			},
 		}), options, "delivery-intent");
 		deliveryIntent = event.value;
 	}
 
 	let observedHead: string | undefined;
+	await authorizeDestination();
 	try { observedHead = await git.readRemoteRef(approved.origin, headRef); }
 	catch (error) {
-		if (!deliveryIntent) throw error;
-		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-unreadable", options);
+		if (deliveryIntent.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-unreadable", options);
 		throw new RecoveryRequiredError(`cannot observe approved remote head ${headRef}: ${(error as Error).message}`);
 	}
 	if (observedHead !== undefined && observedHead !== commit) {
-		if (deliveryIntent?.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-conflict", options);
+		if (deliveryIntent.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-conflict", options);
 		throw new RecoveryRequiredError(`refusing conflicting existing remote head ${headRef}: ${observedHead}; expected exact commit ${commit}`);
 	}
 	// A durable pre-attempt intent can retry; after an attempt, absence could
 	// mean the remote ref was deleted, so it must remain recovery-required.
-	if (observedHead === undefined && !firstAttempt && deliveryIntent?.code !== "remote-ref-pending") {
+	if (observedHead === undefined && (deliveryIntent.state === "published" || deliveryIntent.code !== "remote-ref-pending")) {
 		// A prior intent means the create may already have happened and the ref
 		// may since have been removed. Recreating it would be repair, not replay.
-		await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-missing-after-intent", options);
+		if (deliveryIntent.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-missing-after-intent", options);
 		throw new RecoveryRequiredError(`remote head ${headRef} is absent after a recorded publication intent; refusing to recreate or repair it`);
 	}
 	if (observedHead === undefined) {
+		await requireCurrentControls();
 		// Record that a push may have been attempted before calling the transport.
 		// A subsequent absent head is uncertain, never blindly recreated.
-		deliveryIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent!, "pending", "remote-ref-create-attempt", options)).receipt;
+		deliveryIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "remote-ref-create-attempt", options)).receipt;
 		// An empty-expected lease creates the ref atomically.
 		// If the response is lost, readback decides whether the exact commit appeared.
 		try {
 			await fault(options, "pr-ref-create:before-effect");
+			await authorizeDestination();
 			await git.createRemoteRef(approved.origin, headRef, commit);
 			await fault(options, "pr-ref-create:after-effect");
 		} catch (error) {
+			await authorizeDestination();
 			const readback = await git.readRemoteRef(approved.origin, headRef).catch(() => undefined);
 			if (readback !== commit) {
-				await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", readback ? "remote-ref-conflict" : "remote-ref-create-uncertain", options);
+				await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", readback ? "remote-ref-conflict" : "remote-ref-create-uncertain", options);
 				throw new RecoveryRequiredError(`create-only remote ref effect is uncertain (${(error as Error).message}); observed ${readback ?? "absence"}`);
 			}
 		}
+		await authorizeDestination();
 		observedHead = await git.readRemoteRef(approved.origin, headRef);
 		if (observedHead !== commit) {
-			await recordPrDeliveryState(kit, wave, deliveryIntent!, "unknown", "remote-ref-readback-mismatch", options);
+			await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "remote-ref-readback-mismatch", options);
 			throw new RecoveryRequiredError(`remote head readback is ${observedHead ?? "absent"}, not ${commit}`);
 		}
 	}
 
 	// Persist the confirmed branch before any PR-host mutation. A crash before
 	// the next intent can safely resume from the create-only branch observation.
-	const latestAfterBranch = latestOf(await receiptSnapshot(kit), wave, "delivery")?.value ?? deliveryIntent!;
-	if (latestAfterBranch.code !== "pr-create-intent" && latestAfterBranch.code !== "pr-create-uncertain"
-		&& (latestAfterBranch.state !== "published" || !latestAfterBranch.prNumber)) {
-		deliveryIntent = (await recordPrDeliveryState(kit, wave, latestAfterBranch, "pending", "remote-ref-confirmed", options)).receipt;
-	} else {
-		deliveryIntent = latestAfterBranch;
+	// Later ref errors may change the latest code without undoing a PR attempt.
+	const prCreateMayHaveOccurred = prior !== undefined && doc.events.some((event) =>
+		event.kind === "delivery" && event.key === prior.key
+		&& (event.value.prNumber !== undefined || ["pr-create-intent", "pr-create-uncertain", "pr-identity-conflict"].includes(event.value.code ?? "")),
+	);
+	if (deliveryIntent.state !== "published" && !prCreateMayHaveOccurred) {
+		deliveryIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "remote-ref-confirmed", options)).receipt;
 	}
 
 	let records: RemotePullRequest[];
+	await authorizeDestination();
 	try { records = await host.findForHead(identity); }
 	catch (error) {
-		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", deliveryIntent.code === "pr-create-intent" || deliveryIntent.code === "pr-create-uncertain" ? "pr-create-uncertain" : "pr-lookup-failed", options);
+		if (deliveryIntent.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", prCreateMayHaveOccurred ? "pr-create-uncertain" : "pr-lookup-failed", options);
 		throw new RecoveryRequiredError(`PR lookup failed; no blind create/retry will be made: ${(error as Error).message}`);
 	}
 	let found: RemotePullRequest | undefined;
 	try { found = findExactPr(records, identity); }
 	catch (error) {
-		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "pr-identity-conflict", options);
+		if (deliveryIntent.state !== "published") await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "pr-identity-conflict", options);
 		throw error;
 	}
-	if (found) {
-		if (deliveryIntent.state === "published" && deliveryIntent.prNumber === found.number && deliveryIntent.prUrl === found.url) {
-			const existing = latestOf(await receiptSnapshot(kit), wave, "delivery");
-			if (existing?.value.state === "published") return { receipt: existing.value, event: existing };
+	if (prior?.value.state === "published") {
+		if (found && prior.value.prNumber === found.number && prior.value.prUrl === found.url) {
+			return { receipt: prior.value, event: prior };
 		}
+		throw new RecoveryRequiredError("the recorded published PR identity is no longer observable; refusing to replace it");
+	}
+	if (found) {
 		return await recordPrDeliveryState(kit, wave, deliveryIntent, "published", undefined, options, found);
 	}
 
-	const prCreateMayHaveOccurred = deliveryIntent.prNumber !== undefined
-		|| ["pr-create-intent", "pr-create-uncertain", "pr-identity-conflict"].includes(deliveryIntent.code ?? "");
 	if (prCreateMayHaveOccurred) {
 		await recordPrDeliveryState(kit, wave, deliveryIntent, "unknown", "pr-create-uncertain", options);
 		throw new RecoveryRequiredError("no matching PR is currently observable after a possibly attempted/conflicting create; refusing a blind duplicate create");
 	}
+	await requireCurrentControls();
 	const createIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "pr-create-intent", options)).receipt;
 	try {
 		await fault(options, "pr-host-create:before-effect");
+		await authorizeDestination();
 		await host.create({
 			...identity,
 			title: `llm-toolkit-001: ${wave.taskId}`,
@@ -858,6 +906,7 @@ export async function publishPullRequest(
 	} catch (error) {
 		// A timed-out create may have succeeded. Reconcile by repo/base/head/OID;
 		// never repeat create merely because its response was lost.
+		await authorizeDestination();
 		const reconciled = await host.findForHead(identity).catch(() => undefined);
 		if (reconciled) {
 			try {
@@ -873,6 +922,7 @@ export async function publishPullRequest(
 	}
 
 	let created: RemotePullRequest[];
+	await authorizeDestination();
 	try { created = await host.findForHead(identity); }
 	catch (error) {
 		await recordPrDeliveryState(kit, wave, createIntent, "unknown", "pr-create-uncertain", options);
@@ -904,6 +954,7 @@ async function recordPrDeliveryState(
 		kind: "delivery", ...meta, value: {
 			...wave, id: meta.opId, acceptedId: intent.acceptedId, commit: intent.commit, mode: "pr", state,
 			...(intent.ref ? { ref: intent.ref } : {}), ...(intent.baseRef ? { baseRef: intent.baseRef } : {}),
+			...(intent.deliveryOrigin !== undefined ? { deliveryOrigin: intent.deliveryOrigin } : {}),
 			...(pr ? { prNumber: pr.number, prUrl: pr.url } : intent.prNumber !== undefined ? { prNumber: intent.prNumber, ...(intent.prUrl ? { prUrl: intent.prUrl } : {}) } : {}),
 			checkedAt: meta.at, ...(code ? { code } : {}),
 		},

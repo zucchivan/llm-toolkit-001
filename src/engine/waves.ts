@@ -43,7 +43,7 @@ import { hostExecArgv } from "./recipe-runner.ts";
 import { createTaskControls } from "./controls.ts";
 import {
 	acceptCandidate, discardCandidateWorkspace, integrateAcceptedCandidate, preflightPullRequest,
-	publishLocalResult, publishPullRequest, RecoveryRequiredError,
+	publishLocalResult, publishPullRequest, RecoveryRequiredError, requireReviewedPrDestination,
 } from "./delivery.ts";
 import type { PrPublicationOptions } from "./delivery.ts";
 import type { ProgressEvent } from "./driver-events.ts";
@@ -220,7 +220,7 @@ export interface ApprovalRequest {
  * fixtures all go through it, so no stamp can exist without a
  * revision-qualified, mirror-matched human review.
  */
-export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest): Promise<Grant> {
+export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest, profilePath?: string): Promise<Grant> {
 	const state = await readSessionState(kit.loop.harness);
 	if (!state.router.tasks.length) throw new DriverStateError("no tasks — run `plan` first (or migrate a router.md)");
 	const refusal = grantRefusal(state, { approve: { planRevision: request.planRevision, tasks: request.tasks } });
@@ -229,6 +229,9 @@ export async function approveGrant(kit: LoopAndLock, request: ApprovalRequest): 
 	if (checkpointConflict) throw new DriverStateError(checkpointConflict);
 	const inputsRefusal = await reviewedInputsRefusal(kit, state);
 	if (inputsRefusal) throw new DriverStateError(inputsRefusal);
+	if (kit.loop.config.delivery.mode === "pr") {
+		await requireReviewedPrDestination(kit.loop.paths.root, state.router.identity!, profilePath);
+	}
 	// The grant binds the human to what they reviewed: the mirror must exist
 	// and match the canonical durable render (edited/missing → replan).
 	const mirrorRefusal = await approvalMirrorRefusal(kit, state);
@@ -286,6 +289,7 @@ export async function runWaves(
 				...(options.prPublication?.profilePath ? { profilePath: options.prPublication.profilePath } : {}),
 			});
 		} catch (error) {
+			if (error instanceof RecoveryRequiredError) throw error;
 			throw new DriverStateError((error as Error).message);
 		}
 	}
@@ -293,7 +297,7 @@ export async function runWaves(
 	const explicitTasks = options.tasksFilter?.length ? options.tasksFilter : undefined;
 	let grant: Grant;
 	if (options.approve) {
-		grant = await approveGrant(kit, { planRevision: options.approve.planRevision, tasks: explicitTasks });
+		grant = await approveGrant(kit, { planRevision: options.approve.planRevision, tasks: explicitTasks }, options.prPublication?.profilePath);
 	} else {
 		const refusal = grantRefusal(initial, { tasks: explicitTasks });
 		if (refusal) throw new DriverStateError(refusal);
@@ -405,6 +409,9 @@ export async function runWaves(
 			if (resumedModelStage) {
 				const inputsRefusal = await reviewedInputsRefusal(kit, stateNow);
 				if (inputsRefusal) throw new DriverStateError(inputsRefusal);
+				if (kit.loop.config.delivery.mode === "pr" && stateNow.router.identity) {
+					await requireReviewedPrDestination(kit.loop.paths.root, stateNow.router.identity, options.prPublication?.profilePath);
+				}
 			}
 		}
 		if (!task) {
@@ -828,6 +835,9 @@ export async function driveTaskWaves(
 		if (!active) {
 			const bindingRefusal = await reviewBindingRefusal(root, identity, kit.loop.config);
 			if (bindingRefusal) throw new DriverStateError(bindingRefusal);
+			if (kit.loop.config.delivery.mode === "pr") {
+				await requireReviewedPrDestination(root, identity, opts.prPublication?.profilePath);
+			}
 		}
 
 		const wave = active?.wave ?? current.waveCount + 1;

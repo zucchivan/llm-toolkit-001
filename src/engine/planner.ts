@@ -8,7 +8,7 @@
  * same commit. A failed parse leaves the old plan untouched.
  */
 import { join } from "node:path";
-import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
+import { readApprovedDeliveryOrigin, resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
 import { headBranch, headCommit } from "../util/git.ts";
 import { readSafeText } from "../util/safe-read.ts";
 import { ConversationKit } from "./conversations.ts";
@@ -80,15 +80,26 @@ export async function loadPrd(kit: LoopAndLock, prdPathArg?: string): Promise<st
 }
 
 /** Run the one planning conversation and commit "planned" state. */
-export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText: string): Promise<PlanOutcome> {
+export async function runPlan(
+	kitAndLock: LoopAndLock,
+	prdPath: string,
+	prdText: string,
+	/** Internal profile path seam for offline PR tests. */
+	options: { profilePath?: string } = {},
+): Promise<PlanOutcome> {
 	// Replacing a plan must not strand an old lease or an unconfirmed effect.
 	const prior = await readSessionState(kitAndLock.loop.harness);
 	if (prior.router.identity && prior.router.tasks.some((task) => task.status === "in_progress")) throw new PlanParseError("cannot replan while a task is in progress — reconcile its checkpoint first");
 	const receipts = await kitAndLock.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT);
 	if (prior.router.identity && receipts) {
 		const latest = new Map<string, (typeof receipts.events)[number]>();
+		const deliveries = new Map<string, Extract<(typeof receipts.events)[number], { kind: "delivery" }>>();
 		for (const event of receipts.events) {
 			if (event.kind === "checkpoint" && event.value.planRevision === prior.router.identity.planRevision) latest.set(`${event.value.taskId}/${event.value.wave}`, event);
+			if (event.kind === "delivery" && event.value.planRevision === prior.router.identity.planRevision) deliveries.set(event.key, event);
+		}
+		if ([...deliveries.values()].some(({ value }) => value.mode === "pr" && value.state !== "published")) {
+			throw new PlanParseError("cannot replan with an unresolved PR delivery intent — recover the prior revision first");
 		}
 		if ([...latest.values()].some((event) => event.kind === "checkpoint" && (event.value.stage !== "terminal" || event.value.state !== "complete"))) {
 			throw new PlanParseError("cannot replan with unresolved checkpoint or effect — resume or reconcile the prior revision first");
@@ -112,7 +123,14 @@ export async function runPlan(kitAndLock: LoopAndLock, prdPath: string, prdText:
 	// was edited/deleted without a commit: otherwise the plan reviews one set of
 	// bytes and the wave executes another. The base is captured here too, so a
 	// HEAD move during the planning conversation cannot silently rebind it.
-	const base = { commit: await headCommit(root), branch: await headBranch(root) };
+	const destination = kitAndLock.loop.config.delivery.mode === "pr"
+		? await readApprovedDeliveryOrigin(root, options.profilePath)
+		: undefined;
+	const base = {
+		commit: await headCommit(root),
+		branch: await headBranch(root),
+		...(destination ? { deliveryOrigin: destination.origin } : {}),
+	};
 	const baseControlsRefusal = await reviewedBaseTreeRefusal(root, base.commit, controls);
 	if (baseControlsRefusal) throw new PlanParseError(baseControlsRefusal);
 	await flushStatusSnapshot(kitAndLock, { phase: "planning" });

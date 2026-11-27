@@ -688,7 +688,7 @@ This is not an auto-merge feature or a claim that a PR is CI-approved code.
 `run` uses the verified publication contract below; no legacy branch/checkout
 path remains active.
 
-Before a PR-mode run, the operator must put exactly one project entry in
+Before PR-mode planning, the operator must put exactly one project entry in
 the private host policy (`~/.config/llm-toolkit-001/host-v1.json`, or the
 platform-equivalent) with an approved canonical HTTPS GitHub `deliveryOrigin`
 for the exact canonical project root. The operation reads that allowlisted
@@ -698,6 +698,19 @@ GitHub token in project config. Git transport uses a private bare directory
 with clean config and the exact approved URL. Push uses the source object
 store without importing its config. The HTTPS credential path uses the
 validated, literally quoted gh executable. Credentials stay in host delivery.
+
+`plan` records the canonical destination in the durable revision and shows
+it in `router.md` for review. Run and resume require explicit `--deliver`.
+Current operator authorization must match the reviewed destination before
+any remote observation or change. The delivery journal binds that same
+origin before either remote mutation. A missing, changed or ambiguous
+binding stops publication and reports recovery required.
+
+For a legacy PR intent with no destination binding, preserve the journal
+and establish the original destination from independent operator records.
+The kit provides no automated recovery or replan for that unresolved
+effect. Completed legacy receipts remain readable. If there is no
+unresolved effect, create a new plan and review the bound destination.
 
 Before any public branch is created, the pinned candidate and its integration
 parent are checked for tracked private `.orch` runtime state and §2 secret
@@ -714,8 +727,9 @@ blindly recreated. An exact existing head is observed without pushing; a
 different head blocks. An already-attempted ref that later disappears is not
 recreated. Task A's PR targets the reviewed base branch only while it still
 points at the reviewed base commit. A later task's PR targets the unique
-previously published branch whose recorded integration commit is its exact
-parent. The new commit keeps that local integration commit as its single parent;
+previously published branch whose receipt binds the same destination and
+whose recorded integration commit is its exact parent. The new commit keeps
+that local integration commit as its single parent;
 publication does not guess at a GitHub merge commit.
 
 The PR host receives explicit repo/base/head identities. `published` is recorded

@@ -100,6 +100,8 @@ export type PlanIdentity = {
 	baseCommit: string | null;
 	/** Checked-out branch at planning; null when HEAD is detached or there is no repository. */
 	baseBranch: string | null;
+	/** Canonical operator-approved GitHub origin, captured only for PR plans. */
+	deliveryOrigin?: string;
 	/** Normalized project-relative PRD path. */
 	prdPath: string;
 	/** SHA256 of the PRD text as planned. */
@@ -450,14 +452,15 @@ export async function buildPlanIdentity(
 	prdText: string,
 	tasks: readonly RouterTask[],
 	controls: PlanControls,
-	/** Git base captured with the controls BEFORE disclosure; absent = read now. */
-	base?: { commit: string | null; branch: string | null },
+	/** Git base and PR destination captured with the controls BEFORE disclosure. */
+	base?: { commit: string | null; branch: string | null; deliveryOrigin?: string },
 ): Promise<PlanIdentity> {
 	const identity: PlanIdentity = {
 		planRevision: randomUUID(),
 		definitionSha256: planDefinitionSha256(tasks),
 		baseCommit: base ? base.commit : await headCommit(root),
 		baseBranch: base ? base.branch : await headBranch(root),
+		...(base?.deliveryOrigin !== undefined ? { deliveryOrigin: base.deliveryOrigin } : {}),
 		prdPath: normalizeRelPath(root, prdPath),
 		prdSha256: shasum(prdText),
 	};
