@@ -3,7 +3,8 @@
 **Approved product design; not yet a shipped/certified backend.** The current
 loop still executes project tools/gates/probes on the host. Use trusted projects
 and fixtures only. The S2 native source and offline build script are present.
-The versioned bundle, fixture builder and production adapter are later slices.
+The bundle format and offline validator are available. Asset setup, the fixture
+builder and the production adapter are later work.
 The local adapter stays non-default until M1-P05.
 
 ## Approved choices (2026-11-26)
@@ -39,11 +40,10 @@ not an npm/worker hook. Maintainers/source builders need Rust/Cargo; ordinary
 users should obtain the verified prebuilt launcher. Linux x86_64 is the first
 qualification target; other hosts/architectures remain unavailable until proved.
 
-Planned `bundle-format.md` defines canonical inventory/provenance without a
-self-referential digest. Existing `toolchains.*.manifestSha256` remains its trust
-anchor. Actual compiler/Node versions, artifact hashes and dependency closure
-are not selected by this document. Host Node v24.18.0 is an observation, not a
-bundle pin. Local hashes establish content identity, not vendor authenticity.
+[Bundle schema 1](bundle-format.md) defines canonical inventory and provenance.
+Existing `toolchains.*.manifestSha256` anchors the canonical manifest bytes.
+Exact compiler and Node versions, artifact hashes, vendor authenticity and the
+dependency closure still require independent review.
 
 Planned `provision-toolchain.sh` will separate preparation from approved host
 installation. Explicit operator setup may acquire named assets only from reviewed
@@ -51,7 +51,7 @@ sources with independent authenticity checks, or accept an offline supplied bund
 Safe bounded archive/path/type/size handling and complete private staging must
 precede installation; never execute unverified content, project hooks or curl-
 pipe-shell. No inherited credential/env selection or unreviewed redirect authority.
-This docs checkpoint performs none of those operations.
+Those operations remain pending.
 
 Planned `make-fixture-rootfs.sh` consumes explicitly selected trusted installed
 inputs and stays offline. Worker launch, recovery and ordinary project runs may
@@ -237,7 +237,7 @@ Authoritative strict paths/acceptance are in
 | --- | --- | --- |
 | S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Implemented** with Node tooling; no Rust/asset prerequisite |
 | S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Locked build and six real native canaries passed on the development host. [Evidence](../../docs/engineering-plan/evidence/M1-P03.md#s2-merge-review-verification-2026-11-27). |
-| S3 | Bundle format/provenance/approval/install separation and offline fixture | Approved design; exact pins/assets not enrolled |
+| S3 | Bundle format/provenance/approval/install separation and offline fixture | Schema 1 and pure validator implemented. Exact pins, setup, enrollment and fixture remain pending. |
 | S4 | Full scan/writer exclusion/durable seal/private candidate-ref recovery | Pure inventory/delta preparation only |
 | S5 | local.ts public lease wiring, in-namespace checks and real conformance | Not implemented; not certified |
 
