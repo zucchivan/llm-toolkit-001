@@ -4,7 +4,11 @@ Give the CLI a requirements document and a Git repository. It breaks the work in
 
 In the included demo, the coding model writes a search filter that only matches exact case. The requirement says search should ignore case. A test runs the filter, catches the mistake, and sends the failure back for repair. The next attempt passes.
 
-The kit handles the work around that exchange. You decide what counts as done before editing starts. If a run stops halfway through, you can see which changes passed, what failed, and whether it is safe to resume. Your own checkout stays available while the CLI builds the result elsewhere.
+## Why run one task at a time?
+
+Each task starts from the last accepted change. Even independent tasks wait their turn, so a parallel orchestrator can finish those sooner. The benefit here is a single history you can follow from the plan revision you approved to the exact Git tree each check and review examined. Your checkout stays available throughout the run.
+
+Suppose the process stops after review while opening a pull request. The CLI records acceptance and publication separately. On restart it checks what happened to that PR. If it can confirm the outcome, it can continue. If the outcome is uncertain, it stops for recovery before starting the next task. [Result and recovery contract](docs/project-contract.md#m0-p14-serial-candidate-and-result-contract)
 
 **Use trusted projects only.** Coding tools, gate commands, and baseline probes currently execute on the host. Linux containment using bubblewrap, a Rust launcher, and versioned toolchain bundles is under development. [Local sandbox status](sandbox/local/README.md)
 
