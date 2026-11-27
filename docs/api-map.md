@@ -678,8 +678,8 @@ config/env, `KIT_*` or argv.
   resolved URL of `src/sandbox/trusted-exec.ts` (`src/cli.ts` from source,
   `dist/cli.js` from a build, plus `ui/bin/llm-toolkit-ui.js`); on Linux
   `git` = `/usr/bin/git`, `gh` = `/usr/bin/gh`. `helper`/`bwrap` have no default
-  until P03/P05. A non-Linux host has no Git/gh default and refuses only the
-  operation that needs it.
+  until P03/P05. `localLauncher` has no default on any platform. A non-Linux
+  host has no Git/gh default and refuses only the operation that needs it.
 - **No fallback.** A present `installation.*` override wins even when invalid;
   use-time validation then refuses. A missing/invalid selected path is never
   replaced by another candidate (including the fixed default or PATH).
@@ -692,6 +692,13 @@ config/env, `KIT_*` or argv.
   never acquire Git/UI/helper prerequisites. The eager
   `validateTrustedInstallation` sweep is an explicit host check only, never the
   launch gate.
+- **P03-S1 local launcher selection.** Optional `installation.localLauncher`
+  uses this same profile parser, descriptor and `requireTrustedTool` path. It
+  is refused on use when absent, receives no PATH/env/cwd/project fallback, and
+  gets the ordinary no-symlink, owner/mode, ancestor and outside-target checks.
+  It has no dev-in-kit exception. Its selected path is included in the
+  descriptor digest. This selects the future kit-owned Rust executable; it is
+  distinct from `helper` and `bwrap`. No launcher is spawned by this slice.
 - **Dev-in-kit.** The one in-target exception is the running installation's own
   entries (`src/cli.ts`, `dist/cli.js`, the UI bin). Provenance is the resolved
   module URL recorded at selection; a target that merely contains a kit copy is
@@ -886,15 +893,15 @@ filesystem, retain a durable seal or publish results. `guest-helper-main.ts`
 exports the fixed ABI parser and bounded stdio adapter for the P02 helper; it is
 not launched by production. The SDK seam/readout version are unchanged.
 
-**Approved target, not implemented:** optional `installation.localLauncher` in
+**Implemented in P03-S1:** optional `installation.localLauncher` in
 `types.ts`, `host-profile.ts` and `trusted-exec.ts` uses existing `INSTALL_TOOLS`,
 parser and `requireTrustedTool` selection/validation, no second resolver or new
-runtime npm dependency. No default/fallback or eager prerequisite; current parser
-still refuses this unknown key. Per-use filesystem trust and outside-target rules
-apply without a dev-in-kit exception. Descriptor digest must bind the new tool.
+runtime npm dependency. No default/fallback or eager prerequisite. Per-use
+filesystem trust and outside-target rules apply without a dev-in-kit exception;
+the descriptor digest binds the selected path.
 This key selects the host Rust placement executable, not guest helper or bwrap.
-Bundle inventory validation additionally binds installed artifact bytes before
-admitting project execution; selection-only tests do not prove that later binding.
+S1 tests prove selection and filesystem trust only; bundle inventory validation
+must additionally bind installed artifact bytes before project execution.
 
 The standalone `sandbox/local/launcher/` crate will own clone3 exact-child
 placement with reviewed unsafe/FD/owner-loss behavior. Its fixed argv/FD/status

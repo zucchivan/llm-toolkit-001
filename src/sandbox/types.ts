@@ -9,7 +9,7 @@ export type Backend = "local" | "microvm" | "remote";
 export const BACKENDS: readonly Backend[] = ["local", "microvm", "remote"];
 
 /** Host executables that must resolve from the operator-selected installation. */
-export const INSTALL_TOOLS = ["cli", "ui", "node", "git", "gh", "helper", "bwrap"] as const;
+export const INSTALL_TOOLS = ["cli", "ui", "node", "git", "gh", "helper", "bwrap", "localLauncher"] as const;
 export type InstallTool = (typeof INSTALL_TOOLS)[number];
 
 export type Purpose = "plan" | "implement" | "verify" | "gate" | "probe";
@@ -26,6 +26,7 @@ export interface InstallationPaths {
 	gh?: string;
 	helper?: string;
 	bwrap?: string;
+	localLauncher?: string;
 }
 
 /** Where one selected host tool came from (never a PATH/cwd lookup). */

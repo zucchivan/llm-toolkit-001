@@ -1,0 +1,9 @@
+[package]
+name = "kit-local-launcher"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[dependencies]
+libc = "=0.2.189"

@@ -107,7 +107,7 @@ platforms/adapters remain unavailable. No live-model, live-PR, savings, latency 
 containment claim may be inferred from mocks. Real backend measurements must be
 explicitly labeled with host, pin and method, never generalized benchmarks.
 
-### Active packet — M1-P03: design approved; S1 ready, certification still blocked
+### Active packet — M1-P03: S1 implemented; launcher/certification still blocked
 
 As of 2026-11-26, P03's standalone helper ABI/stdio adapter has a bounded
 implementation in `src/sandbox/guest-helper-main.ts`, but no production launcher
@@ -137,10 +137,14 @@ canonical ordering, rejects implicit-directory/name collisions and enforces
 non-raiseable bounds. Pure full-delta validation reuses the existing scope
 matcher for additions/deletions/content/mode changes. These close offline
 preparation gaps only: complete filesystem scan, writer exclusion, durable seal
-and result publication remain unimplemented. Launcher selection still needs an
-implementation of the now-approved P01/strict-path extension; enrolled assets
-remain absent. P03 certification is still BLOCKED; no production cutover or real
-certification. Current verification is at the top of `evidence/M1-P03.md`.
+and result publication remain unimplemented. P03-S1 now implements optional
+`installation.localLauncher` through the existing P01 types, strict profile
+parser, descriptor and `requireTrustedTool` validation. It has no default or
+fallback, is checked only on use, receives no dev-in-kit exception, and is bound
+by the descriptor digest. This is selection trust only: it does not prove
+artifact bytes or launch anything. Enrolled assets remain absent. P03
+certification is still BLOCKED; no production cutover or real certification.
+Current verification is at the top of `evidence/M1-P03.md`.
 
 **Operator decision (2026-11-26):** use a kit-owned Rust clone3 launcher (Rust
 build-toolchain prerequisite accepted), versioned complete bundles with explicit
@@ -151,15 +155,11 @@ needed for these directions. Do not ask the next agent to rediscover the choice.
 No Rust install, bundle download/enrollment or profile change is authorized until
 exact assets/provenance/pins/paths/commands have been presented and approved.
 
-**Dispatch next: P03-S1 only.** Add optional `installation.localLauncher` via
-`src/sandbox/{types,host-profile,trusted-exec}.ts` and the existing P01 resolver,
-with failure-first tests in `test/{host-paths,trusted-exec}.test.ts`. Missing
-selection refuses on use, never by default/eager sweep; no PATH/env fallback,
-new dev-in-kit exception or weakened ownership/mode policy. Check descriptor
-identity binding. Update API/evidence status. No Rust code/build, launcher spawn,
-fixture, installer/network, host profile mutation, P04/P05, root npm dependency or
-accepted P01 hygiene-race fix. This slice is READY TO IMPLEMENT with current
-Node tooling; Rust not being installed is not a blocker to S1.
+**Active slice: P03-S2 only.** The standalone Rust launcher, reviewed ABI and
+offline build/canary sources live under `sandbox/local/`. Use P03 evidence for
+the actual compiler/build and real-lane disposition. D1 still gates exact
+host setup. The current slice has no bundle enrollment, scan/seal/import,
+production wiring or containment certification.
 
 Then S2 proves the Rust launcher/build/ABI; S3 implements versioned bundle
 inventory/provisioning and offline fixture; S4 proves full scan/seal/private-ref
