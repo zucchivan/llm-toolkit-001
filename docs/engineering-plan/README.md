@@ -143,9 +143,8 @@ Use `clone3(CLONE_INTO_CGROUP)` for the exact journaled child before bwrap/helpe
 execution; no spawn-then-move. Compiler/target/Cargo dependencies are pinned
 maintainer/source-build inputs, separate from npm; prebuilt versioned bundles
 serve ordinary users. Minimal unsafe syscall code needs explicit review and real
-ordering/FD/owner-loss proof. No runtime compilation. The key/crate are approved
-for implementation, not yet implemented or installed. M1.md P03 defines strict
-paths and bounded slices; S1 (optional selection only) is ready now.
+ordering/FD/owner-loss proof. No runtime compilation. M1.md P03 defines the strict paths and bounded slices. S1 provides optional
+selection; S2 provides the native seam and an offline build.
 
 P03 owns a standalone kit helper entrypoint, installed outside the target and
 selected explicitly through P01's existing `installation.helper` descriptor
@@ -165,6 +164,18 @@ bwrap/helper can enable project execution. Namespace/resource checks and a
 matching host-bound handshake precede project operations. A runnable project
 process followed by PID placement is insufficient. Owner loss prevents admission
 or triggers fencing; persisted/guest claims never replace host observations.
+
+**S2 host launcher ABI.** The launcher receives FD 3 for the exact
+journaled cgroup, FD 4 for private `KLS1` placement/terminal status, FD 5
+for controller liveness and FD 6 for the private single-use gate. Bubblewrap
+is the immediate `clone3(CLONE_INTO_CGROUP)` child. The existing helper keeps
+its own standard I/O. Placement status never enables project work before
+the independent checks and matching helper handshake. Launch consumes its
+permission under the same kernel lock used for durable revocation. Recovery
+revokes before killing and observing the same cgroup empty, including after
+launcher loss. An uncertain gate or cgroup identity blocks recovery. See
+[`sandbox/local/README.md`](../../sandbox/local/README.md#s2-fixed-host-launcher-abi)
+for the byte and descriptor contract.
 
 For local results the host scans only after killing the exact lease cgroup and
 observing `populated 0`, with reattachment and other workspace writers excluded.

@@ -131,6 +131,34 @@ describe("installation selection", () => {
 		expect(descriptor.tools["git"]!.path).not.toBe("/usr/bin/git");
 	});
 
+	it("requires an explicitly selected local launcher on use and binds it into identity", async () => {
+		const target = await tempDir("kit-te-target-");
+		const absent = selectInstallation({ platform: "linux", running: null, execPath: "/usr/bin/node" });
+		const before = installationDescriptorDigest(absent);
+		await expect(requireTrustedTool(absent, "localLauncher", { targetRoot: target }))
+			.rejects.toMatchObject({ code: "not-configured" });
+		expect(spawned).toHaveLength(0);
+		const selected = selectInstallation({ platform: "linux", running: null, execPath: "/usr/bin/node", installation: { localLauncher: "/usr/bin/false" } });
+		expect(selected.tools.localLauncher).toMatchObject({ path: "/usr/bin/false", source: "profile", runningEntry: false });
+		expect(installationDescriptorDigest(selected)).not.toBe(before);
+		await expect(requireTrustedTool(selected, "localLauncher", { targetRoot: target })).resolves.toMatchObject({ path: "/usr/bin/false" });
+		expect(spawned).toHaveLength(0);
+	});
+
+	it("refuses in-target and symlinked local launcher selections without fallback or project execution", async () => {
+		const target = await tempDir("kit-te-target-");
+		const selected = selectInstallation({ platform: "linux", running: null, execPath: "/usr/bin/node", installation: { localLauncher: join(target, "launcher") } });
+		await installExecutable(target, "launcher");
+		await expect(requireTrustedTool(selected, "localLauncher", { targetRoot: target })).rejects.toMatchObject({ code: "installation-inside-target" });
+		const installRoot = await tempDir("kit-te-launcher-");
+		const real = await installExecutable(installRoot, "bin/launcher");
+		const link = join(installRoot, "bin", "launcher-link");
+		await symlink(real, link);
+		const symlinked = selectInstallation({ platform: "linux", running: null, execPath: "/usr/bin/node", installation: { localLauncher: link } });
+		await expect(requireTrustedTool(symlinked, "localLauncher", { targetRoot: target })).rejects.toMatchObject({ code: "unsafe-path" });
+		expect(spawned).toHaveLength(0);
+	});
+
 	it("never consults PATH, target .bin, cwd or a KIT_* value", () => {
 		const saved = {
 			PATH: process.env["PATH"],

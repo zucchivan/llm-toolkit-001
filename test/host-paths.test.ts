@@ -230,6 +230,14 @@ describe("strict host profile schema", () => {
 			expect(parseError(hostProfile({ installation: { node } })).code).toBe("unsafe-path");
 		}
 	});
+
+	it("accepts only a canonical absolute localLauncher installation path", () => {
+		const parsed = parseHostProfile(hostProfile({ installation: { localLauncher: "/opt/kit/bin/kit-local-launcher" } }));
+		expect(parsed.installation?.localLauncher).toBe("/opt/kit/bin/kit-local-launcher");
+		for (const localLauncher of ["kit-local-launcher", "/opt/kit/../launcher", "/opt//launcher"]) {
+			expect(() => parseHostProfile(hostProfile({ installation: { localLauncher } }))).toThrow(HostProfileError);
+		}
+	});
 });
 
 describe("host profile file trust", () => {

@@ -458,7 +458,9 @@ export async function requireTrustedTool(
 	if (!selected) {
 		throw new TrustedInstallationError(
 			"not-configured",
-			`no trusted installation for ${tool}; set installation.${tool} in the operator host profile or run from the trusted installation`,
+			tool === "localLauncher"
+				? "no trusted installation for localLauncher; set installation.localLauncher in the operator host profile"
+				: `no trusted installation for ${tool}; set installation.${tool} in the operator host profile or run from the trusted installation`,
 			tool,
 		);
 	}

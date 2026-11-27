@@ -2,10 +2,9 @@
 
 **Approved product design; not yet a shipped/certified backend.** The current
 loop still executes project tools/gates/probes on the host. Use trusted projects
-and fixtures only. No bundle release, Rust launcher build script, provisioning
-script, fixture builder or runnable setup command exists yet. This document is
-an operator/implementation contract, not installation instructions that already
-work. The local adapter stays non-default until M1-P05.
+and fixtures only. The S2 native source and offline build script are present.
+The versioned bundle, fixture builder and production adapter are later slices.
+The local adapter stays non-default until M1-P05.
 
 ## Approved choices (2026-11-26)
 
@@ -31,11 +30,11 @@ work. The local adapter stays non-default until M1-P05.
 
 ## Setup/build/run separation
 
-Planned source-build module: `launcher/` with Cargo.toml, actual Cargo.lock,
+The standalone source-build module is `launcher/` with Cargo.toml, Cargo.lock,
 rust-toolchain.toml and Rust sources/tests. Pin an exact reviewed compiler/target
 and minimal syscall dependencies independently of npm. Explain/minimize unsafe
 code; Rust does not prove correct FDs, process ownership or recovery ordering.
-`build-launcher.sh` will be an explicit offline build from reviewed locked inputs,
+`build-launcher.sh` performs an explicit offline build from reviewed locked inputs,
 not an npm/worker hook. Maintainers/source builders need Rust/Cargo; ordinary
 users should obtain the verified prebuilt launcher. Linux x86_64 is the first
 qualification target; other hosts/architectures remain unavailable until proved.
@@ -69,12 +68,140 @@ Before setup approval, present:
 - literal build/install commands and any requested privileges;
 - exact proposed host-profile diff and how existing selections are preserved.
 
-The planned optional profile key `installation.localLauncher` has **no default**
-and is **not accepted by the current parser**. P03-S1 adds it through the existing
-P01 resolver/per-use validator; do not enroll it yet. Do not expand P01's CLI/UI
-in-target exception, allow symlinks or relax ownership/mode checks. This key is
-not `installation.helper` or `installation.bwrap`; each has its own identity.
-Artifact bytes must also match the reviewed inventory before project admission.
+## S2 compiler and reproducible build
+
+S2 uses the official signed standalone Rust 1.100.0 x86_64 GNU distribution and
+exactly `libc 0.2.189` from crates.io. The compiler is a build input. The native
+binary is staged here for verification, and S3 owns enrollment and any live
+host-profile edit. An approved offline copy of the same inputs works as well.
+
+| Input | Reviewed source and identity |
+| --- | --- |
+| Standalone archive | [Rust 1.100.0 distribution manifest](https://static.rust-lang.org/dist/channel-rust-1.100.0.toml), SHA-256 `98ee6bec240e1cfe944f17e7092412dc5ef6e008484bb668c6936d35a7d15acd` |
+| Detached signature and public key | [Rust Forge signing guidance](https://forge.rust-lang.org/infra/other-installation-methods.html), primary fingerprint `108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE` |
+| Syscall dependency | [crates.io sparse index](https://index.crates.io/li/bc/libc), SHA-256 `3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2` |
+
+After D1 approval for the exact paths and commands, an operator can stage the
+inputs under a private directory outside the checkout. The following Bash
+session uses no elevated privileges. The temporary GPG keyring has only the
+verified release key. All compiler and crate acquisition occurs in this step.
+
+```bash
+set -euo pipefail
+umask 077
+stage=$(mktemp -d /tmp/kit-p03-s2.XXXXXXXX)
+mkdir -m 700 "$stage/gnupg" "$stage/compiler" "$stage/build"
+archive=rust-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+dist=https://static.rust-lang.org/dist/2026-11-12
+curl --proto '=https' --tlsv1.2 -fsS "$dist/$archive" -o "$stage/$archive"
+curl --proto '=https' --tlsv1.2 -fsS "$dist/$archive.asc" -o "$stage/$archive.asc"
+curl --proto '=https' --tlsv1.2 -fsS https://static.rust-lang.org/rust-key.gpg.ascii -o "$stage/rust-key.asc"
+curl --proto '=https' --tlsv1.2 -fsS https://static.crates.io/crates/libc/libc-0.2.189.crate -o "$stage/libc-0.2.189.crate"
+(
+    cd "$stage"
+    printf '%s  %s\n' 98ee6bec240e1cfe944f17e7092412dc5ef6e008484bb668c6936d35a7d15acd "$archive" | sha256sum --check
+    printf '%s  %s\n' 3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2 libc-0.2.189.crate | sha256sum --check
+)
+fingerprint=$(gpg --homedir "$stage/gnupg" --batch --with-colons --show-keys "$stage/rust-key.asc" |
+    awk -F: '$1 == "pub" { primary=1; next } primary && $1 == "fpr" { print $10; primary=0 }')
+test "$fingerprint" = 108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE
+gpg --homedir "$stage/gnupg" --batch --import "$stage/rust-key.asc"
+gpg --homedir "$stage/gnupg" --batch --verify "$stage/$archive.asc" "$stage/$archive"
+tar -xJf "$stage/$archive" --no-same-owner --no-same-permissions -C "$stage/compiler"
+env -i PATH=/usr/bin:/bin LC_ALL=C "$stage/compiler/${archive%.tar.xz}/install.sh" \
+    --prefix="$stage/toolchain" --disable-ldconfig \
+    --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu
+bash sandbox/local/build-launcher.sh "$stage/toolchain" "$stage/libc-0.2.189.crate" "$stage/build"
+```
+
+The offline script rechecks the crate bytes, pins the compiler, isolates Cargo
+configuration, records the GNU linker/compiler and glibc baseline, runs locked
+tests, compares two clean release builds byte for byte, and prints their
+digests. The build script has no acquisition path. Its output is development
+evidence for the recorded build inputs and host. It is not a bundle release.
+
+## S2 fixed host-launcher ABI
+
+The trusted host selects the launcher and Bubblewrap and constructs the entire
+argv with literal tokens. It starts with the following fixed forms.
+
+```text
+kit-local-launcher --protocol=1 --cgroup-fd=3 --gate-fd=6 -- <selected-absolute-bwrap> <host-built-bwrap-argv...>
+kit-local-launcher --protocol=1 --cgroup-fd=3 --gate-fd=6 --fence
+```
+
+| FD | Launch use |
+| --- | --- |
+| 0–2 | Bubblewrap and helper stdin/stdout (bounded P02 RPC) and bounded diagnostics on stderr. The launcher parent closes its copies after placement. |
+| 3 | Open exact journaled direct-child cgroup-v2 directory. Never passed through to Bubblewrap. |
+| 4 | Launcher-only writable pipe or connected Unix stream for status. The host parses the byte stream and enforces the grammar below. |
+| 5 | Launcher-only readable pipe or connected Unix stream with one controller peer. The channel carries no payload. EOF, unexpected data, or any error denotes owner loss. |
+| 6 | Read/write private single-use gate file. It is also supplied with FD 3 for `--fence`. |
+
+The controller owns a stable delegated parent and records its boot, delegation,
+lease cgroup and gate identities before invoking the launcher. It must resolve
+the cgroup and its gate from those retained identities, including on reopen with another
+controller. An unavailable or substituted parent, cgroup or gate requires
+recovery. The normal adapter must supply a sanitized launcher environment and
+enforce approved artifact bytes. S2 has no production caller.
+
+The gate is an operator-owned mode-0600, 24-byte regular file with one hard
+link. Its record is magic `KLG1`, state byte (1 ready, 2 spent, 3 revoked),
+three zero bytes, and little-endian 64-bit cgroup device and inode numbers.
+The host creates, binds and durably records the gate once per lease. Both
+launch and fence use a process-associated kernel lock on the same gate inode.
+The launcher checks the cgroup identity and filesystem, consumes the gate
+durably, proves the exact lease cgroup is empty with a working kill control,
+checks controller/status liveness, then performs
+`clone3(CLONE_INTO_CGROUP)` under the lock. A cgroup cannot be rearmed or
+substituted on recovery. Bubblewrap is the immediate child, receives a clean
+environment and inherits only the specified standard streams. Workload
+processes need separate stdio and must be unable to obtain helper control
+handles. Host namespace/resource checks and the matching P02 helper handshake
+are still required before project admission.
+
+FD 4 carries at most two 16-byte `KLS1` records. Byte 4 is version 1, byte 5
+is the event, bytes 6–7 are zero, bytes 8–11 are the little-endian PID and
+bytes 12–15 carry a signed little-endian detail. The legal forms are:
+
+- Pre-clone refusal after status setup can emit only `launch-error` (3),
+  PID zero and positive errno. Bad argv or unusable channels can fail without
+  any records.
+- `placed` (1), PID greater than 1 and detail zero, followed by one
+  same-PID terminal record. `exited` (2) carries an exit code, `launch-error`
+  (3) carries a positive errno for child startup failure, and `signaled` (4)
+  carries a signal number. The private close-on-exec error pipe can report
+  child setup/exec failure. Empty error-pipe EOF does not establish readiness.
+- Unknown events, invalid fields, a PID mismatch, extra data, early EOF, or an
+  inoperable channel deny admission and require exact-lease recovery.
+
+When the child terminates or the launcher detects controller/status loss, the
+launcher revokes permission under the same lock before issuing
+`cgroup.kill` and observing `populated 0`. A fresh controller uses
+`--fence` after launcher loss, with the same FD 3 and FD 6 bindings. This
+operation returns success only after revocation and empty observation. A
+failure with uncertain state must remain recovery-required. The future
+adapter independently verifies the fence before scanning or import.
+
+For S2 native tests, the ordinary locked Cargo run checks ABI refusal. An
+explicit lane passes the path to a stable, already delegated cgroup-v2 parent
+and runs the ignored native integration tests. Missing delegation, clone3 or
+fencing capabilities fail that lane. The real tests use disposable children
+of the supplied parent and a synthetic probe; they precede the S5
+Bubblewrap/guest conformance lane. Use the native test executable printed by
+the successful build and supply the approved delegation explicitly.
+
+```bash
+test_dir="$stage/build/tests/target/x86_64-unknown-linux-gnu/debug/deps"
+mapfile -d '' native_tests < <(find "$test_dir" -maxdepth 1 -type f -executable -name 'launcher-*' -print0)
+test "${#native_tests[@]}" -eq 1
+KIT_S2_REAL_CGROUP_PARENT='/sys/fs/cgroup/<approved-delegated-parent>' \
+    "${native_tests[0]}" --ignored --test-threads=1
+```
+
+The optional `installation.localLauncher` selection has no default and uses
+the existing P01 resolver. S2 leaves the live profile alone and S3/S5 retain
+byte identity and use-time verification.
 
 ## Result publication contract
 
@@ -104,8 +231,8 @@ Authoritative strict paths/acceptance are in
 
 | Slice | Work | Current state |
 | --- | --- | --- |
-| S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Ready to implement now** with Node tooling; no Rust/asset prerequisite |
-| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Approved design; compiler/host setup waits for D1 |
+| S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Implemented** with Node tooling; no Rust/asset prerequisite |
+| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Native source, build script and canaries present. See P03 evidence for real-lane results. |
 | S3 | Bundle format/provenance/approval/install separation and offline fixture | Approved design; exact pins/assets not enrolled |
 | S4 | Full scan/writer exclusion/durable seal/private candidate-ref recovery | Pure inventory/delta preparation only |
 | S5 | local.ts public lease wiring, in-namespace checks and real conformance | Not implemented; not certified |
