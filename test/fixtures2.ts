@@ -125,7 +125,7 @@ export async function scripted(kit: Awaited<ReturnType<typeof openProjectHarness
  * function (M0-P05): a revision-qualified grant through `approveGrant` — never
  * a bare-timestamp stamp. Returns the granted plan revision.
  */
-export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarness>>): Promise<string> {
+export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarness>>, profilePath?: string): Promise<string> {
 	// Test-only setup changes (for example a custom reviewed gate) belong in the
 	// immutable base tree before planning; the P14 driver never imports them from
 	// the operator worktree after the review point.
@@ -141,7 +141,7 @@ export async function accomplish(kit: Awaited<ReturnType<typeof openProjectHarne
 	const { loadPrd, runPlan } = await import("../src/engine/planner.ts");
 	const { approveGrant } = await import("../src/engine/waves.ts");
 	const prd = await loadPrd(kit);
-	const outcome = await runPlan(kit, "docs/prd.md", prd);
-	await approveGrant(kit, { planRevision: outcome.planRevision });
+	const outcome = await runPlan(kit, "docs/prd.md", prd, { profilePath });
+	await approveGrant(kit, { planRevision: outcome.planRevision }, profilePath);
 	return outcome.planRevision;
 }

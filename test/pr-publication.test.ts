@@ -1,15 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acceptCandidate, integrateAcceptedCandidate, publishPullRequest, GhPullRequestHost, RecoveryRequiredError, TrustedGitRemoteTransport } from "../src/engine/delivery.ts";
-import type { LoopAndLock } from "../src/engine/harness.ts";
+import { openProjectHarness, type LoopAndLock } from "../src/engine/harness.ts";
 import { buildFauxModels, fauxAssistantMessage } from "./fixtures.ts";
 import { bakeProject, scripted } from "./fixtures2.ts";
 import { demoConfigToml } from "./demo-project.ts";
 import { gateReceiptEvent, passReceiptEvent, ReceiptsDoc } from "../src/engine/receipts.ts";
 import type { PullRequestHost, RemoteGitTransport, RemotePullRequest, PullRequestIdentity } from "../src/engine/delivery.ts";
-import type { WaveKey } from "../src/engine/receipts.ts";
+import type { DeliveryReceipt, WaveKey } from "../src/engine/receipts.ts";
 import { commitState, readSessionState } from "../src/engine/state.ts";
 import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { loadPrd, runPlan } from "../src/engine/planner.ts";
@@ -59,8 +59,8 @@ class BareRemote implements RemoteGitTransport {
 	}
 
 	async readRemoteRef(origin: string, ref: string): Promise<string | undefined> {
-		this.checkOrigin(origin);
 		this.readCalls += 1;
+		this.checkOrigin(origin);
 		const result = await exec(["git", "--git-dir", this.bare, "for-each-ref", "--format=%(refname)%00%(objectname)", ref], { cwd: this.cwd, timeoutMs: 10_000 });
 		if (result.code !== 0) throw new Error(result.stderr || "bare remote query failed");
 		const row = result.stdout.trim();
@@ -71,8 +71,8 @@ class BareRemote implements RemoteGitTransport {
 	}
 
 	async createRemoteRef(origin: string, ref: string, oid: string): Promise<void> {
-		this.checkOrigin(origin);
 		this.pushCalls += 1;
+		this.checkOrigin(origin);
 		// Exercise Git's empty-expected-value lease against the local bare remote.
 		const result = await exec(["git", "-c", "core.hooksPath=/dev/null", "push", "--porcelain", `--force-with-lease=${ref}:`, this.bare, `${oid}:${ref}`], {
 			cwd: this.cwd, timeoutMs: 20_000,
@@ -98,12 +98,14 @@ class BareRemote implements RemoteGitTransport {
 
 class FakePullRequestHost implements PullRequestHost {
 	readonly records: RemotePullRequest[] = [];
+	readCalls = 0;
 	createCalls = 0;
 	/** Simulates a successful create whose reply and first lookup are lost/delayed. */
 	loseFirstCreateReply = false;
 	private hiddenReads = 0;
 
 	async findForHead(identity: PullRequestIdentity): Promise<RemotePullRequest[]> {
+		this.readCalls += 1;
 		if (this.hiddenReads > 0) {
 			this.hiddenReads -= 1;
 			return [];
@@ -165,8 +167,8 @@ async function fixture(options: { deliveryMode?: "pr" | "none" } = {}): Promise<
 	await chmod(profilePath, 0o600);
 
 	await scripted(baked.kit, [fauxAssistantMessage(JSON.stringify({ tasks: TASKS }), { stopReason: "stop" })], baked.models.faux);
-	const plan = await runPlan(baked.kit, "docs/prd.md", await loadPrd(baked.kit));
-	await approveGrant(baked.kit, { planRevision: plan.planRevision });
+	const plan = await runPlan(baked.kit, "docs/prd.md", await loadPrd(baked.kit), { profilePath });
+	await approveGrant(baked.kit, { planRevision: plan.planRevision }, profilePath);
 	const remote = new BareRemote(ORIGIN, bare, baked.project.root);
 	return {
 		root: baked.project.root, bare, profilePath, baseCommit, baseBranch, kit: baked.kit,
@@ -202,6 +204,22 @@ async function receiptEvents(kit: LoopAndLock) {
 	return (await kit.loop.harness.snapshot(ReceiptsDoc, BACKGROUND_CONTEXT))?.events ?? [];
 }
 
+async function reopen(kit: LoopAndLock): Promise<LoopAndLock> {
+	await kit.loop.close();
+	kit.lock.release();
+	openKits.splice(openKits.indexOf(kit), 1);
+	const reopened = await openProjectHarness(kit.loop.paths.root, "test", { modelsOverride: buildFauxModels([]).models });
+	openKits.push(reopened);
+	return reopened;
+}
+
+async function seedDelivery(kit: LoopAndLock, receipt: Omit<DeliveryReceipt, "id" | "checkedAt">): Promise<void> {
+	await commitState(kit, { receiptAttempts: [{
+		identity: { ...receipt, stage: "delivery" },
+		build: (meta) => ({ kind: "delivery", ...meta, value: { ...receipt, id: meta.opId, checkedAt: meta.at } }),
+	}] });
+}
+
 async function remoteRef(remote: BareRemote, ref: string): Promise<string | undefined> {
 	return remote.readRemoteRef(ORIGIN, ref);
 }
@@ -216,16 +234,31 @@ afterEach(async () => {
 });
 
 describe("verified stacked PR publication against a fake remote", () => {
+	it("refuses a changed operator-approved destination after review before any remote call", async () => {
+		const data = await fixture();
+		await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
+		await writeFile(data.profilePath, JSON.stringify({
+			version: 1, projects: [{ root: await realpath(data.root), deliveryOrigin: "https://github.com/acme/other.git" }],
+		}));
+		await expect(publishPullRequest(data.kit, data.waves[0]!, {
+			deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+		})).rejects.toThrow(/operator-approved PR destination changed/);
+		expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([0, 0, 0, 0]);
+		expect((await receiptEvents(data.kit)).filter((event) => event.kind === "delivery")).toEqual([]);
+	});
+
 	it("publishes A against the reviewed base and B against A's verified branch", async () => {
 		const data = await fixture();
 		const state = await readSessionState(data.kit.loop.harness);
+		expect(state.router.identity?.deliveryOrigin).toBe(ORIGIN);
+		expect(await readFile(join(data.root, "router.md"), "utf8")).toContain(`> PR DESTINATION: ${ORIGIN}`);
 		const baseRef = `refs/heads/${data.baseBranch}`;
 		const aCommit = await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
 		const aBranch = `refs/heads/kit/${data.waves[0]!.planRevision}/stack-a`;
 		const aResult = await publishPullRequest(data.kit, data.waves[0]!, {
 			deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
 		});
-		expect(aResult.receipt).toMatchObject({ state: "published", ref: aBranch, baseRef, commit: aCommit, prNumber: 1 });
+		expect(aResult.receipt).toMatchObject({ state: "published", ref: aBranch, baseRef, commit: aCommit, prNumber: 1, deliveryOrigin: ORIGIN });
 		expect(await remoteRef(data.remote, aBranch)).toBe(aCommit);
 		expect(data.host.records[0]).toMatchObject({ baseRef: data.baseBranch, baseOid: data.baseCommit, headRef: aBranch.slice("refs/heads/".length), headOid: aCommit });
 
@@ -235,7 +268,7 @@ describe("verified stacked PR publication against a fake remote", () => {
 			deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
 		});
 		expect(bResult.receipt).toMatchObject({
-			state: "published", ref: bBranch, baseRef: aBranch, commit: bCommit, prNumber: 2,
+			state: "published", ref: bBranch, baseRef: aBranch, commit: bCommit, prNumber: 2, deliveryOrigin: ORIGIN,
 		});
 		expect(await remoteRef(data.remote, bBranch)).toBe(bCommit);
 		expect(data.host.records[1]).toMatchObject({
@@ -346,6 +379,84 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect(data.remote.pushCalls).toBe(1);
 	});
 
+	it("rechecks authorization before the push after remote observation", async () => {
+		const data = await fixture();
+		await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
+		const options = { deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host };
+		await expect(publishPullRequest(data.kit, data.waves[0]!, {
+			...options,
+			async faultInjector(point) {
+				if (point === "pr-ref-create:before-effect") {
+					await writeFile(data.profilePath, JSON.stringify({
+						version: 1, projects: [{ root: await realpath(data.root), deliveryOrigin: "https://github.com/acme/other.git" }],
+					}));
+				}
+			},
+		})).rejects.toThrow(/operator-approved PR destination changed/);
+		expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([2, 0, 0, 0]);
+	});
+
+	it("can observe a recorded push after control drift but refuses to start PR creation", async () => {
+		const data = await fixture();
+		await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
+		const options = { deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host };
+		await expect(publishPullRequest(data.kit, data.waves[0]!, {
+			...options,
+			async faultInjector(point) {
+				if (point === "pr-ref-create:after-effect") await writeFile(join(data.root, "docs/prd.md"), "changed after push");
+			},
+		})).rejects.toThrow(/cannot start a new PR publication effect: the reviewed PRD .* changed/);
+		expect(data.remote.pushCalls).toBe(1);
+		expect(data.host.readCalls).toBe(1);
+		expect(data.host.createCalls).toBe(0);
+	});
+
+	it.each([undefined, "https://github.com/acme/other.git"])(
+		"refuses an unresolved intent recorded with destination %s on reopen",
+		async (deliveryOrigin) => {
+			const data = await fixture();
+			const wave = data.waves[0]!;
+			const commit = await acceptAndIntegrate(data.kit, wave, data.baseCommit);
+			const acceptance = (await receiptEvents(data.kit)).find((event) => event.kind === "acceptance")!;
+			await seedDelivery(data.kit, {
+				...wave, mode: "pr", state: "pending", acceptedId: acceptance.value.id, commit,
+				ref: `refs/heads/kit/${wave.planRevision}/${wave.taskId}`, baseRef: `refs/heads/${data.baseBranch}`,
+				code: "remote-ref-create-attempt", ...(deliveryOrigin ? { deliveryOrigin } : {}),
+			});
+			const kit = await reopen(data.kit);
+			const history = await receiptEvents(kit);
+			await expect(publishPullRequest(kit, wave, {
+				deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+			})).rejects.toThrow(deliveryOrigin ? /durable PR delivery destination differs/ : /legacy PR delivery receipt has no destination binding/);
+			expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([0, 0, 0, 0]);
+			expect(await receiptEvents(kit)).toEqual(history);
+			await expect(runPlan(kit, "docs/prd.md", await loadPrd(kit), { profilePath: data.profilePath }))
+				.rejects.toThrow(/cannot replan with an unresolved PR delivery intent/);
+		},
+	);
+
+	it.each([undefined, "https://github.com/acme/other.git"])(
+		"preserves completed history with destination %s without using it as an unverified stack base",
+		async (deliveryOrigin) => {
+			const data = await fixture();
+			const wave = data.waves[0]!;
+			const parent = await acceptAndIntegrate(data.kit, wave, data.baseCommit);
+			const acceptance = (await receiptEvents(data.kit)).find((event) => event.kind === "acceptance")!;
+			await seedDelivery(data.kit, {
+				...wave, mode: "pr", state: "published", acceptedId: acceptance.value.id, commit: parent,
+				ref: `refs/heads/kit/${wave.planRevision}/${wave.taskId}`, baseRef: `refs/heads/${data.baseBranch}`,
+				prNumber: 1, prUrl: "https://github.com/acme/widget/pull/1", ...(deliveryOrigin ? { deliveryOrigin } : {}),
+			});
+			await acceptAndIntegrate(data.kit, data.waves[1]!, parent);
+			const history = await receiptEvents(data.kit);
+			await expect(publishPullRequest(data.kit, data.waves[1]!, {
+				deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+			})).rejects.toThrow(/published stack base .* lacks a matching PR destination binding/);
+			expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([0, 0, 0, 0]);
+			expect(await receiptEvents(data.kit)).toEqual(history);
+		},
+	);
+
 	it("does not recreate a remote ref removed after publication", async () => {
 		const data = await fixture();
 		const commit = await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
@@ -368,11 +479,16 @@ describe("verified stacked PR publication against a fake remote", () => {
 		await expect(publishPullRequest(data.kit, data.waves[0]!, options)).rejects.toBeInstanceOf(RecoveryRequiredError);
 		const firstHistory = (await receiptEvents(data.kit)).filter((event) => event.kind === "delivery");
 		expect(firstHistory.at(-1)?.kind === "delivery" ? firstHistory.at(-1)!.value : undefined).toMatchObject({ state: "unknown", code: "pr-create-uncertain", commit });
-		const retry = await publishPullRequest(data.kit, data.waves[0]!, options);
-		expect(retry.receipt).toMatchObject({ state: "published", commit, prNumber: 1 });
+		const kit = await reopen(data.kit);
+		// Existing effects remain observable even after unrelated reviewed inputs drift.
+		await writeFile(join(data.root, "docs/prd.md"), "edited since publication");
+		const retry = await publishPullRequest(kit, data.waves[0]!, options);
+		expect(retry.receipt).toMatchObject({ state: "published", commit, prNumber: 1, deliveryOrigin: ORIGIN });
+		expect(data.remote.pushCalls).toBe(1);
 		expect(data.host.createCalls).toBe(1);
-		const events = (await receiptEvents(data.kit)).filter((event) => event.kind === "delivery");
+		const events = (await receiptEvents(kit)).filter((event) => event.kind === "delivery");
 		expect(events.some((event) => event.kind === "delivery" && event.value.state === "published")).toBe(true);
+		expect(events.every((event) => event.value.deliveryOrigin === ORIGIN)).toBe(true);
 	});
 
 	it("refuses a non-GitHub or non-canonical host-profile origin before remote effects", async () => {
@@ -391,6 +507,17 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect(data.remote.pushCalls).toBe(0);
 		expect(data.host.createCalls).toBe(0);
 		expect((await receiptEvents(data.kit)).some((event) => event.kind === "delivery")).toBe(false);
+	});
+
+	it("requires one unambiguous authorization for the canonical project root", async () => {
+		const data = await fixture();
+		await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
+		const entry = { root: await realpath(data.root), deliveryOrigin: ORIGIN };
+		await writeFile(data.profilePath, JSON.stringify({ version: 1, projects: [entry, entry] }));
+		await expect(publishPullRequest(data.kit, data.waves[0]!, {
+			deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+		})).rejects.toThrow(/cannot establish current PR destination authorization.*exactly one project entry/);
+		expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([0, 0, 0, 0]);
 	});
 
 	it("refuses a conflicting pre-existing remote head without overwriting it", async () => {

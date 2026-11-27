@@ -308,6 +308,7 @@ export function renderRouterMd(
 		lines.push(`> PLAN REVISION: ${identity.planRevision}`);
 		lines.push(`> DEFINITION SHA256: ${identity.definitionSha256}`);
 		if (identity.controlsSha256) lines.push(`> CONTROLS SHA256: ${identity.controlsSha256}`);
+		if (identity.deliveryOrigin) lines.push(`> PR DESTINATION: ${identity.deliveryOrigin}`);
 	}
 	lines.push("");
 	if (prd) lines.push(`PRD: ${prd}`, "");

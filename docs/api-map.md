@@ -605,11 +605,16 @@ not an OS sandbox.
 
 ### M0-P13 — verified stacked PR publication (active through M0-P14)
 
-- `preflightPullRequest(kit, {deliverExplicit, profilePath?})` validates explicit `--deliver`, the canonical host-approved origin, and the reviewed base branch without network effects. It runs before PR-mode grant approval or model dispatch. `publishPullRequest(kit, wave, options)` then requires a current exact grant,
+- `runPlan` captures the operator-approved origin before model disclosure for
+  PR mode and records it on the review identity. `preflightPullRequest(kit,
+  {deliverExplicit, profilePath?})` validates explicit `--deliver`, current
+  approval of the reviewed origin, and the reviewed base branch without
+  network effects. It runs before PR-mode grant approval or model dispatch.
+  `publishPullRequest(kit, wave, options)` then requires a current exact grant,
   matching acceptance/integration receipts, an integrated commit with the
   accepted tree and exactly one recorded parent, `delivery.mode = "pr"`, and
   explicit `deliverExplicit: true` (the CLI's `--deliver` consent). It reads
-  the destination only from the exact-root operator host policy's
+  current authorization only from the exact-root operator host policy's
   `projects[].deliveryOrigin`; the optional profile path exists only as a
   test seam. `src/sandbox/host-profile.ts` rejects insecure/non-regular profile
   files and accepts only canonical HTTPS `github.com/owner/repo[.git]` URLs.
@@ -628,7 +633,8 @@ not an OS sandbox.
   available.
 - The reviewed base branch must still point at the planned base commit. A
   later task may target only the unique, already-published PR branch whose
-  integration commit is its exact sole parent; its remote tip must still equal
+  receipt binds the same destination and whose integration commit is its
+  exact sole parent. Its remote tip must still equal
   that parent. Thus A targets the reviewed base and B targets A's observed
   branch, while B's commit still has A's accepted integration commit as its
   parent.
@@ -638,8 +644,10 @@ not an OS sandbox.
   open PR with the canonical repo, base ref/OID, head ref/OID, number, and URL
   must validate before the delivery receipt becomes `published`. Ambiguity or
   mismatch is `unknown`.
-- Delivery receipts journal the exact accepted commit, fully-qualified head
-  ref, target base ref, and (only after host validation) PR number/URL. Retries
+- Delivery receipts journal the canonical reviewed origin, exact accepted
+  commit, fully-qualified head ref, target base ref, and (only after host
+  validation) PR number/URL. An unbound legacy intent requires manual
+  recovery. The current profile cannot establish where that intent ran. Retries
   re-read the base/head refs and query the PR host first. An exact PR found
   after a lost create response is acknowledged; a possibly attempted create
   with no observable PR stays unknown and is never blindly repeated. A lost

@@ -116,7 +116,7 @@ export type RollbackReceipt = WaveKey & {
 	leaseId?: string;
 };
 
-/** Separates local/none acknowledgment from a confirmed local branch update. */
+/** Journaled publication state for local and PR delivery. */
 export type DeliveryReceipt = WaveKey & {
 	id: string;
 	acceptedId: string;
@@ -125,6 +125,8 @@ export type DeliveryReceipt = WaveKey & {
 	state: "not_requested" | "pending" | "published" | "failed" | "unknown";
 	ref?: string;
 	baseRef?: string;
+	/** Canonical plan origin for PR effects. Absent in legacy receipts. */
+	deliveryOrigin?: string;
 	prNumber?: number;
 	prUrl?: string;
 	checkedAt: number;

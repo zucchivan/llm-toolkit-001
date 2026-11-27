@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openProjectHarness, type LoopAndLock } from "../src/engine/harness.ts";
 import { runWaves } from "../src/engine/waves.ts";
 import { conversationEntries } from "../src/engine/inspector.ts";
 import { ReceiptsDoc } from "../src/engine/receipts.ts";
+import { RecoveryRequiredError } from "../src/engine/delivery.ts";
 import type { PullRequestHost, PullRequestIdentity, RemoteGitTransport, RemotePullRequest } from "../src/engine/delivery.ts";
 import { BACKGROUND_CONTEXT } from "../src/engine/kit.ts";
 import { readSessionState } from "../src/engine/state.ts";
@@ -69,6 +70,8 @@ async function run(argv: string[], cwd: string): Promise<string> {
 }
 
 class BareRemote implements RemoteGitTransport {
+	readCalls = 0;
+	pushCalls = 0;
 	constructor(private readonly approvedOrigin: string, private readonly bare: string, private readonly cwd: string) {}
 
 	private check(origin: string): void {
@@ -76,6 +79,7 @@ class BareRemote implements RemoteGitTransport {
 	}
 
 	async readRemoteRef(origin: string, ref: string): Promise<string | undefined> {
+		this.readCalls += 1;
 		this.check(origin);
 		const result = await exec(["git", "--git-dir", this.bare, "for-each-ref", "--format=%(refname)%00%(objectname)", ref], { cwd: this.cwd, timeoutMs: 10_000 });
 		if (result.code !== 0) throw new Error(result.stderr || "bare ref query failed");
@@ -87,6 +91,7 @@ class BareRemote implements RemoteGitTransport {
 	}
 
 	async createRemoteRef(origin: string, ref: string, oid: string): Promise<void> {
+		this.pushCalls += 1;
 		this.check(origin);
 		const result = await exec(["git", "push", "--porcelain", `--force-with-lease=${ref}:`, this.bare, `${oid}:${ref}`], { cwd: this.cwd, timeoutMs: 20_000 });
 		if (result.code !== 0) throw new Error(result.stderr || "bare create-only push failed");
@@ -95,8 +100,10 @@ class BareRemote implements RemoteGitTransport {
 
 class FakePullRequests implements PullRequestHost {
 	readonly rows: RemotePullRequest[] = [];
+	readCalls = 0;
 
 	async findForHead(identity: PullRequestIdentity): Promise<RemotePullRequest[]> {
+		this.readCalls += 1;
 		return this.rows.filter((row) => row.repository === identity.repository && row.headRef === identity.headRef);
 	}
 
@@ -128,7 +135,15 @@ process.stdout.write(actual);
 	await writeFile(join(root, "evals", "recipes.toml"), `[lineage-check]\ncmd = "node evals/lineage-check.cjs"\n`, "utf8");
 }
 
-async function provisionPrRemote(kit: LoopAndLock, profilePath: string): Promise<{
+async function writePrProfile(root: string, profilePath: string, deliveryOrigin = ORIGIN): Promise<void> {
+	await writeFile(profilePath, JSON.stringify({
+		version: 1,
+		projects: [{ root: await realpath(root), deliveryOrigin }],
+		toolchains: {},
+	}), { mode: 0o600 });
+}
+
+async function provisionPrRemote(kit: LoopAndLock): Promise<{
 	bare: string;
 	remote: BareRemote;
 	host: FakePullRequests;
@@ -142,16 +157,13 @@ async function provisionPrRemote(kit: LoopAndLock, profilePath: string): Promise
 	roots.push(bare);
 	await run(["git", "init", "--bare", bare], kit.loop.paths.root);
 	await run(["git", "push", bare, `${baseCommit}:refs/heads/${baseBranch}`], kit.loop.paths.root);
-	await writeFile(profilePath, JSON.stringify({
-		version: 1,
-		projects: [{ root: await realpath(kit.loop.paths.root), deliveryOrigin: ORIGIN }],
-		toolchains: {},
-	}), "utf8");
-	await chmod(profilePath, 0o600);
 	return { bare, remote: new BareRemote(ORIGIN, bare, kit.loop.paths.root), host: new FakePullRequests(), baseCommit, baseBranch };
 }
 
-describe.each(["none", "commit", "pr"] as const)("serial accepted lineage (%s mode)", (mode) => {
+describe.each([
+	["none", "normal"], ["commit", "normal"], ["pr", "normal"], ["pr", "destination changed after review"],
+	["pr", "destination changed after durable intent"],
+] as const)("serial accepted lineage (%s mode, %s)", (mode, scenario) => {
 	it("gives B A's exact integrated bytes and publishes only the accepted lineage", async () => {
 		const config = demoConfigToml().replace('mode = "none"', `mode = "${mode}"`);
 		const baked = await bakeProject({ buildFauxModels, configToml: config });
@@ -170,6 +182,10 @@ describe.each(["none", "commit", "pr"] as const)("serial accepted lineage (%s mo
 		await addLineageGate(baked.project.root);
 
 		const { faux, models } = baked.models;
+		const profileDir = await mkdtemp(join(tmpdir(), "kit-lineage-profile-"));
+		roots.push(profileDir);
+		const profilePath = join(profileDir, "host-v1.json");
+		if (mode === "pr") await writePrProfile(baked.project.root, profilePath);
 		await scripted(baked.kit, [
 			fauxAssistantMessage(JSON.stringify(TASKS), { stopReason: "stop" }),
 			fauxAssistantMessage([fauxToolCall("write", { path: "src/a.txt", content: A_BYTES })], { stopReason: "toolUse" }),
@@ -182,22 +198,60 @@ describe.each(["none", "commit", "pr"] as const)("serial accepted lineage (%s mo
 			approval("src/b.txt"),
 			fauxAssistantMessage(JSON.stringify({ verdict: "approve", criteria: [{ id: "1", status: "pass", evidence: [{ kind: "line", path: "src/b.txt", line: 1 }] }], notes: "independently checked B" }), { stopReason: "stop" }),
 		], faux);
-		const revision = await accomplish(baked.kit);
+		const revision = await accomplish(baked.kit, profilePath);
 		const stateBefore = await readSessionState(baked.kit.loop.harness);
 		const operatorHead = (await exec(["git", "rev-parse", "HEAD"], { cwd: baked.project.root, timeoutMs: 10_000 })).stdout.trim();
 		const operatorIndex = (await exec(["git", "write-tree"], { cwd: baked.project.root, timeoutMs: 10_000 })).stdout.trim();
 
-		const profileDir = await mkdtemp(join(tmpdir(), "kit-lineage-profile-"));
-		roots.push(profileDir);
-		const profilePath = join(profileDir, "host-v1.json");
-		let prPublication: { profilePath: string; gitTransport: RemoteGitTransport; prHost: PullRequestHost } | undefined;
+		let prPublication: { profilePath: string; gitTransport: BareRemote; prHost: FakePullRequests } | undefined;
 		let bare: string | undefined;
 		let host: FakePullRequests | undefined;
 		if (mode === "pr") {
-			const provisioned = await provisionPrRemote(baked.kit, profilePath);
+			const provisioned = await provisionPrRemote(baked.kit);
 			bare = provisioned.bare;
 			host = provisioned.host;
 			prPublication = { profilePath, gitTransport: provisioned.remote, prHost: provisioned.host };
+		}
+		if (scenario !== "normal") {
+			const publication = prPublication!;
+			const changed = "https://github.com/acme/other.git";
+			const observed = () => [
+				publication.gitTransport.readCalls, publication.gitTransport.pushCalls,
+				publication.prHost.readCalls, publication.prHost.rows.length,
+			];
+			const reasons: string[] = [];
+			const stopped = await runWaves(baked.kit, {
+				prPublication: {
+					...publication,
+					faultInjector(point) {
+						if (scenario === "destination changed after durable intent" && point === "delivery-intent:after-commit") {
+							throw new Error("interrupted after durable publication intent");
+						}
+					},
+				},
+				deliverExplicit: true,
+				async driverFaultInjector(point) {
+					if (scenario === "destination changed after review" && point === "after-review-before-delivery") {
+						await writePrProfile(baked.project.root, profilePath, changed);
+					}
+				},
+			}, (event) => { if (event.kind === "recovery-required") reasons.push(event.message); });
+			expect(stopped.exit).toBe("recovery-required");
+			if (scenario === "destination changed after review") {
+				expect(reasons).toEqual([expect.stringContaining("operator-approved PR destination changed")]);
+				expect(observed()).toEqual([0, 0, 0, 0]);
+				return;
+			}
+			expect(reasons).toEqual([expect.stringContaining("interrupted after durable publication intent")]);
+			expect(observed()).toEqual([1, 0, 0, 0]);
+			await closeKit(baked.kit);
+			await writePrProfile(baked.project.root, profilePath, changed);
+			const reopened = await openProjectHarness(baked.project.root, "test", { modelsOverride: models });
+			openKits.push(reopened);
+			await expect(runWaves(reopened, { prPublication: publication, deliverExplicit: true }))
+				.rejects.toThrow(RecoveryRequiredError);
+			expect(observed()).toEqual([1, 0, 0, 0]);
+			return;
 		}
 		const summary = await runWaves(baked.kit, {
 			prPublication,
