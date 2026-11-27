@@ -107,7 +107,7 @@ platforms/adapters remain unavailable. No live-model, live-PR, savings, latency 
 containment claim may be inferred from mocks. Real backend measurements must be
 explicitly labeled with host, pin and method, never generalized benchmarks.
 
-### Active packet — M1-P03: S1 implemented; launcher/certification still blocked
+### Active packet — M1-P03: S2 native verification passed; certification still blocked
 
 As of 2026-11-26, P03's standalone helper ABI/stdio adapter has a bounded
 implementation in `src/sandbox/guest-helper-main.ts`, but no production launcher
@@ -155,13 +155,13 @@ needed for these directions. Do not ask the next agent to rediscover the choice.
 No Rust install, bundle download/enrollment or profile change is authorized until
 exact assets/provenance/pins/paths/commands have been presented and approved.
 
-**Active slice: P03-S2 only.** The standalone Rust launcher, reviewed ABI and
-offline build/canary sources live under `sandbox/local/`. Use P03 evidence for
-the actual compiler/build and real-lane disposition. D1 still gates exact
-host setup. The current slice has no bundle enrollment, scan/seal/import,
-production wiring or containment certification.
+**P03-S2 verification.** The pinned offline build produced identical launcher
+binaries in two clean build directories. All five real native canaries passed
+on the development host, and the optimized test lane exercised the same binary
+bytes. The S2 compiler setup was isolated, with no bundle enrollment or live
+profile edit. See [P03 evidence](evidence/M1-P03.md#s2-native-verification-2026-11-27).
 
-Then S2 proves the Rust launcher/build/ABI; S3 implements versioned bundle
-inventory/provisioning and offline fixture; S4 proves full scan/seal/private-ref
-recovery; S5 wires/certifies local. Each remains bounded by M1.md P03; packet
-closure still needs real conformance and reviewer acceptance.
+S3 owns versioned bundle inventory, enrollment and the offline fixture. S4 owns
+full scan, seal and private-ref recovery. S5 wires the production adapter and
+runs the full Bubblewrap/guest conformance lane. Each remains bounded by M1.md
+P03. Packet closure still requires real conformance and reviewer acceptance.

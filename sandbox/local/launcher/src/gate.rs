@@ -131,15 +131,17 @@ pub(crate) fn fence() -> io::Result<()> {
 }
 
 pub(crate) fn check_controls() -> io::Result<()> {
+    let mut kind = Vec::with_capacity(16);
+    control(c"cgroup.type", libc::O_RDONLY)?.take(32).read_to_end(&mut kind)?;
+    if kind != b"domain\n" {
+        return Err(errno(libc::EOPNOTSUPP));
+    }
     if populated()? {
         return Err(errno(libc::EBUSY));
     }
-    // An opened control file alone does not prove the kernel accepts a kill
-    // operation in this cgroup. Probe only the exact, still-empty lease.
-    control(c"cgroup.kill", libc::O_WRONLY)?.write_all(b"1\n")?;
-    if populated()? {
-        return Err(errno(libc::EBUSY));
-    }
+    // Reserve the kill write for fencing. Kernels with a cgroup kill-sequence
+    // bug can kill a clone immediately if its target was killed before launch.
+    control(c"cgroup.kill", libc::O_WRONLY)?;
     Ok(())
 }
 

@@ -12,6 +12,10 @@ const EXITED: u8 = 2;
 const LAUNCH_ERROR: u8 = 3;
 const SIGNALED: u8 = 4;
 
+// Linux UAPI (linux/sched.h). libc 0.2.189's GNU constant is a c_int
+// and truncates this flag before it can reach the 64-bit clone3 field.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
 // Linux UAPI struct clone_args, through CLONE_ARGS_SIZE_VER2 (cgroup).
 #[repr(C)]
 #[derive(Default)]
@@ -87,7 +91,7 @@ fn place(argv: &[*const libc::c_char], child_error: libc::c_int) -> io::Result<l
         return Err(errno(libc::ECANCELED));
     }
     let args = CloneArgs {
-        flags: libc::CLONE_INTO_CGROUP as u64,
+        flags: CLONE_INTO_CGROUP,
         exit_signal: libc::SIGCHLD as u64,
         cgroup: CGROUP_FD as u64,
         ..Default::default()
