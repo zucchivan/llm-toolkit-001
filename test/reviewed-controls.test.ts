@@ -98,6 +98,7 @@ describe("review identity: every reviewed byte and effective policy setting (M1-
 	async function reviewProject(): Promise<{ root: string; config: ReturnType<typeof parseConfig> }> {
 		const root = await tempRoot();
 		await mkdir(join(root, ".orch"), { recursive: true });
+		await writeFile(join(root, ".orch", "config.toml"), demoConfigToml(), "utf8");
 		await mkdir(join(root, "docs"), { recursive: true });
 		await mkdir(join(root, "evals", "fixtures"), { recursive: true });
 		await writeFile(join(root, "docs", "prd.md"), "# PRD\n", "utf8");

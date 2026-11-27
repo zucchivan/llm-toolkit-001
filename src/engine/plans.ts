@@ -46,7 +46,7 @@ import { headBranch, headCommit, shasum } from "../util/git.ts";
 import { readBlob, readTreeEntries, resolveTree } from "../util/git-objects.ts";
 import { resolveCanonicalProjectRoot } from "../sandbox/host-profile.ts";
 import { SafeReadBudget, readSafeFile, readSafeText, walkSafeFiles } from "../util/safe-read.ts";
-import { controlPolicySettings } from "../config.ts";
+import { controlPolicySettings, loadConfig } from "../config.ts";
 import type { ControlPolicySettings, KitConfig } from "../config.ts";
 import type { RouterTask } from "./infos.ts";
 import type { Remediation } from "../adoption/types.ts";
@@ -417,6 +417,10 @@ export async function reviewBindingRefusal(
 	let controls: PlanControls;
 	try {
 		controls = await loadPlanControls(canonicalRoot, { prdPath: identity.prdPath, config });
+		const currentSettings = controlPolicySettings(await loadConfig(canonicalRoot));
+		if (canonicalSha256(currentSettings) !== canonicalSha256(controls.settings)) {
+			return "reviewed policy settings changed on disk — replan and re-approve before granting or starting more work";
+		}
 	} catch (error) {
 		return `reviewed control inputs cannot be read: ${(error as Error).message} — restore them or replan before granting or starting more work`;
 	}

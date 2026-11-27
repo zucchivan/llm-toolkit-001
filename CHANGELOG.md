@@ -9,14 +9,11 @@ Manual semver discipline: keep `package.json` version and the newest section in 
   decoding and canonical bounded complete inventories; added full projected-delta
   validation using the existing scope matcher, and a standalone bounded helper
   ABI/stdio adapter. These are offline preparation, not a wired local backend.
-- **Approved P03 product/engineering direction:** kit-owned Rust clone3 launcher,
-  additive optional `installation.localLauncher` through the existing resolver,
-  versioned complete toolchain bundles with explicit setup/offline execution,
-  private candidate-ref CAS/receipt recovery and review-before-host-changes.
-  README, local/operator/interface/concept docs and engineering slices now
-  distinguish approval from implementation/enrollment/certification. No native
-  crate, compiler install, bundle release, new runtime dependency, host-profile
-  mutation or P04/P05 cutover is included. P03-S1 selection support is next.
+- **M1-P03 S1–S2:** added optional `installation.localLauncher` and a standalone
+  Rust clone3 launcher with a pinned offline build and a single-use launch gate.
+  Native placement and fencing tests passed on the Linux development host. S3
+  starts with the versioned bundle format and offline validator. The launcher
+  has no production caller and P03 conformance remains open.
 
 - **M0 release gate**: `test/m0-release.test.ts` proves the prerequisite
   with a black-box run of the BUILT CLI (`node dist/cli.js`) over the

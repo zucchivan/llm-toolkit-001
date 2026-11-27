@@ -20,6 +20,14 @@ pub(crate) struct Gate;
 
 impl Gate {
     pub(crate) fn lock() -> io::Result<Self> {
+        // SAFETY: F_GETFL takes no additional argument and reads FD status.
+        let flags = unsafe { syscall_result(libc::fcntl(GATE_FD, libc::F_GETFL).into())? };
+        // Linux pwrite appends on an O_APPEND descriptor even with an explicit offset.
+        if flags & libc::O_ACCMODE as libc::c_long != libc::O_RDWR as libc::c_long
+            || flags & libc::O_APPEND as libc::c_long != 0
+        {
+            return Err(errno(libc::EINVAL));
+        }
         let info = stat(GATE_FD)?;
         // SAFETY: geteuid takes no arguments and has no process side effects.
         let owner = unsafe { libc::geteuid() };

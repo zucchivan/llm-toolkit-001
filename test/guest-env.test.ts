@@ -105,6 +105,32 @@ function executeTool(tool: unknown, args: unknown, env: GuestEnv, extras: Record
 }
 
 describe("guest ExecutionEnv transport", () => {
+	it.each(["host", "guest"] as const)("closes the lease when the %s transport write fails", async (side) => {
+		const cwd = await mkdtemp(join(tmpdir(), "kit-guest-env-"));
+		roots.push(cwd);
+		const [host, guest] = pairedStreams();
+		const failedStream = side === "host" ? host : guest;
+		const write = failedStream.write.bind(failedStream);
+		let failWrites = false;
+		let failedWrites = 0;
+		failedStream.write = async (bytes) => {
+			if (!failWrites) return write(bytes);
+			failedWrites++;
+			throw new Error("transport disconnected");
+		};
+		const lease = { cwd, leaseId: "write-failure", role: "implementer" as const };
+		const helper = startGuestHelper({ ...lease, stream: guest });
+		const env = new GuestEnv({ ...lease, stream: host });
+		leases.push({ env, helper });
+		await env.ready;
+
+		failWrites = true;
+		expect(await env.absolutePath(".", BACKGROUND_CONTEXT)).toMatchObject({ ok: false });
+		await helper.done;
+		expect(await env.absolutePath(".", BACKGROUND_CONTEXT)).toMatchObject({ ok: false });
+		expect(failedWrites).toBe(1);
+	});
+
 	it("runs the registered read, edit, and write tools on guest paths and retains reader identity", async () => {
 		const { env } = await createLease();
 		await executeTool(createWriteTool(), { path: "nested/note.txt", content: "alpha\nbeta\n" }, env);

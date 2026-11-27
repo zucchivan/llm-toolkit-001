@@ -32,12 +32,12 @@ Rust launcher + versioned complete toolchain bundles**. This is not yet a shippe
 or certified execution backend. Current tools/gates/probes still execute on the
 host; use trusted projects/fixtures only, including the quickstart below.
 
-- **Reliable process ownership:** the Rust launcher will place sandbox children
+- **Process placement:** the standalone Rust launcher places its immediate child
   into the exact journaled cgroup-v2 lease before execution using
   `clone3(CLONE_INTO_CGROUP)`. Timeout/owner loss requires killing the whole lease
   and observing it empty before accepting results. Rust reduces memory-safety
-  risk; syscall/FD/admission ordering still needs review and real tests. This is
-  shared-kernel Linux containment, not a VM.
+  risk. Development-host tests cover placement, descriptor closure and fencing.
+  The future backend uses shared-kernel Linux containment.
 - **Repeatable setup:** a bundle will identify the host launcher/bwrap and include
   the pinned guest Node runtime, libraries, helper/import closure and minimal
   utilities/dependencies. Project-specific prebuilt dependency bundles remain
@@ -61,11 +61,12 @@ host; use trusted projects/fixtures only, including the quickstart below.
   are not one atomic cross-store write. No partial import into your checkout;
   integration and delivery retain their existing owners.
 
-**Available now:** offline protocol/helper, lifecycle and inventory/delta
-preparation only. **Still to implement:** Rust launcher selection/build/ABI,
-bundle tooling and actual pins, full scan/seal/publication, local launch wiring
-and real conformance. No bundle releases or setup command are available yet;
-the local adapter remains non-default until M1-P05.
+**Checkpoint scope:** bounded guest transport, offline lifecycle and
+inventory/delta preparation, and the standalone Rust launcher through S2.
+The launcher has no production caller. Full P03 still requires versioned
+bundles and an offline fixture, fenced scan and sealed publication, production
+wiring, and Bubblewrap/guest conformance. The local adapter remains non-default
+until M1-P05.
 See [local setup/status](sandbox/local/README.md),
 [operator contract](docs/project-contract.md#linux-local-sandbox--approved-p03-provisioning-contract),
 and [engineering slices](docs/engineering-plan/M1.md#p03-rust-launcher-and-versioned-bundle-amendment-operator-approved-2026-11-26).

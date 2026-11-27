@@ -539,6 +539,15 @@ describe("run-scope: resolve never broadens the stored grant (M0-P18)", () => {
 		expect(refusal).toMatch(/does not equal the stored grant \(t1\)/);
 		await expect(runWaves(kit, { tasksFilter: ["t1", "t2"] })).rejects.toThrow(/does not equal the stored grant/);
 
+		// Edit reviewed policy while this same harness still holds its old config.
+		const reviewedConfig = await readFile(join(project.root, ".orch", "config.toml"), "utf8");
+		const rowsBeforeDrift = await waveLogRows(project.root);
+		await writeConfig(project.root, reviewedConfig.replace("timeoutSec = 30", "timeoutSec = 31"));
+		await expect(runWaves(kit, { tasksFilter: [] })).rejects.toThrow(/reviewed.*settings changed/);
+		expect(await waveLogRows(project.root)).toEqual(rowsBeforeDrift);
+		expect(readGrant((await readSessionState(kit.loop.harness)).runStatus)).toEqual(grantBefore);
+		await writeConfig(project.root, reviewedConfig);
+
 		// A replacement added after review and the first wave must not change
 		// the retry's projected controls or recipe verdict.
 		const git = (...args: string[]) => execFileSync("/usr/bin/git", args, { cwd: project.root, encoding: "utf8" }).trim();

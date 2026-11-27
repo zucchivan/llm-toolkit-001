@@ -6,17 +6,17 @@
  * tasks' diff drawer (files/hunks, engine exclusions, cumulative wave label)
  * plus the live in-flight diff inside a gate-stall window.
  */
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { join } from "node:path";
 import { startServer, type RunningUiServer } from "../server/server.ts";
 import { newToken } from "../server/auth.ts";
 import { readOnce } from "../server/readout.ts";
 import { jobsList, type JobRecord } from "../server/jobs.ts";
-import { currentTrustedInstallation, requireLaunchPrefix } from "../../src/sandbox/trusted-exec.ts";
-import { postAction, actionHeaders, waitFor, spawnSleeper } from "./actions-helper.ts";
+import { requireLaunchPrefix, selectInstallation } from "../../src/sandbox/trusted-exec.ts";
+import { postAction, actionHeaders, waitFor, trustedNodeFixture } from "./actions-helper.ts";
 import { bakeConfiguredDemo } from "./helpers.ts";
 
 const FAUX = process.env["KIT_FAUX"] === "1";
@@ -33,16 +33,38 @@ if (fs.existsSync("src/list.ts") && !fs.readFileSync("src/list.ts", "utf8").incl
 }
 `;
 
+async function installSlowGate(root: string): Promise<void> {
+	await mkdir(join(root, "evals"), { recursive: true });
+	await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
+	await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
+	execFileSync("/usr/bin/git", ["add", "--", "slow-gate.cjs", "evals/recipes.auto.toml"], { cwd: root });
+	execFileSync("/usr/bin/git", ["commit", "-qm", "Install slow gate fixture"], { cwd: root });
+}
+
 describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 	let root: string;
 	let running: RunningUiServer;
 	let cookie: string;
 	let csrf: string;
 	let base: string;
+	let entryDir: string;
+	let installation: ReturnType<typeof selectInstallation>;
+
+	beforeAll(async () => {
+		// Run the real CLI through a private test entry. The trusted launcher
+		// checks its mode and Node identity even on shared development checkouts.
+		entryDir = await mkdtemp(join(tmpdir(), "ui-e2e-entry-"));
+		const entry = join(entryDir, "cli.mjs");
+		const loader = import.meta.resolve("tsx/esm/api");
+		const cli = new URL("../../src/cli.ts", import.meta.url).href;
+		await writeFile(entry, `import { register } from ${JSON.stringify(loader)};\nregister();\nawait import(${JSON.stringify(cli)});\n`, { mode: 0o600 });
+		installation = selectInstallation({ execPath: await trustedNodeFixture(), installation: { cli: entry } });
+	});
 
 	afterAll(async () => {
 		await running?.shutdown().catch(() => {});
 		await rm(root, { recursive: true, force: true }).catch(() => {});
+		await rm(entryDir, { recursive: true, force: true }).catch(() => {});
 	});
 
 	it("plan job → planned readout → run job completes the demo waves (+ per-task diffs)", { timeout: 300_000 }, async () => {
@@ -54,7 +76,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-dist-"));
 		await writeFile(join(dist, "index.html"), "<!doctype html><title>ok</title>", "utf8");
-		running = await startServer({ root, token, port: 0, distDir: dist });
+		running = await startServer({ root, token, port: 0, distDir: dist, installation });
 		cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
 		csrf = token;
 		base = `http://127.0.0.1:${running.port}`;
@@ -62,7 +84,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 
 		// --- plan through the UI (real CLI, faux planner)
 		const plan = await postAction(base, cookie, { kind: "plan", prd: "docs/prd.md" }, headers);
-		expect(plan.status).toBe(202);
+		expect(plan.status, await plan.clone().text()).toBe(202);
 		const { jobId } = (await plan.json()) as { jobId: string };
 		const planJob = (await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000))! as JobRecord;
 		expect(planJob.status).toBe("exited");
@@ -188,21 +210,19 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// three behavioral gates): the sleep runs INSIDE list-parse's wave (after
 		// src/list.ts is written) so the live-diff window has real content.
 		root = await bakeConfiguredDemo();
-		await mkdir(join(root, "evals"), { recursive: true });
-		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
-		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
+		await installSlowGate(root);
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-live-dist-"));
 		await writeFile(join(dist, "index.html"), "<!doctype html><title>ok</title>", "utf8");
-		running = await startServer({ root, token, port: 0, distDir: dist });
+		running = await startServer({ root, token, port: 0, distDir: dist, installation });
 		base = `http://127.0.0.1:${running.port}`;
 		cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
 		csrf = token;
 		const headers = actionHeaders(csrf, base);
 
 		const plan = await postAction(base, cookie, { kind: "plan", prd: "docs/prd.md" }, headers);
-		expect(plan.status).toBe(202);
+		expect(plan.status, await plan.clone().text()).toBe(202);
 		const { jobId } = (await plan.json()) as { jobId: string };
 		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
 
@@ -278,7 +298,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// PROJECT cwd (so the check reaches the command line) — its cmd is not
 		// this project's installed CLI entry, so the identity check fails
 		// BEFORE anything is signalled.
-		const foreign = spawn(process.execPath, ["-e", "const t = Date.now() + 30000; while (Date.now() < t) {}"], { cwd: root, stdio: "ignore" });
+		const foreign = spawn(await trustedNodeFixture(), ["-e", "const t = Date.now() + 30000; while (Date.now() < t) {}"], { cwd: root, stdio: "ignore" });
 		const holder = { child: foreign, pid: foreign.pid! };
 		try {
 			await writeFile(join(root, ".orch", "lock"), `${holder.pid}\n${new Date().toISOString()}\n`, "utf8");
@@ -317,21 +337,19 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		// descriptor/argv launch identity the ui records for its own jobs, cwd =
 		// the project root, detached from jobs.
 		root = await bakeConfiguredDemo();
-		await mkdir(join(root, "evals"), { recursive: true });
-		await writeFile(join(root, "slow-gate.cjs"), SLOW_GATE, "utf8");
-		await writeFile(join(root, "evals", "recipes.auto.toml"), '[slow-gate]\nargv = ["node", "slow-gate.cjs"]\n', "utf8");
+		await installSlowGate(root);
 
 		const token = newToken();
 		const dist = await mkdtemp(join(tmpdir(), "ui-e2e-stop-dist-"));
 		await writeFile(join(dist, "index.html"), "<!doctype html><title>ok</title>", "utf8");
-		running = await startServer({ root, token, port: 0, distDir: dist });
+		running = await startServer({ root, token, port: 0, distDir: dist, installation });
 		base = `http://127.0.0.1:${running.port}`;
 		cookie = `kit_ui=${token}; kit_ui_csrf=${token}`;
 		csrf = token;
 		const headers = actionHeaders(csrf, base);
 
 		const plan = await postAction(base, cookie, { kind: "plan", prd: "docs/prd.md" }, headers);
-		expect(plan.status).toBe(202);
+		expect(plan.status, await plan.clone().text()).toBe(202);
 		const { jobId } = (await plan.json()) as { jobId: string };
 		await waitFor(() => recordOf(root, jobId), (j) => j !== undefined && j.status !== "running", 60_000);
 
@@ -344,7 +362,7 @@ describe.skipIf(!FAUX)("real CLI e2e (KIT_FAUX=1)", () => {
 		const planned = await readOnce(root);
 		const revision = planned.readout.storage?.router.identity?.planRevision!;
 		expect(revision).toMatch(/^[0-9a-f-]{36}$/);
-		const launch = await requireLaunchPrefix(await currentTrustedInstallation(), "cli", { targetRoot: root });
+		const launch = await requireLaunchPrefix(installation, "cli", { targetRoot: root });
 		const child = spawn(launch.argv[0]!, [...launch.argv.slice(1), "run", "--approve", "--revision", revision, "--tasks", "list-parse"], {
 			cwd: root,
 			stdio: "ignore",

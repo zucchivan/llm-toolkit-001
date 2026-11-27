@@ -12,7 +12,8 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { buildArgv, resolveCli, startAction, stopAction, validateAction, configPreflight, ACTION_ROLE_NEEDS } from "../server/actions.ts";
-import { jobEnvironment, jobRunnerArgs, launchBinding, markStaleRecords, pruneJobs, spawnJob, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
+import { jobEnvironment, jobRunnerArgs, launchBinding, pruneJobs, spawnJob, statusForExit, jobsList, readJobRecord, tailJobLog, jobsViewList } from "../server/jobs.ts";
+import { startServer } from "../server/server.ts";
 import { selectInstallation } from "../../src/sandbox/trusted-exec.ts";
 import { bake, cleanup, postAction, actionHeaders, trustedNodeFixture, waitFor, spawnSleeper, type Baked } from "./actions-helper.ts";
 
@@ -539,21 +540,28 @@ describe("actions over HTTP: auth + validation + conflict + lifecycle", () => {
 	});
 
 	it("a dead-pid running record goes stale on the next server start (the same root, second server)", async () => {
-		const first = await bake({ skipJobSweep: false });
-		// leave a bogus "running" record with an impossible pid
-		const ghostJob = join(first.root, ".orch", "ui", "jobs");
-		await mkdir(ghostJob, { recursive: true });
-		await writeFile(
-			join(ghostJob, "ghost-1.json"),
-			JSON.stringify({ id: "ghost-1", kind: "plan", argv: ["x"], cwd: first.root, pid: 2_999_999_999, startedAt: Date.now(), status: "running", logPath: join(ghostJob, "ghost-1.log") }),
-			"utf8",
-		);
-		const marked = await markStaleRecords(first.root);
-		expect(marked).toBe(1);
-		const record = await readJobRecord(first.root, "ghost-1");
-		expect(record?.status).toBe("stale");
-		await first.running.shutdown().catch(() => {});
-		await rm(first.root, { recursive: true, force: true }).catch(() => {});
+		const first = await bake({ skipJobSweep: true });
+		try {
+			const ghostJob = join(first.root, ".orch", "ui", "jobs");
+			await mkdir(ghostJob, { recursive: true });
+			await writeFile(
+				join(ghostJob, "ghost-1.json"),
+				JSON.stringify({ id: "ghost-1", kind: "plan", argv: ["x"], cwd: first.root, pid: 2_999_999_999, startedAt: Date.now(), status: "running", logPath: join(ghostJob, "ghost-1.log") }),
+				"utf8",
+			);
+			expect((await readJobRecord(first.root, "ghost-1"))?.status).toBe("running");
+			await first.running.shutdown();
+			const second = await startServer({
+				root: first.root, token: first.csrf, port: 0, distDir: first.stubDir, installation: first.installation,
+			});
+			try {
+				await waitFor(() => readJobRecord(first.root, "ghost-1"), (record) => record?.status === "stale");
+			} finally {
+				await second.shutdown();
+			}
+		} finally {
+			await cleanup(first);
+		}
 	});
 
 	it("prune keeps the newest max and drops old records with their logs", async () => {

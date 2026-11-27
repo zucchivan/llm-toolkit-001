@@ -136,7 +136,7 @@ kit-local-launcher --protocol=1 --cgroup-fd=3 --gate-fd=6 --fence
 | 3 | Open exact journaled direct-child cgroup-v2 directory. Never passed through to Bubblewrap. |
 | 4 | Launcher-only writable pipe or connected Unix stream for status. The host parses the byte stream and enforces the grammar below. |
 | 5 | Launcher-only readable pipe or connected Unix stream with one controller peer. The channel carries no payload. EOF, unexpected data, or any error denotes owner loss. |
-| 6 | Read/write private single-use gate file. It is also supplied with FD 3 for `--fence`. |
+| 6 | Private single-use gate file opened read/write with append mode disabled. It is also supplied with FD 3 for `--fence`. |
 
 The controller owns a stable delegated parent and records its boot, delegation,
 lease cgroup and gate identities before invoking the launcher. It must resolve
@@ -236,7 +236,7 @@ Authoritative strict paths/acceptance are in
 | Slice | Work | Current state |
 | --- | --- | --- |
 | S1 | Optional localLauncher parser/types/resolver selection and refusal/digest tests | **Implemented** with Node tooling; no Rust/asset prerequisite |
-| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Locked build and real native canaries passed on the development host. [Evidence](../../docs/engineering-plan/evidence/M1-P03.md#s2-native-verification-2026-11-27). |
+| S2 | Rust crate/build inputs/fixed argv-FD-status ABI and real placement/FD/owner-loss proofs | Locked build and six real native canaries passed on the development host. [Evidence](../../docs/engineering-plan/evidence/M1-P03.md#s2-merge-review-verification-2026-11-27). |
 | S3 | Bundle format/provenance/approval/install separation and offline fixture | Approved design; exact pins/assets not enrolled |
 | S4 | Full scan/writer exclusion/durable seal/private candidate-ref recovery | Pure inventory/delta preparation only |
 | S5 | local.ts public lease wiring, in-namespace checks and real conformance | Not implemented; not certified |

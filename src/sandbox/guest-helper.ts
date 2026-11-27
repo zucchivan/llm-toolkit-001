@@ -60,6 +60,7 @@ class GuestHelper {
 	private readonly inFlight = new Map<string, InFlight>();
 	private readonly seenRequestIds = new Set<string>();
 	private writeTail: Promise<void> = Promise.resolve();
+	private transportFailed = false;
 	private handleSequence = 0;
 	private uploadSequence = 0;
 	private phase: "hello" | "active" | "closing" | "closed" = "hello";
@@ -374,15 +375,16 @@ class GuestHelper {
 
 	private sendFrame(frame: unknown): Promise<void> {
 		const bytes = encodeGuestFrame(frame);
-		const write = this.writeTail.then(() => this.options.stream.write(bytes));
-		this.writeTail = write.catch((error: unknown) => {
-			this.failTransport();
-			throw error;
+		const write = this.writeTail.then(() => {
+			if (this.transportFailed) throw new GuestProtocolError("guest transport is closed");
+			return this.options.stream.write(bytes);
 		});
+		this.writeTail = write.catch(() => this.failTransport());
 		return write;
 	}
 	private failTransport(): void {
-		if (this.phase === "closed" || this.phase === "closing") return;
+		if (this.transportFailed || this.phase === "closed") return;
+		this.transportFailed = true;
 		this.phase = "closing";
 		for (const operation of this.inFlight.values()) operation.controller.abort();
 		void this.options.stream.close().catch(() => undefined);
