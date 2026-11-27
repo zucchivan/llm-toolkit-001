@@ -831,11 +831,12 @@ export async function publishPullRequest(
 		// Record that a push may have been attempted before calling the transport.
 		// A subsequent absent head is uncertain, never blindly recreated.
 		deliveryIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "remote-ref-create-attempt", options)).receipt;
+		await fault(options, "pr-ref-create:before-effect");
+		await requireCurrentControls();
+		await authorizeDestination();
 		// An empty-expected lease creates the ref atomically.
 		// If the response is lost, readback decides whether the exact commit appeared.
 		try {
-			await fault(options, "pr-ref-create:before-effect");
-			await authorizeDestination();
 			await git.createRemoteRef(approved.origin, headRef, commit);
 			await fault(options, "pr-ref-create:after-effect");
 		} catch (error) {
@@ -894,9 +895,10 @@ export async function publishPullRequest(
 	}
 	await requireCurrentControls();
 	const createIntent = (await recordPrDeliveryState(kit, wave, deliveryIntent, "pending", "pr-create-intent", options)).receipt;
+	await fault(options, "pr-host-create:before-effect");
+	await requireCurrentControls();
+	await authorizeDestination();
 	try {
-		await fault(options, "pr-host-create:before-effect");
-		await authorizeDestination();
 		await host.create({
 			...identity,
 			title: `llm-toolkit-001: ${wave.taskId}`,

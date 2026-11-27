@@ -396,6 +396,32 @@ describe("verified stacked PR publication against a fake remote", () => {
 		expect([data.remote.readCalls, data.remote.pushCalls, data.host.readCalls, data.host.createCalls]).toEqual([2, 0, 0, 0]);
 	});
 
+	it.each([
+		{ boundary: "pr-ref-create:before-effect", pushes: 0, lastCode: "remote-ref-create-attempt" },
+		{ boundary: "pr-host-create:before-effect", pushes: 1, lastCode: "pr-create-intent" },
+	] as const)("refuses fresh effects when the reviewed PRD changes at $boundary", async ({ boundary, pushes, lastCode }) => {
+		const data = await fixture();
+		const wave = data.waves[0]!;
+		const commit = await acceptAndIntegrate(data.kit, wave, data.baseCommit);
+		const headRef = `refs/heads/kit/${wave.planRevision}/${wave.taskId}`;
+
+		await expect.soft(publishPullRequest(data.kit, wave, {
+			deliverExplicit: true, profilePath: data.profilePath, gitTransport: data.remote, prHost: data.host,
+			async faultInjector(point) {
+				if (point === boundary) await writeFile(join(data.root, "docs/prd.md"), "changed at the publication boundary");
+			},
+		})).rejects.toMatchObject({
+			name: "RecoveryRequiredError",
+			message: expect.stringMatching(/cannot start a new PR publication effect: the reviewed PRD docs\/prd\.md changed/),
+		});
+		expect.soft([data.remote.pushCalls, data.host.createCalls]).toEqual([pushes, 0]);
+		expect(await remoteRef(data.remote, headRef)).toBe(pushes ? commit : undefined);
+		const deliveries = (await receiptEvents(data.kit)).filter((event) => event.kind === "delivery");
+		expect(deliveries.at(-1)?.value).toMatchObject({ state: "pending", code: lastCode, commit, ref: headRef });
+		expect(deliveries.filter((event) => event.value.code === "remote-ref-confirmed").map((event) => event.value.commit))
+			.toEqual(pushes ? [commit] : []);
+	});
+
 	it("can observe a recorded push after control drift but refuses to start PR creation", async () => {
 		const data = await fixture();
 		await acceptAndIntegrate(data.kit, data.waves[0]!, data.baseCommit);
