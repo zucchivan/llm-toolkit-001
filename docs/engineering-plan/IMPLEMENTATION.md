@@ -53,8 +53,8 @@ Use these fields:
 Tests green + review-ready are necessary, not sufficient. A reviewer must check
 scope, caller completeness and the effect table before advancing. If no separate
 reviewer is available, stop at READY FOR REVIEW and request review rather than
-inventing approval. An implementation handoff names the next internal step or
-packet, constraints and exact checks; it ends with NEXT PROMPT per AGENTS.md.
+inventing approval. When the operator requests a paste-ready handoff, use
+`$next-prompt` and name the next internal step or packet, constraints and exact checks.
 No commit/push without the operator's explicit request.
 
 ## Required adversarial cases (apply by obligation, not cargo-cult)

@@ -10,36 +10,10 @@ Keep the boundary: UI work follows `ui/PRD.md`; core changes for the UI are
 limited to the additive seam in `ui/PRD.md` Appendix A. Do not fold UI scope
 into the loop kit's scope.
 
-## Standing rule: end every task with the next prompt
+## Optional session handoff
 
-Every agent session — and every subagent/delegate — must end its final message
-with a paste-ready prompt for the next session. This applies even when the task
-is a one-line fix, incomplete, or blocked.
-
-Use this exact heading and a fenced block:
-
-```text
-NEXT PROMPT:
-```text
-...
-```
-```
-
-The prompt must be self-contained and assume a fresh context with no memory of
-this session. It must include:
-
-- the goal and current state (what shipped, where it lives);
-- files to read first (repo-relative or absolute paths);
-- the next task's scope, with explicit non-goals;
-- verification/acceptance commands;
-- constraints and decisions that must not be undone;
-- the same "end with NEXT PROMPT" instruction, recursively.
-
-Subagents return their own `NEXT PROMPT` to the orchestrator. The orchestrator
-folds them into one consolidated prompt (or one per parallel stream) and ends
-with the single next prompt. A vague "continue" is not a valid next prompt.
-
-If nothing remains, say so and provide a final verification prompt instead.
+Use `$next-prompt` only when the user explicitly requests a paste-ready prompt
+for a fresh session. See [the skill](.agents/skills/next-prompt/SKILL.md).
 
 ## Working defaults
 
